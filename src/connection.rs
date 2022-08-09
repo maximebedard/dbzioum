@@ -1,3 +1,4 @@
+use std::fmt;
 use std::{io, net::SocketAddr};
 
 use tokio::{
@@ -71,7 +72,7 @@ impl Connection {
         params.push("application_name");
         params.push("pickup");
         params.push("replication");
-        params.push("true");
+        params.push("database");
 
         let mut len = 4 + 4 + 1;
 
@@ -199,20 +200,10 @@ impl Connection {
                     println!("{:?}: {:?}", param_name, param_value);
                 }
                 b'Z' => {
-                    // ReadyForQuery (B)
-                    //     Byte1('Z')
-                    //         Identifies the message type. ReadyForQuery is sent whenever the backend is ready for a new query cycle.
-                    //     Int32(5)
-                    //         Length of message contents in bytes, including self.
-                    //     Byte1
-                    //         Current backend transaction status indicator. Possible values are 'I' if idle (not in a transaction block); 'T' if in a transaction block; or 'E' if in a failed transaction block (queries will be rejected until block is ended).
-
-                    self.stream.read_i32().await?; // skip len
-                    let status = self.stream.read_u8().await?;
+                    self.read_ready_for_query().await?;
                     break;
                 }
                 b'E' => {
-                    // ErrorResponse
                     self.read_backend_error().await?;
                 }
                 b'N' => {
@@ -226,10 +217,201 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn exec(&mut self, command: impl AsRef<str>) -> io::Result<()> {
+    pub async fn start_replication(
+        &mut self,
+        slot: Option<impl AsRef<str> + fmt::Display>,
+        location: impl AsRef<str> + fmt::Display,
+        tid: Option<i32>,
+    ) -> io::Result<()> {
+        let mut query = "START_REPLICATION".to_string();
+        if let Some(slot) = slot {
+            query = format!("{} SLOT {}", query, slot);
+        }
+        query = format!("{} {}", query, location);
+        if let Some(tid) = tid {
+            query = format!("{} TIMELINE {}", query, tid);
+        }
+        self.query(query).await
+    }
+
+    pub async fn identify_system(&mut self) -> io::Result<()> {
+        self.query("IDENTIFY_SYSTEM").await
+    }
+
+    pub async fn show(&mut self, name: impl AsRef<str> + fmt::Display) -> io::Result<()> {
+        self.query(format!("SHOW {}", name)).await
+    }
+
+    pub async fn timeline_history(&mut self, tid: i32) -> io::Result<()> {
+        self.query(format!("TIMELINE_HISTORY {}", tid)).await
+    }
+
+    async fn query(&mut self, command: impl AsRef<str>) -> io::Result<()> {
         let len = command.as_ref().as_bytes().len() + 1 + 4;
         self.stream.write_u8(b'Q').await?;
         self.stream.write_i32(len as i32).await?;
+        self.stream.write_all(command.as_ref().as_bytes()).await?;
+        self.stream.write_u8(0).await?;
+        self.stream.flush().await?;
+
+        loop {
+            match self.stream.read_u8().await? {
+                b'C' => {
+                    // CommandComplete (B)
+                    //     Byte1('C')
+                    //         Identifies the message as a command-completed response.
+                    //     Int32
+                    //         Length of message contents in bytes, including self.
+                    //     String
+                    //         The command tag. This is usually a single word that identifies which SQL command was completed.
+                    //         For an INSERT command, the tag is INSERT oid rows, where rows is the number of rows inserted. oid is the object ID of the inserted row if rows is 1 and the target table has OIDs; otherwise oid is 0.
+                    //         For a DELETE command, the tag is DELETE rows where rows is the number of rows deleted.
+                    //         For an UPDATE command, the tag is UPDATE rows where rows is the number of rows updated.
+                    //         For a SELECT or CREATE TABLE AS command, the tag is SELECT rows where rows is the number of rows retrieved.
+                    //         For a MOVE command, the tag is MOVE rows where rows is the number of rows the cursor's position has been changed by.
+                    //         For a FETCH command, the tag is FETCH rows where rows is the number of rows that have been retrieved from the cursor.
+                    //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
+                    self.stream.read_i32().await?; // skip len
+                    let command_tag = self.read_c_string().await?;
+                }
+                b'G' => {
+                    // CopyInResponse (B)
+                    //     Byte1('G')
+                    //         Identifies the message as a Start Copy In response. The frontend must now send copy-in data (if not prepared to do so, send a CopyFail message).
+                    //     Int32
+                    //         Length of message contents in bytes, including self.
+                    //     Int8
+                    //         0 indicates the overall COPY format is textual (rows separated by newlines, columns separated by separator characters, etc). 1 indicates the overall copy format is binary (similar to DataRow format). See COPY for more information.
+                    //     Int16
+                    //         The number of columns in the data to be copied (denoted N below).
+                    //     Int16[N]
+                    //         The format codes to be used for each column. Each must presently be zero (text) or one (binary). All must be zero if the overall copy format is textual.
+                    self.stream.read_i32().await?; // skip len
+                    let format = self.stream.read_i8().await?;
+                    let num_columns = self.stream.read_i16().await?;
+                    for i in 0..num_columns {
+                        self.stream.read_i16().await?;
+                    }
+                }
+                b'H' => {
+                    // CopyOutResponse (B)
+                    //     Byte1('H')
+                    //         Identifies the message as a Start Copy Out response. This message will be followed by copy-out data.
+                    //     Int32
+                    //         Length of message contents in bytes, including self.
+                    //     Int8
+                    //         0 indicates the overall COPY format is textual (rows separated by newlines, columns separated by separator characters, etc). 1 indicates the overall copy format is binary (similar to DataRow format). See COPY for more information.
+                    //     Int16
+                    //         The number of columns in the data to be copied (denoted N below).
+                    //     Int16[N]
+                    //         The format codes to be used for each column. Each must presently be zero (text) or one (binary). All must be zero if the overall copy format is textual.
+                    self.stream.read_i32().await?; // skip len
+                    let format = self.stream.read_i8().await?;
+                    let num_columns = self.stream.read_i16().await?;
+                    for i in 0..num_columns {
+                        self.stream.read_i16().await?;
+                    }
+                }
+                b'T' => {
+                    // RowDescription (B)
+                    //     Byte1('T')
+                    //         Identifies the message as a row description.
+                    //     Int32
+                    //         Length of message contents in bytes, including self.
+                    //     Int16
+                    //         Specifies the number of fields in a row (can be zero).
+                    //     Then, for each field, there is the following:
+                    //     String
+                    //         The field name.
+                    //     Int32
+                    //         If the field can be identified as a column of a specific table, the object ID of the table; otherwise zero.
+                    //     Int16
+                    //         If the field can be identified as a column of a specific table, the attribute number of the column; otherwise zero.
+                    //     Int32
+                    //         The object ID of the field's data type.
+                    //     Int16
+                    //         The data type size (see pg_type.typlen). Note that negative values denote variable-width types.
+                    //     Int32
+                    //         The type modifier (see pg_attribute.atttypmod). The meaning of the modifier is type-specific.
+                    //     Int16
+                    //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
+                    self.stream.read_i32().await?; // skip len
+                    let num_fields = self.stream.read_i16().await?;
+                    for i in 0..num_fields {
+                        let field_name = self.read_c_string().await?;
+                        println!("field: {}", field_name);
+                        let oid = self.stream.read_i32().await?;
+                        let attr_number = self.stream.read_i16().await?;
+                        let datatype_oid = self.stream.read_i32().await?;
+                        let datatype_size = self.stream.read_i16().await?;
+                        let type_modifier = self.stream.read_i32().await?;
+                        let format = self.stream.read_i16().await?;
+                    }
+                }
+                b'D' => {
+                    // DataRow (B)
+                    //     Byte1('D')
+                    //         Identifies the message as a data row.
+                    //     Int32
+                    //         Length of message contents in bytes, including self.
+                    //     Int16
+                    //         The number of column values that follow (possibly zero).
+                    //     Next, the following pair of fields appear for each column:
+                    //     Int32
+                    //         The length of the column value, in bytes (this count does not include itself). Can be zero. As a special case, -1 indicates a NULL column value. No value bytes follow in the NULL case.
+                    //     Byten
+                    //         The value of the column, in the format indicated by the associated format code. n is the above length.
+
+                    self.stream.read_i32().await?; // skip len
+                    let num_columns = self.stream.read_i16().await?;
+                    for i in 0..num_columns {
+                        let len = self.stream.read_i32().await?;
+                        if len > 0 {
+                            let mut buffer = vec![0; len as usize];
+                            self.stream.read_exact(&mut buffer).await?;
+                        }
+                    }
+                }
+                b'I' => {
+                    // EmptyQueryResponse (B)
+                    //     Byte1('I')
+                    //         Identifies the message as a response to an empty query string. (This substitutes for CommandComplete.)
+                    //     Int32(4)
+                    //         Length of message contents in bytes, including self.
+                    self.stream.read_i32().await?;
+                    break;
+                }
+                b'Z' => {
+                    self.read_ready_for_query().await?;
+                    break;
+                }
+                b'E' => {
+                    self.read_backend_error().await?;
+                    break;
+                }
+                b'N' => {
+                    self.read_backend_notice().await?;
+                    break;
+                }
+                code => {
+                    panic!("Unexpected backend message: {:?}", char::from(code))
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn read_ready_for_query(&mut self) -> io::Result<()> {
+        // ReadyForQuery (B)
+        //     Byte1('Z')
+        //         Identifies the message type. ReadyForQuery is sent whenever the backend is ready for a new query cycle.
+        //     Int32(5)
+        //         Length of message contents in bytes, including self.
+        //     Byte1
+        //         Current backend transaction status indicator. Possible values are 'I' if idle (not in a transaction block); 'T' if in a transaction block; or 'E' if in a failed transaction block (queries will be rejected until block is ended).
+        self.stream.read_i32().await?; // skip len
+        let status = self.stream.read_u8().await?;
         Ok(())
     }
 

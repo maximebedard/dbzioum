@@ -11,13 +11,15 @@ async fn main() {
         "[::]:5432".parse().unwrap(),
         ConnectionOptions {
             user: "maximebedard".to_string(),
+            database: Some("zapper".to_string()),
             ..Default::default()
         },
     )
     .await
     .unwrap();
 
-    connection.exec("").await.unwrap();
+    connection.identify_system().await.unwrap();
+    connection.show("asds").await.unwrap();
     connection.close().await.unwrap();
 }
 
