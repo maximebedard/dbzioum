@@ -246,13 +246,17 @@ impl Connection {
         self.query(format!("TIMELINE_HISTORY {}", tid)).await
     }
 
-    async fn query(&mut self, command: impl AsRef<str>) -> io::Result<()> {
+    async fn query(&mut self, command: impl AsRef<str> + fmt::Display) -> io::Result<()> {
+        println!("query: \"{}\"", command);
         let len = command.as_ref().as_bytes().len() + 1 + 4;
         self.stream.write_u8(b'Q').await?;
         self.stream.write_i32(len as i32).await?;
         self.stream.write_all(command.as_ref().as_bytes()).await?;
         self.stream.write_u8(0).await?;
         self.stream.flush().await?;
+
+        let mut fields: Option<Vec<RawField>> = None;
+        let mut columns: Option<Vec<RawColumn>> = None;
 
         loop {
             match self.stream.read_u8().await? {
@@ -273,6 +277,7 @@ impl Connection {
                     //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
                     self.stream.read_i32().await?; // skip len
                     let command_tag = self.read_c_string().await?;
+                    println!("complete: {}", command_tag);
                 }
                 b'G' => {
                     // CopyInResponse (B)
@@ -337,16 +342,27 @@ impl Connection {
                     //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
                     self.stream.read_i32().await?; // skip len
                     let num_fields = self.stream.read_i16().await?;
+                    let mut tmp_fields = Vec::with_capacity(num_fields as usize);
                     for i in 0..num_fields {
-                        let field_name = self.read_c_string().await?;
-                        println!("field: {}", field_name);
+                        let name = self.read_c_string().await?;
+                        println!("field: {}", name);
                         let oid = self.stream.read_i32().await?;
                         let attr_number = self.stream.read_i16().await?;
                         let datatype_oid = self.stream.read_i32().await?;
                         let datatype_size = self.stream.read_i16().await?;
                         let type_modifier = self.stream.read_i32().await?;
                         let format = self.stream.read_i16().await?;
+                        tmp_fields.push(RawField {
+                            name,
+                            oid,
+                            attr_number,
+                            datatype_oid,
+                            datatype_size,
+                            type_modifier,
+                            format,
+                        });
                     }
+                    fields = Some(tmp_fields);
                 }
                 b'D' => {
                     // DataRow (B)
@@ -364,13 +380,21 @@ impl Connection {
 
                     self.stream.read_i32().await?; // skip len
                     let num_columns = self.stream.read_i16().await?;
+                    let mut tmp_columns = Vec::with_capacity(num_columns as usize);
                     for i in 0..num_columns {
                         let len = self.stream.read_i32().await?;
+
                         if len > 0 {
                             let mut buffer = vec![0; len as usize];
                             self.stream.read_exact(&mut buffer).await?;
+                            tmp_columns.push(RawColumn::Bytes(buffer));
+                        } else if len == 0 {
+                            tmp_columns.push(RawColumn::Bytes(Vec::new()));
+                        } else if len == -1 {
+                            tmp_columns.push(RawColumn::Null);
                         }
                     }
+                    columns = Some(tmp_columns);
                 }
                 b'I' => {
                     // EmptyQueryResponse (B)
@@ -489,4 +513,24 @@ impl Connection {
     }
 }
 
-struct InFlightQuery {}
+// select oid, pg_type.typname from pg_type where oid < 10000 AND typname LIKE '_%' order by oid;
+enum FieldType {
+    BOOL = 16,
+}
+
+#[derive(Debug)]
+struct RawField {
+    name: String,
+    oid: i32,
+    attr_number: i16,
+    datatype_oid: i32,
+    datatype_size: i16,
+    type_modifier: i32,
+    format: i16,
+}
+
+#[derive(Debug)]
+enum RawColumn {
+    Null,
+    Bytes(Vec<u8>),
+}

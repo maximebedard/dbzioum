@@ -19,7 +19,7 @@ async fn main() {
     .unwrap();
 
     connection.identify_system().await.unwrap();
-    connection.show("asds").await.unwrap();
+    connection.show("SERVER_VERSION").await.unwrap();
     connection.close().await.unwrap();
 }
 
