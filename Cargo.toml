@@ -1,10 +1,16 @@
 [package]
-name = "pickup"
+name = "ps2bq"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.2", features = ["full"] }
-bytes = { version = "1.2" }
+tokio = { version = "1", features = ["full"] }
+bytes = { version = "1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+hyper = { version = "0.14", features = ["client", "http2", "tcp"]}
+base64 = { version = "0.13" }
+rustls = { version = "0.20" }
+chrono = { version = "0.4" }
