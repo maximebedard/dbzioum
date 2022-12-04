@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use tokio::{
 };
 
 #[derive(Debug, Clone)]
-struct AccessToken {
+pub struct AccessToken {
     value: String,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -24,13 +25,19 @@ impl AccessToken {
     }
 }
 
+impl fmt::Display for AccessToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.value.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
-struct Credential {
+pub struct Credential {
     pub sender: mpsc::Sender<oneshot::Sender<io::Result<AccessToken>>>,
 }
 
 impl Credential {
-    fn spawn(scopes: Vec<String>) -> (Self, JoinHandle<()>) {
+    pub fn spawn(scopes: Vec<String>) -> (Self, JoinHandle<()>) {
         let (sender, mut receiver) = mpsc::channel::<oneshot::Sender<io::Result<AccessToken>>>(32);
 
         let handle = task::spawn(async move {
@@ -228,6 +235,7 @@ impl CredentialStrategy {
             Ok(_) = tokio::net::TcpListener::bind(("metadata.google.internal", 0)) => true,
         }
     }
+
     async fn refresh_access_token(&self, scopes: &Vec<String>) -> io::Result<AccessToken> {
         match self {
             CredentialStrategy::User { key } => {
@@ -381,7 +389,155 @@ impl CredentialStrategy {
 }
 
 #[derive(Debug, Clone)]
-struct Storage {}
+struct StorageInner {
+    credential: Credential,
+}
+
+impl StorageInner {
+    async fn json_request(&self, mut req: hyper::Request<hyper::Body>) -> io::Result<()> {
+        let http = hyper::Client::builder().build_http();
+        let access_token = self.credential.access_token().await.unwrap();
+        let headers = req.headers_mut();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", access_token).parse().unwrap(),
+        );
+        http.request(req).await.unwrap();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Storage {
+    inner: StorageInner,
+}
+
+impl Storage {
+    pub fn new(credential: Credential) -> Self {
+        let inner = StorageInner { credential };
+        Self { inner }
+    }
+
+    pub fn bucket(&self, name: impl Into<String>) -> StorageBucket {
+        let inner = self.inner.clone();
+        let name = name.into();
+        StorageBucket { inner, name }
+    }
+}
+
+#[derive(Debug)]
+pub struct StorageBucket {
+    inner: StorageInner,
+    name: String,
+}
+
+impl StorageBucket {
+    pub async fn exists(&self) -> io::Result<()> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(format!(
+                "https://storage.googleapis.com/storage/v1/b/{}",
+                self.name
+            ))
+            .body(hyper::Body::empty())
+            .unwrap();
+        self.inner.json_request(req).await.unwrap();
+        Ok(())
+    }
+
+    pub async fn create(&self) -> io::Result<()> {
+        let project_id = "";
+        let body = serde_json::json!({"name": self.name}).to_string();
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!(
+                "https://storage.googleapis.com/storage/v1/b?project={}",
+                project_id
+            ))
+            .body(body.into())
+            .unwrap();
+        self.inner.json_request(req).await.unwrap();
+        Ok(())
+    }
+
+    pub async fn delete(&self) -> io::Result<()> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::DELETE)
+            .uri(format!(
+                "https://storage.googleapis.com/storage/v1/b/{}",
+                self.name
+            ))
+            .body(hyper::Body::empty())
+            .unwrap();
+        self.inner.json_request(req).await.unwrap();
+        Ok(())
+    }
+
+    pub async fn delete_silently(&self) -> io::Result<()> {
+        match self.delete().await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    }
+
+    pub fn object(&self, name: impl Into<String>) -> StorageObject {
+        let inner = self.inner.clone();
+        let bucket_name = self.name.clone();
+        let name = name.into();
+        StorageObject {
+            inner,
+            bucket_name,
+            name,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct StorageObject {
+    inner: StorageInner,
+    bucket_name: String,
+    name: String,
+}
+
+impl StorageObject {
+    pub async fn exists(&self) -> io::Result<()> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(format!(
+                "https://storage.googleapis.com/storage/v1/b/{}/{}",
+                self.bucket_name, self.name,
+            ))
+            .body(hyper::Body::empty())
+            .unwrap();
+        self.inner.json_request(req).await.unwrap();
+        Ok(())
+    }
+
+    pub async fn create(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub async fn delete(&self) -> io::Result<()> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::DELETE)
+            .uri(format!(
+                "https://storage.googleapis.com/storage/v1/b/{}/{}",
+                self.bucket_name, self.name,
+            ))
+            .body(hyper::Body::empty())
+            .unwrap();
+        self.inner.json_request(req).await.unwrap();
+        Ok(())
+    }
+
+    pub async fn delete_silently(&self) -> io::Result<()> {
+        match self.delete().await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct BigQuery {}
