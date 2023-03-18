@@ -1,4 +1,4 @@
-use ps2bq::pg::{Connection, ConnectionOptions};
+use ps2bq::mysql::{Connection, ConnectionOptions};
 use std::env;
 
 #[tokio::test]
@@ -27,9 +27,9 @@ async fn test_connection_replication() {
 
 async fn setup_connection() -> Connection {
     Connection::connect(ConnectionOptions {
-        user: env::var("POSTGRES_USER").unwrap_or_else(|_| "postgres".to_string()),
-        password: env::var("POSTGRES_PASSWORD").ok(),
-        database: env::var("POSTGRES_DATABASE").ok(),
+        user: env::var("MYSQL_USER").unwrap_or_else(|_| "root".to_string()),
+        password: env::var("MYSQL_PASSWORD").ok(),
+        database: env::var("MYSQL_DATABASE").ok(),
         ..Default::default()
     })
     .await

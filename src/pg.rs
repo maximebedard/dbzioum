@@ -13,25 +13,35 @@ pub struct Connection {
     options: ConnectionOptions,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct ConnectionOptions {
+    pub addr: SocketAddr,
     pub user: String,
     pub use_ssl: bool,
     pub password: Option<String>,
     pub database: Option<String>,
 }
 
+impl Default for ConnectionOptions {
+    fn default() -> Self {
+        Self {
+            addr: "[::]:5432".parse().unwrap(),
+            user: Default::default(),
+            use_ssl: Default::default(),
+            password: Default::default(),
+            database: Default::default(),
+        }
+    }
+}
+
 const PROTOCOL_VERSION: i32 = 196608;
 const SSL_HANDSHAKE_CODE: i32 = 80877103;
 
 impl Connection {
-    pub async fn connect(
-        addr: SocketAddr,
-        options: impl Into<ConnectionOptions>,
-    ) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        let stream = BufStream::new(stream);
+    pub async fn connect(options: impl Into<ConnectionOptions>) -> io::Result<Self> {
         let options = options.into();
+        let stream = TcpStream::connect(options.addr).await?;
+        let stream = BufStream::new(stream);
         let use_ssl = options.use_ssl;
         let mut connection = Self { stream, options };
         if use_ssl {

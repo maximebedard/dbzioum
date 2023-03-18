@@ -5,20 +5,17 @@ use ps2bq::stream::PostgresStream;
 
 #[tokio::main]
 async fn main() {
-    let conn = Connection::connect(
-        "[::]:5432".parse().unwrap(),
-        ConnectionOptions {
-            user: "maximebedard".to_string(),
-            database: Some("zapper".to_string()),
-            ..Default::default()
-        },
-    )
+    let _conn = Connection::connect(ConnectionOptions {
+        user: "maximebedard".to_string(),
+        database: Some("zapper".to_string()),
+        ..Default::default()
+    })
     .await
     .unwrap();
 
-    let (http, http_handle) = HttpServer::spawn();
-    let (stream, stream_handle) = PostgresStream::spawn();
-    let (sink, sink_handle) = BigQuerySink::spawn();
+    let (_http, http_handle) = HttpServer::spawn();
+    let (_stream, stream_handle) = PostgresStream::spawn();
+    let (_sink, sink_handle) = BigQuerySink::spawn();
 
     tokio::select! {
         _ = http_handle => {},

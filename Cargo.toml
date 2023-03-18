@@ -14,3 +14,6 @@ hyper = { version = "0.14", features = ["client", "http2", "tcp"]}
 base64 = { version = "0.13" }
 rustls = { version = "0.20" }
 chrono = { version = "0.4" }
+bitflags = { version = "2.0" }
+sha1 = { version = "0.10" }
+sha2 = { version = "0.10" }

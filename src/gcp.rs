@@ -11,8 +11,8 @@ use tokio::{
 
 #[derive(Debug, Clone)]
 pub struct AccessToken {
-    value: String,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub value: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl AccessToken {
@@ -32,16 +32,16 @@ impl fmt::Display for AccessToken {
 }
 
 #[derive(Debug, Clone)]
-pub struct Credential {
+pub struct AccessTokenManager {
     pub sender: mpsc::Sender<oneshot::Sender<io::Result<AccessToken>>>,
 }
 
-impl Credential {
+impl AccessTokenManager {
     pub fn spawn(scopes: Vec<String>) -> (Self, JoinHandle<()>) {
         let (sender, mut receiver) = mpsc::channel::<oneshot::Sender<io::Result<AccessToken>>>(32);
 
         let handle = task::spawn(async move {
-            let strategy = CredentialStrategy::autodetect().await.unwrap();
+            let strategy = AccessTokenStrategy::autodetect().await.unwrap();
             let mut access_token: Option<AccessToken> = None;
             while let Some(sender) = receiver.recv().await {
                 match access_token.as_ref().filter(|t| !t.is_expired()) {
@@ -58,6 +58,7 @@ impl Credential {
                 }
             }
         });
+
         (Self { sender }, handle)
     }
 
@@ -159,7 +160,7 @@ struct ServiceAccountKey {
     project_id: String,
 }
 
-enum CredentialStrategy {
+enum AccessTokenStrategy {
     User {
         key: UserKey,
     },
@@ -172,7 +173,7 @@ enum CredentialStrategy {
     },
 }
 
-impl CredentialStrategy {
+impl AccessTokenStrategy {
     async fn autodetect() -> io::Result<Self> {
         // 1. GOOGLE_APPLICATION_CREDENTIALS environment variable
         if let Some(path) = Self::application_credentials_path() {
@@ -211,9 +212,9 @@ impl CredentialStrategy {
                 let signer = Signer::new(private_key_string.into_bytes()).unwrap();
                 Ok(Self::ServiceAccount { signer, key })
             }
-            Some(credential_type) => Err(io::Error::new(
+            Some(access_token_type) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{} is not supported", credential_type),
+                format!("{} is not supported", access_token_type),
             )),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -238,7 +239,7 @@ impl CredentialStrategy {
 
     async fn refresh_access_token(&self, scopes: &Vec<String>) -> io::Result<AccessToken> {
         match self {
-            CredentialStrategy::User { key } => {
+            AccessTokenStrategy::User { key } => {
                 let client = hyper::Client::new();
 
                 let request = hyper::Request::builder()
@@ -281,7 +282,7 @@ impl CredentialStrategy {
                     expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(expires_in)),
                 })
             }
-            CredentialStrategy::ServiceAccount { signer, key } => {
+            AccessTokenStrategy::ServiceAccount { signer, key } => {
                 let client = hyper::Client::new();
 
                 let assertion = signer.sign(scopes, key).unwrap();
@@ -325,7 +326,7 @@ impl CredentialStrategy {
                     expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(expires_in)),
                 })
             }
-            CredentialStrategy::MetadataServer { account } => {
+            AccessTokenStrategy::MetadataServer { account } => {
                 let host = std::env::var("GCE_METADATA_HOST")
                     .unwrap_or_else(|_| "169.254.169.254".to_string());
                 let uri = format!(
@@ -390,13 +391,13 @@ impl CredentialStrategy {
 
 #[derive(Debug, Clone)]
 struct StorageInner {
-    credential: Credential,
+    access_token_manager: AccessTokenManager,
 }
 
 impl StorageInner {
     async fn json_request(&self, mut req: hyper::Request<hyper::Body>) -> io::Result<()> {
         let http = hyper::Client::builder().build_http();
-        let access_token = self.credential.access_token().await.unwrap();
+        let access_token = self.access_token_manager.access_token().await.unwrap();
         let headers = req.headers_mut();
         headers.insert("Content-Type", "application/json".parse().unwrap());
         headers.insert(
@@ -414,8 +415,10 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(credential: Credential) -> Self {
-        let inner = StorageInner { credential };
+    pub fn new(access_token_manager: AccessTokenManager) -> Self {
+        let inner = StorageInner {
+            access_token_manager,
+        };
         Self { inner }
     }
 
@@ -539,5 +542,33 @@ impl StorageObject {
     }
 }
 
-#[derive(Debug, Default)]
-struct BigQuery {}
+#[derive(Debug, Clone)]
+pub struct BigQuery {
+    access_token_manager: AccessTokenManager,
+}
+
+impl BigQuery {
+    pub fn new(access_token_manager: AccessTokenManager) -> Self {
+        Self {
+            access_token_manager,
+        }
+    }
+
+    pub async fn append_rows() {}
+
+    pub async fn batch_commit_write_streams() {}
+
+    pub async fn create_write_stream() {}
+
+    pub async fn finalize_write_stream() {}
+
+    pub async fn flush_rows() {}
+
+    pub async fn get_write_stream() {}
+}
+
+// https://cloud.google.com/bigquery/docs/reference/storage/rpc/google.cloud.bigquery.storage.v1#google.cloud.bigquery.storage.v1.BigQueryWrite
+
+// https://github.com/googleapis/googleapis/tree/master/google/cloud/bigquery/storage/v1
+
+// https://github.com/tokio-rs/prost
