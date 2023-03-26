@@ -4,10 +4,23 @@ CDC for postgres with BQ sink. Uses wal2json codec to decode replication events 
 
 # TODOS:
 
-- [] simple postgresql client
+- [ ] simple postgresql client (> v11)
+  - [ ] auth
+    - [x] password
+    - [ ] md5
+    - [ ] scram-sha-256
+    - [ ] ssl
   - [x] simple query support
   - [x] create/exists/delete replication slot
   - [ ] start replication stream
+- [ ] simple mysql client (> v8)
+  - [ ] auth
+    - [ ] mysql_native_password
+    - [x] caching_sha2_password
+    - [ ] ssl
+  - [ ] simple query support
+  - [ ] switch connection to replica
+  - [ ] stream binary log events
 - [ ] gcp clients
   - [x] auth
     - [x] service account
@@ -21,7 +34,8 @@ CDC for postgres with BQ sink. Uses wal2json codec to decode replication events 
     - [ ] load job
     - [ ] ...
     - [ ] tests
-- [] streamer task
+- [] pg streamer task
+- [] mysql streamer task
 - [] sink task
 - [] http api task
 - [] ps2bq binary

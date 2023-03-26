@@ -1,16 +1,14 @@
 use bytes::{Buf, BufMut, BytesMut};
+use std::cmp::max;
 use std::io;
-use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::TcpStream;
 
-use super::buf_ext::BufExt;
+use super::buf_ext::{BufExt, BufMutExt};
 use super::protocol::{
-    BinlogDumpFlags, CapabilityFlags, CharacterSet, Column, Command, Handshake, Packet, Row,
-    ServerError, ServerOk, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN,
-    MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
+    BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType, Command, StatusFlags,
+    CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
 use super::protocol_binlog::{BinlogEvent, BinlogEventPacket};
 use super::value::Value;
@@ -19,8 +17,8 @@ use super::value::Value;
 pub struct ConnectionOptions {
     pub addr: SocketAddr,
     pub user: String,
-    pub password: String,
-    pub db_name: Option<String>,
+    pub password: Option<String>,
+    pub database: Option<String>,
     pub hostname: Option<String>,
     pub server_id: Option<u32>,
     pub use_compression: bool,
@@ -32,8 +30,8 @@ impl Default for ConnectionOptions {
         Self {
             addr: "[::]:3306".parse().unwrap(),
             user: "root".to_string(),
-            password: "".to_string(),
-            db_name: None,
+            password: None,
+            database: None,
             hostname: None,
             server_id: None,
             use_compression: false,
@@ -72,7 +70,6 @@ pub struct Connection {
     capabilities: CapabilityFlags,
     status_flags: StatusFlags,
     server_character_set: CharacterSet,
-    buffer: BytesMut,
     sequence_id: u8,
     last_command_id: u8,
     opts: ConnectionOptions,
@@ -83,11 +80,10 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub async fn new(opts: impl Into<ConnectionOptions>) -> io::Result<Self> {
+    pub async fn connect(opts: impl Into<ConnectionOptions>) -> io::Result<Self> {
         let capabilities = CapabilityFlags::empty();
         let status_flags = StatusFlags::empty();
         let server_character_set = CharacterSet::UTF8MB4;
-        let buffer = BytesMut::with_capacity(4 * 1024);
         let sequence_id = 0;
         let last_command_id = 0;
         let last_inserted_id = 0;
@@ -98,10 +94,9 @@ impl Connection {
         let io = TcpStream::connect(opts.addr).await?;
         let io = BufStream::new(io);
 
-        Ok(Self {
+        let mut connection = Self {
             stream: io,
             capabilities,
-            buffer,
             sequence_id,
             last_command_id,
             last_inserted_id,
@@ -111,10 +106,14 @@ impl Connection {
             opts,
             status_flags,
             server_character_set,
-        })
+        };
+
+        connection.handshake().await?;
+
+        Ok(connection)
     }
 
-    pub async fn disconnect(&mut self) -> io::Result<()> {
+    pub async fn close(mut self) -> io::Result<()> {
         self.write_command(Command::COM_QUIT, &[]).await?;
         let payload = self.read_payload().await;
 
@@ -125,14 +124,14 @@ impl Connection {
         }
     }
 
-    pub async fn handshake(&mut self) -> io::Result<()> {
+    async fn handshake(&mut self) -> io::Result<()> {
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html
         let payload = self.read_payload().await?;
 
         match payload.get(0) {
             Some(0xFF) => {
                 let err = ServerError::parse(payload, self.capabilities)?;
-                Err(self.handle_server_error(err).into())
+                Err(self.handle_server_error(err))
             }
             Some(_) => {
                 let handshake = Handshake::parse(payload)?;
@@ -150,38 +149,36 @@ impl Connection {
     }
 
     async fn handle_handshake(&mut self, p: Handshake) -> io::Result<()> {
-        if p.protocol_version() != 10u8 {
-            panic!("not supported")
+        if p.protocol_version != 10u8 {
+            unimplemented!()
         }
 
-        if !p
-            .capabilities()
-            .contains(CapabilityFlags::CLIENT_PROTOCOL_41)
-        {
-            panic!("not supported")
+        if !p.capabilities.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
+            unimplemented!()
         }
 
         // Intersection between what the server supports, and what our client supports.
-        self.capabilities = p.capabilities() & default_capabilities(&self.opts);
-        self.status_flags = p.status_flags();
-        self.server_character_set = p.character_set();
+        self.capabilities = p.capabilities & default_client_capabilities(&self.opts);
+        self.status_flags = p.status_flags;
+        self.server_character_set = p.character_set;
         // potentially keep the server version too?
 
         if self.opts.use_ssl {
             // TODO: ssl
-            panic!("not supported");
+            unimplemented!()
         }
 
         let nonce = p.nonce();
-        let auth_plugin_name = p.auth_plugin_name();
-        let auth_data = scramble_password(auth_plugin_name, self.opts.password.as_str(), &nonce)?;
-        self.write_handshake_response(auth_plugin_name, auth_data)
+        let auth_plugin_name = p.auth_plugin_name.clone().unwrap_or_default();
+        let password = self.opts.password.clone().unwrap_or_default();
+        let auth_data = scramble_password(&auth_plugin_name, &password, &nonce)?;
+        self.write_handshake_response(auth_plugin_name.as_str(), auth_data)
             .await?;
-        self.authenticate(auth_plugin_name, &nonce).await?;
+        self.authenticate(auth_plugin_name.as_str(), &nonce).await?;
 
-        if self.capabilities.contains(CapabilityFlags::CLIENT_COMPRESS) {
+        if self.opts.use_compression {
             // TODO: wrap stream to a compressed stream.
-            panic!("not supported");
+            unimplemented!()
         }
 
         Ok(())
@@ -196,8 +193,13 @@ impl Connection {
     }
 
     /// Send a text query to MYSQL and yield only the first result.
-    pub async fn pop(&mut self, query: impl AsRef<str>) -> io::Result<Option<QueryResult>> {
-        self.query(query).await.map(QueryResults::pop)
+    pub async fn pop(&mut self, query: impl AsRef<str>) -> io::Result<QueryResults> {
+        self.query(query)
+            .await
+            .map(|QueryResults { columns, mut rows }| QueryResults {
+                columns,
+                rows: rows.pop().map(|r| vec![r]).unwrap_or_default(),
+            })
     }
 
     pub async fn ping(&mut self) -> io::Result<()> {
@@ -208,7 +210,7 @@ impl Connection {
             Some(0x00) => ServerOk::parse(payload, self.capabilities)
                 .map(|ok| self.handle_ok(ok))
                 .map_err(Into::into),
-            _ => panic!("todo"),
+            _ => unimplemented!(),
         }
     }
 
@@ -234,6 +236,7 @@ impl Connection {
 
             self.sequence_id = self.sequence_id.wrapping_add(1);
             self.stream.write(&b[..]).await?;
+            self.stream.flush().await?;
         }
 
         Ok(())
@@ -246,7 +249,7 @@ impl Connection {
             Some(0x00) => self.parse_and_handle_server_ok(payload),
             Some(0xFF) => {
                 let err = ServerError::parse(payload, self.capabilities)?;
-                Err(self.handle_server_error(err).into())
+                Err(self.handle_server_error(err))
             }
             Some(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -264,21 +267,20 @@ impl Connection {
         let payload = self.read_payload().await?;
 
         match payload.get(0) {
-            Some(0x00) => self.parse_and_handle_server_ok(payload).unwrap_or_default(),
+            Some(0x00) => {
+                self.parse_and_handle_server_ok(payload)?;
+                todo!();
+            }
             Some(0xFF) => {
                 let err = ServerError::parse(payload, self.capabilities)?;
-                Err(self.handle_server_error(err).into())
+                Err(self.handle_server_error(err))
             }
             Some(0xFB) => todo!("infile not supported"),
             Some(_) => {
-                // TODO: potentially try to move this out of here?
                 let column_count = payload.as_slice().mysql_get_lenc_uint().unwrap() as usize;
                 let columns = self.read_columns(column_count).await?;
                 let rows = self.read_rows(&columns).await?;
-                let query_results = QueryResults {
-                    columns: Arc::new(columns),
-                    rows,
-                };
+                let query_results = QueryResults { columns, rows };
                 Ok(query_results)
             }
             None => Err(io::Error::new(
@@ -322,8 +324,7 @@ impl Connection {
 
             match payload.get(0) {
                 Some(0x00) | Some(0xFE) => {
-                    let _ =
-                        ServerOk::parse(payload, self.capabilities).map(|ok| self.handle_ok(ok))?;
+                    ServerOk::parse(payload, self.capabilities).map(|ok| self.handle_ok(ok))?;
                     break;
                 }
                 Some(_) => {
@@ -345,38 +346,30 @@ impl Connection {
         let payload = self.read_payload().await?;
 
         // 0x00 = Ok, 0xFF = Err, 0xFE = AuthSwitch, 0x01 = AuthMoreData
-        match (auth_plugin_name, payload.get(0)) {
-            (MYSQL_NATIVE_PASSWORD_PLUGIN_NAME, Some(0x00)) => {
-                ServerOk::parse(payload, self.capabilities)
-                    .map(|ok| self.handle_ok(ok))
-                    .map_err(Into::into)
+        match auth_plugin_name {
+            MYSQL_NATIVE_PASSWORD_PLUGIN_NAME | CACHING_SHA2_PASSWORD_PLUGIN_NAME => {
+                if payload.as_slice() == &[0x01, 0x03] {
+                    let payload = self.read_payload().await?;
+                    self.parse_and_handle_server_ok(payload)?;
+                    return Ok(());
+                }
+
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "todo"));
             }
-            (MYSQL_NATIVE_PASSWORD_PLUGIN_NAME, Some(0xFE)) => {
-                todo!();
-            }
-            (CACHING_SHA2_PASSWORD_PLUGIN_NAME, Some(0x00)) => todo!(),
-            (CACHING_SHA2_PASSWORD_PLUGIN_NAME, Some(0xFE)) => todo!(),
-            (CACHING_SHA2_PASSWORD_PLUGIN_NAME, Some(0x01)) => todo!(),
-            (_, Some(0xff)) => {
-                let err = ServerError::parse(payload, self.capabilities)?;
-                Err(self.handle_server_error(err).into())
-            }
-            (custom, Some(_)) => panic!("custom not supported"),
-            (_, None) => panic!("todo"),
+            other => unimplemented!(),
         }
     }
 
     fn handle_ok(&mut self, ok: ServerOk) {
-        self.affected_rows = ok.affected_rows();
-        self.last_inserted_id = ok.last_inserted_id();
-        self.status_flags = ok.status_flags().unwrap_or(StatusFlags::empty());
-        self.warnings = ok.warnings().unwrap_or(0);
+        self.affected_rows = ok.affected_rows;
+        self.last_inserted_id = ok.last_inserted_id;
+        self.status_flags = ok.status_flags.unwrap_or(StatusFlags::empty());
+        self.warnings = ok.warnings.unwrap_or(0);
     }
 
     async fn read_payload(&mut self) -> io::Result<Vec<u8>> {
-        let packet = self.read_packet().await?;
-        self.check_sequence_id(packet.sequence_id())?;
-        let payload = packet.take_payload();
+        let (sequence_id, payload) = self.read_packet().await?;
+        self.check_sequence_id(sequence_id)?;
         println!("<< {:02X?}", payload);
         Ok(payload)
     }
@@ -398,86 +391,45 @@ impl Connection {
         auth_plugin_name: &str,
         scrambled_data: Option<Vec<u8>>,
     ) -> io::Result<()> {
-        let auth_plugin_name = auth_plugin_name.as_bytes();
-        let auth_plugin_len = auth_plugin_name.len();
-        let user = self.opts.user.as_bytes();
-        let db_name = self.opts.db_name.as_ref().map(String::as_bytes);
-        let db_name_len = db_name.map(|x| x.len()).unwrap_or(0);
-        let scramble_data_len = scrambled_data.as_ref().map(|x| x.len()).unwrap_or(0);
-
-        let mut payload_len = 4 + 4 + 1 + 23 + 1 + scramble_data_len + auth_plugin_len;
-        if user.len() > 0 {
-            payload_len += user.len() + 1;
-        }
-        if db_name_len > 0 {
-            payload_len += db_name_len + 1;
-        }
-
-        let mut b = BytesMut::with_capacity(payload_len);
+        let mut b = BytesMut::new();
         b.put_u32_le(self.capabilities.bits());
         b.put_u32_le(self.max_packet_size);
-        b.put_u8(client_character_set() as u8);
+        b.put_u8(CharacterSet::UTF8 as u8);
         b.put(&[0; 23][..]);
+        b.put(self.opts.user.as_bytes());
+        b.put_u8(0);
 
-        if user.len() > 0 {
-            b.put(user);
+        if let Some(scrambled_data) = scrambled_data {
+            b.mysql_put_lenc_uint(scrambled_data.len() as u64);
+            b.put(scrambled_data.as_slice());
+        }
+
+        if let Some(db_name) = self.opts.database.as_ref() {
+            b.put(db_name.as_bytes());
             b.put_u8(0);
         }
 
-        b.put_u8(scramble_data_len as u8);
-        if let Some(scrable_data) = scrambled_data {
-            b.put(scrable_data.as_slice());
-        }
-
-        if let Some(db_name) = db_name {
-            b.put(db_name);
-            b.put_u8(0);
-        }
-
-        b.put(auth_plugin_name);
+        b.put(auth_plugin_name.as_bytes());
         b.put_u8(0);
 
         // TODO: connection attributes (e.g. name of the client, version, etc...)
         self.write_payload(&b[..]).await
     }
 
-    // TODO: move this out of here...
-    async fn read_packet(&mut self) -> io::Result<Packet> {
-        loop {
-            let mut buf = Cursor::new(&self.buffer[..]);
+    async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        let mut header = vec![0; 4];
+        self.stream.read_exact(&mut header).await?;
+        let mut header_buffer = header.as_slice();
+        let payload_len = header_buffer.get_uint_le(3);
+        let sequence_id = header_buffer.get_u8();
 
-            // We have enough data to parse a complete MYSQL packet.
-            if Packet::check(&mut buf) {
-                buf.set_position(0);
-                let packet = Packet::parse(&mut buf)?;
-                let len = buf.position() as usize;
-                self.buffer.advance(len);
-                return Ok(packet);
-            }
+        let mut payload = vec![0; payload_len as usize];
+        self.stream.read_exact(&mut payload).await?;
 
-            // There is not enough buffered data to read a frame. Attempt to read more data from the socket.
-            //
-            // On success, the number of bytes is returned. `0` indicates "end of stream".
-            if self.stream.read(&mut self.buffer).await? == 0 {
-                if self.buffer.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "Connection closed",
-                    ));
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "Connection reset by peer",
-                    ));
-                }
-            }
-        }
+        return Ok((sequence_id, payload));
     }
 
-    async fn get_system_variable(
-        &mut self,
-        var: impl AsRef<str>,
-    ) -> io::Result<Option<QueryResult>> {
+    async fn get_system_variable(&mut self, var: impl AsRef<str>) -> io::Result<QueryResults> {
         self.pop(format!("SELECT @@{}", var.as_ref())).await
     }
 
@@ -533,7 +485,10 @@ impl Connection {
                 let p = BinlogEventPacket::parse(payload)?;
                 Ok(Some(p.into_binlog_event()?))
             }
-            Some(0xFF) => self.parse_and_handle_server_error(payload),
+            Some(0xFF) => {
+                self.parse_and_handle_server_error(payload)?;
+                todo!();
+            }
             Some(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid data while parsing binlog event response",
@@ -553,7 +508,7 @@ impl Connection {
 
     fn parse_and_handle_server_error(&mut self, payload: Vec<u8>) -> io::Result<()> {
         let err = ServerError::parse(payload, self.capabilities)?;
-        Err(self.handle_server_error(err).into())
+        Err(self.handle_server_error(err))
     }
 
     async fn ensure_checksum_is_disabled(&mut self) -> io::Result<()> {
@@ -646,26 +601,22 @@ impl Connection {
     }
 }
 
-fn client_character_set() -> CharacterSet {
-    // TODO: not 100% sure, but seems to depends on the server version...
-    CharacterSet::UTF8
-}
-
 // Defines the default capabilities that our client support.
-fn default_capabilities(opts: &ConnectionOptions) -> CapabilityFlags {
+fn default_client_capabilities(opts: &ConnectionOptions) -> CapabilityFlags {
     let mut capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
-    | CapabilityFlags::CLIENT_SECURE_CONNECTION
-    | CapabilityFlags::CLIENT_LONG_PASSWORD
-    | CapabilityFlags::CLIENT_PLUGIN_AUTH
-    | CapabilityFlags::CLIENT_LONG_FLAG
-    // | CapabilityFlags::CLIENT_CONNECT_ATTRS // TODO: ...
-    | CapabilityFlags::CLIENT_DEPRECATE_EOF;
+        | CapabilityFlags::CLIENT_LONG_PASSWORD
+        | CapabilityFlags::CLIENT_PLUGIN_AUTH
+        | CapabilityFlags::CLIENT_LONG_FLAG
+        | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+        | CapabilityFlags::CLIENT_RESERVED2
+        // | CapabilityFlags::CLIENT_CONNECT_ATTRS
+        | CapabilityFlags::CLIENT_DEPRECATE_EOF;
 
     if opts.use_compression {
         capabilities.insert(CapabilityFlags::CLIENT_COMPRESS);
     }
 
-    if opts.db_name.as_ref().filter(|v| !v.is_empty()).is_some() {
+    if opts.database.as_ref().filter(|v| !v.is_empty()).is_some() {
         capabilities.insert(CapabilityFlags::CLIENT_CONNECT_WITH_DB);
     }
 
@@ -677,71 +628,268 @@ fn default_capabilities(opts: &ConnectionOptions) -> CapabilityFlags {
 }
 
 pub fn scramble_password(
-    auth_plugin_name: &str,
-    password: &str,
-    nonce: &[u8],
+    auth_plugin_name: impl AsRef<str>,
+    password: impl AsRef<str>,
+    nonce: impl AsRef<[u8]>,
 ) -> io::Result<Option<Vec<u8>>> {
-    match (password, auth_plugin_name) {
+    match (password.as_ref(), auth_plugin_name.as_ref()) {
         ("", _) => Ok(None),
-        (password, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME) => {
-            Ok(super::scramble::scramble_native(nonce, password.as_bytes()).map(|x| x.to_vec()))
-        }
-        (password, CACHING_SHA2_PASSWORD_PLUGIN_NAME) => {
-            Ok(super::scramble::scramble_sha256(nonce, password.as_bytes()).map(|x| x.to_vec()))
-        }
+        (password, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME) => Ok(super::scramble::scramble_native(
+            nonce.as_ref(),
+            password.as_bytes(),
+        )
+        .map(|x| x.to_vec())),
+        (password, CACHING_SHA2_PASSWORD_PLUGIN_NAME) => Ok(super::scramble::scramble_sha256(
+            nonce.as_ref(),
+            password.as_bytes(),
+        )
+        .map(|x| x.to_vec())),
         (password, custom_plugin_name) => unimplemented!(),
     }
 }
 
+#[derive(Debug)]
+pub struct Handshake {
+    capabilities: CapabilityFlags,
+    protocol_version: u8,
+    scramble_1: Vec<u8>,
+    scramble_2: Option<Vec<u8>>,
+    auth_plugin_name: Option<String>,
+    character_set: CharacterSet,
+    status_flags: StatusFlags,
+}
+
+impl Handshake {
+    fn parse(buffer: impl AsRef<[u8]>) -> io::Result<Self> {
+        // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
+        let mut b = buffer.as_ref();
+        let protocol_version = b.get_u8();
+        let server_version = b.mysql_null_terminated_string()?;
+        b.advance(1);
+        let connection_id = b.get_u32_le();
+        let (scramble_1_slice, mut b) = b.split_at(8);
+        let scramble_1 = scramble_1_slice.to_vec();
+        b.advance(1);
+        let capabilities_1 = b.get_u16_le();
+        let character_set = b.get_u8().into();
+        let status_flags = StatusFlags::from_bits_truncate(b.get_u16_le());
+        let capabilities_2 = b.get_u16_le();
+
+        let capabilities = CapabilityFlags::from_bits_truncate(
+            capabilities_1 as u32 | ((capabilities_2 as u32) << 16),
+        );
+
+        let scramble_len = b.get_u8() as usize;
+        b.advance(10);
+
+        let (scramble_2_slice, mut b) = b.split_at(max(12, scramble_len as i8 - 9) as usize);
+        b.advance(1);
+        let scramble_2 = Some(scramble_2_slice.to_vec());
+
+        let mut auth_plugin_name = None;
+        if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
+            auth_plugin_name = Some(b.mysql_null_terminated_string()?);
+        }
+
+        Ok(Self {
+            capabilities,
+            protocol_version,
+            scramble_1,
+            scramble_2,
+            auth_plugin_name,
+            status_flags,
+            character_set,
+        })
+    }
+
+    fn nonce(&self) -> Vec<u8> {
+        let mut out = self.scramble_1.clone();
+
+        if let Some(ref scramble_2) = self.scramble_2 {
+            out.extend_from_slice(scramble_2);
+        }
+
+        out
+    }
+}
+
+// https://dev.mysql.com/doc/internals/en/packet-OK_Packet.html
+#[derive(Debug)]
+struct ServerOk {
+    affected_rows: u64,
+    last_inserted_id: u64,
+    status_flags: Option<StatusFlags>,
+    warnings: Option<u16>,
+    info: String,
+    session_state_changes: Option<String>,
+}
+
+impl ServerOk {
+    fn parse(buffer: impl AsRef<[u8]>, capability_flags: CapabilityFlags) -> io::Result<Self> {
+        let mut b = buffer.as_ref();
+        let _header = b.get_u8();
+        let affected_rows = b.mysql_get_lenc_uint().unwrap();
+        let last_inserted_id = b.mysql_get_lenc_uint().unwrap();
+
+        let mut status_flags = None;
+        let mut warnings = None;
+        if capability_flags.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
+            status_flags = Some(StatusFlags::from_bits_truncate(b.get_u16_le()));
+            warnings = Some(b.get_u16_le());
+        } else if capability_flags.contains(CapabilityFlags::CLIENT_TRANSACTIONS) {
+            status_flags = Some(StatusFlags::from_bits_truncate(b.get_u16_le()));
+        }
+
+        let (info, session_state_changes) =
+            if capability_flags.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
+                let info = b.mysql_get_lenc_string().unwrap();
+
+                let has_session_state_changes = status_flags
+                    .map(|f| f.contains(StatusFlags::SERVER_SESSION_STATE_CHANGED))
+                    .unwrap_or(false);
+
+                let mut session_state_changes = None;
+                if has_session_state_changes {
+                    session_state_changes = Some(b.mysql_get_lenc_string().unwrap())
+                }
+
+                (info, session_state_changes)
+            } else {
+                let info = b.mysql_get_eof_string().unwrap();
+                (info, None)
+            };
+
+        Ok(Self {
+            affected_rows,
+            last_inserted_id,
+            status_flags,
+            warnings,
+            info,
+            session_state_changes,
+        })
+    }
+}
+
+// https://dev.mysql.com/doc/internals/en/packet-ERR_Packet.html
+#[derive(Debug)]
+pub struct ServerError {
+    error_code: u16,
+    state_marker: Option<String>,
+    state: Option<String>,
+    error_message: String,
+}
+
+impl ServerError {
+    fn parse(buffer: impl AsRef<[u8]>, capability_flags: CapabilityFlags) -> io::Result<Self> {
+        // let mut b = buffer.into();
+        let mut b = buffer.as_ref();
+        let _header = b.get_u8();
+        let error_code = b.get_u16_le();
+
+        let mut state_marker = None;
+        let mut state = None;
+
+        if capability_flags.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
+            state_marker = Some(b.mysql_get_fixed_length_string(1).unwrap());
+            state = Some(b.mysql_get_fixed_length_string(5).unwrap());
+        }
+
+        let error_message = b.mysql_get_eof_string().unwrap();
+        Ok(Self {
+            error_code,
+            state_marker,
+            state,
+            error_message,
+        })
+    }
+}
+
 /// Owned results for 0..N rows.
+#[derive(Debug, Default)]
 pub struct QueryResults {
-    columns: Arc<Vec<Column>>,
+    columns: Vec<Column>,
     rows: Vec<Row>,
-}
-
-impl QueryResults {
-    /// Consumes self and return only the first result.
-    pub fn pop(mut self) -> Option<QueryResult> {
-        self.rows.pop().map(|row| QueryResult {
-            columns: self.columns.clone(),
-            row,
-        })
-    }
-
-    /// Returns a reference to the first result.
-    pub fn first(&self) -> Option<QueryResultRef<'_>> {
-        self.rows.first().map(|row| QueryResultRef {
-            columns: self.columns.clone(),
-            row,
-        })
-    }
-}
-
-impl Default for QueryResults {
-    fn default() -> Self {
-        let columns = Arc::new(Vec::new());
-        let rows = Vec::new();
-        Self { columns, rows }
-    }
-}
-
-/// Owned result for a single row.
-pub struct QueryResult {
-    columns: Arc<Vec<Column>>,
-    row: Row,
-}
-
-impl QueryResult {
-    pub fn values(&self) -> &[Value] {
-        self.row.values()
-    }
-}
-
-/// Reference to a single row.
-pub struct QueryResultRef<'a> {
-    columns: Arc<Vec<Column>>,
-    row: &'a Row,
 }
 
 // https://mariadb.com/kb/en/connection/#sslrequest-packet
 // https://dev.mysql.com/doc/refman/8.0/en/charset-connection.html
+
+#[derive(Debug)]
+pub struct Row(Vec<Value>);
+
+impl Row {
+    fn parse(buffer: impl AsRef<[u8]>, columns: &Vec<Column>) -> io::Result<Self> {
+        let mut b = buffer.as_ref();
+        let mut values = Vec::with_capacity(columns.len());
+
+        for i in 0..columns.len() {
+            let value = parse_value_from_text(&mut b, &columns[i])?;
+            values.push(value);
+        }
+
+        Ok(Self(values))
+    }
+}
+
+#[derive(Debug)]
+pub struct Column {
+    catalog: String,
+    schema: String,
+    table: String,
+    name: String,
+    org_table: String,
+    character_set: CharacterSet,
+    column_length: u32,
+    column_type: ColumnType,
+    flags: ColumnFlags,
+    decimals: u8,
+}
+
+impl Column {
+    fn parse(buffer: impl AsRef<[u8]>) -> io::Result<Self> {
+        let mut b = buffer.as_ref();
+        let catalog = b.mysql_get_lenc_string().unwrap();
+        assert_eq!("def", catalog.as_str());
+        let schema = b.mysql_get_lenc_string().unwrap();
+        let table = b.mysql_get_lenc_string().unwrap();
+        let org_table = b.mysql_get_lenc_string().unwrap();
+        let name = b.mysql_get_lenc_string().unwrap();
+        let org_name = b.mysql_get_lenc_string().unwrap();
+        let fixed_len = b.mysql_get_lenc_uint().unwrap();
+        assert_eq!(0x0C, fixed_len);
+        let character_set = (b.get_u16_le() as u8).into();
+        let column_length = b.get_u32_le();
+        let column_type = b.get_u8().into();
+        let flags = ColumnFlags::from_bits_truncate(b.get_u16_le());
+        let decimals = b.get_u8();
+
+        Ok(Self {
+            catalog,
+            schema,
+            table,
+            name,
+            org_table,
+            character_set,
+            column_length,
+            column_type,
+            flags,
+            decimals,
+        })
+    }
+}
+
+fn parse_value_from_text(b: &mut impl Buf, column: &Column) -> io::Result<Value> {
+    // TODO: I HAVE NO IDEA HOW TO HANDLE THIS CLEANLY JUST YET...
+    // IF MYSQL ALWAYS RETURNS THE VALUES INTO THE CLIENT FORMATTED COLLATION, THEN WE CAN LAZILY CONVERT IT TO UTF8 AND SUPPORT METHODS TO TRANSCODE FROM ONE FORMAT TO THE OTHER
+    // OTHERWISE, WE HAVE TO DO THE CONVERSION OURSELVES BASED ON THE COLUMN COLLATION.
+    //
+    // ALWAYS ASSUME UTF-8, but in theory, the client could have a completely different charset
+    // We should convert it into a value based off of the column's charset, back into our client charset, and so on.
+    // if let Some(0xFB) = b.peek_u8() {
+    //     Ok(Value::Null)
+    // } else {
+    //     let bytes = b.mysql_get_lenc_bytes().unwrap();
+    //     Ok(Value::Bytes(bytes))
+    // }
+    todo!()
+}

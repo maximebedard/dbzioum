@@ -3,12 +3,26 @@ version: "3.1"
 services:
   pg:
     image: "postgres:14"
-    restart: always
+    restart: "always"
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_USER: "postgres"
       POSTGRES_PASSWORD: "postgres"
-      POSTGRES_DB: "postgres"
+      POSTGRES_DB: "test"
+      POSTGRES_HOST_AUTH_METHOD: "password"
     command:
       - "postgres"
       - "-c"
       - "wal_level=logical"
+
+  mysql:
+    image: "mysql:8"
+    restart: "always"
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_USER: "mysql"
+      MYSQL_PASSWORD: "mysql"
+      MYSQL_DATABASE: "test"
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"

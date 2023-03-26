@@ -26,10 +26,10 @@ impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
             addr: "[::]:5432".parse().unwrap(),
-            user: Default::default(),
-            use_ssl: Default::default(),
-            password: Default::default(),
-            database: Default::default(),
+            user: "postgres".to_string(),
+            use_ssl: false,
+            password: None,
+            database: None,
         }
     }
 }
@@ -128,6 +128,7 @@ impl Connection {
                                 self.stream.write_i32(len as i32).await?;
                                 self.stream.write_all(password.as_bytes()).await?;
                                 self.stream.write_u8(0).await?;
+                                self.stream.flush().await?;
                             } else {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
@@ -563,6 +564,7 @@ impl Connection {
     pub async fn close(mut self) -> io::Result<()> {
         self.stream.write_u8(b'X').await?;
         self.stream.write_i32(4).await?;
+        self.stream.flush().await?;
         self.stream.shutdown().await?;
         Ok(())
     }

@@ -1,13 +1,23 @@
 use ps2bq::http::HttpServer;
-use ps2bq::pg::{Connection, ConnectionOptions};
 use ps2bq::sink::BigQuerySink;
 use ps2bq::stream::PostgresStream;
+use ps2bq::{mysql, pg};
 
 #[tokio::main]
 async fn main() {
-    let _conn = Connection::connect(ConnectionOptions {
-        user: "maximebedard".to_string(),
-        database: Some("zapper".to_string()),
+    let conn_pg = pg::Connection::connect(pg::ConnectionOptions {
+        user: "postgres".to_string(),
+        password: Some("postgres".to_string()),
+        database: Some("test".to_string()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let conn_mysql = mysql::Connection::connect(mysql::ConnectionOptions {
+        user: "mysql".to_string(),
+        password: Some("mysql".to_string()),
+        database: Some("test".to_string()),
         ..Default::default()
     })
     .await
@@ -17,9 +27,8 @@ async fn main() {
     let (_stream, stream_handle) = PostgresStream::spawn();
     let (_sink, sink_handle) = BigQuerySink::spawn();
 
-    tokio::select! {
-        _ = http_handle => {},
-        _ = stream_handle => {},
-        _ = sink_handle => {},
-    }
+    tokio::try_join!(http_handle, stream_handle, sink_handle).ok();
+
+    conn_pg.close().await.ok();
+    conn_mysql.close().await.ok();
 }

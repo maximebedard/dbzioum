@@ -1,9 +1,4 @@
-use super::buf_ext::BufExt;
-use super::value::Value;
 use bitflags::bitflags;
-use bytes::{Buf, Bytes};
-use std::cmp::max;
-use std::io;
 
 pub const MYSQL_NATIVE_PASSWORD_PLUGIN_NAME: &str = "mysql_native_password";
 pub const CACHING_SHA2_PASSWORD_PLUGIN_NAME: &str = "caching_sha2_password";
@@ -38,6 +33,7 @@ bitflags! {
 
 // https://dev.mysql.com/doc/internals/en/capability-flags.html#flag-CLIENT_PROTOCOL_41
 bitflags! {
+    // https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html
     #[derive(Debug, Clone, Copy)]
     pub struct CapabilityFlags: u32 {
       const CLIENT_LONG_PASSWORD = 0x00000001;
@@ -55,7 +51,7 @@ bitflags! {
       const CLIENT_IGNORE_SIGPIPE = 0x00001000;
       const CLIENT_TRANSACTIONS = 0x00002000;
       const CLIENT_RESERVED = 0x00004000;
-      const CLIENT_SECURE_CONNECTION = 0x00008000;
+      const CLIENT_RESERVED2    = 0x00008000;
       const CLIENT_MULTI_STATEMENTS = 0x00010000;
       const CLIENT_MULTI_RESULTS = 0x00020000;
       const CLIENT_PS_MULTI_RESULTS = 0x00040000;
@@ -424,37 +420,36 @@ pub enum Command {
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u8)]
 pub enum ColumnType {
-    MYSQL_TYPE_DECIMAL = 0,
-    MYSQL_TYPE_TINY,
-    MYSQL_TYPE_SHORT,
-    MYSQL_TYPE_LONG,
-    MYSQL_TYPE_FLOAT,
-    MYSQL_TYPE_DOUBLE,
-    MYSQL_TYPE_NULL,
-    MYSQL_TYPE_TIMESTAMP,
-    MYSQL_TYPE_LONGLONG,
-    MYSQL_TYPE_INT24,
-    MYSQL_TYPE_DATE,
-    MYSQL_TYPE_TIME,
-    MYSQL_TYPE_DATETIME,
-    MYSQL_TYPE_YEAR,
-    MYSQL_TYPE_NEWDATE,
-    MYSQL_TYPE_VARCHAR,
-    MYSQL_TYPE_BIT,
-    MYSQL_TYPE_TIMESTAMP2,
-    MYSQL_TYPE_DATETIME2,
-    MYSQL_TYPE_TIME2,
-    MYSQL_TYPE_JSON = 245,
-    MYSQL_TYPE_NEWDECIMAL = 246,
-    MYSQL_TYPE_ENUM = 247,
-    MYSQL_TYPE_SET = 248,
-    MYSQL_TYPE_TINY_BLOB = 249,
-    MYSQL_TYPE_MEDIUM_BLOB = 250,
-    MYSQL_TYPE_LONG_BLOB = 251,
-    MYSQL_TYPE_BLOB = 252,
-    MYSQL_TYPE_VAR_STRING = 253,
-    MYSQL_TYPE_STRING = 254,
-    MYSQL_TYPE_GEOMETRY = 255,
+    MYSQL_TYPE_DECIMAL = 0x00_u8,
+    MYSQL_TYPE_TINY = 0x01_u8,
+    MYSQL_TYPE_SHORT = 0x02_u8,
+    MYSQL_TYPE_LONG = 0x03_u8,
+    MYSQL_TYPE_FLOAT = 0x04_u8,
+    MYSQL_TYPE_DOUBLE = 0x05_u8,
+    MYSQL_TYPE_NULL = 0x06_u8,
+    MYSQL_TYPE_TIMESTAMP = 0x07_u8,
+    MYSQL_TYPE_LONGLONG = 0x08_u8,
+    MYSQL_TYPE_INT24 = 0x09_u8,
+    MYSQL_TYPE_DATE = 0x0a_u8,
+    MYSQL_TYPE_TIME = 0x0b_u8,
+    MYSQL_TYPE_DATETIME = 0x0c_u8,
+    MYSQL_TYPE_YEAR = 0x0d_u8,
+    MYSQL_TYPE_VARCHAR = 0x0f_u8,
+    MYSQL_TYPE_BIT = 0x10_u8,
+    MYSQL_TYPE_TIMESTAMP2 = 0x11_u8,
+    MYSQL_TYPE_DATETIME2 = 0x12_u8,
+    MYSQL_TYPE_TIME2 = 0x13_u8,
+    MYSQL_TYPE_JSON = 0xf5_u8,
+    MYSQL_TYPE_NEWDECIMAL = 0xf6_u8,
+    MYSQL_TYPE_ENUM = 0xf7_u8,
+    MYSQL_TYPE_SET = 0xf8_u8,
+    MYSQL_TYPE_TINY_BLOB = 0xf9_u8,
+    MYSQL_TYPE_MEDIUM_BLOB = 0xfa_u8,
+    MYSQL_TYPE_LONG_BLOB = 0xfb_u8,
+    MYSQL_TYPE_BLOB = 0xfc_u8,
+    MYSQL_TYPE_VAR_STRING = 0xfd_u8,
+    MYSQL_TYPE_STRING = 0xfe_u8,
+    MYSQL_TYPE_GEOMETRY = 0xff_u8,
 }
 
 impl From<u8> for ColumnType {
@@ -490,340 +485,7 @@ impl From<u8> for ColumnType {
             0xfd_u8 => ColumnType::MYSQL_TYPE_VAR_STRING,
             0xfe_u8 => ColumnType::MYSQL_TYPE_STRING,
             0xff_u8 => ColumnType::MYSQL_TYPE_GEOMETRY,
-            _ => panic!("Unknown column type {}", x),
+            _ => panic!("invalid column type {}", x),
         }
     }
-}
-
-#[derive(Debug)]
-pub struct Handshake {
-    capabilities: CapabilityFlags,
-    protocol_version: u8,
-    scramble_1: Vec<u8>,
-    scramble_2: Option<Vec<u8>>,
-    auth_plugin_name: Option<String>,
-    character_set: CharacterSet,
-    status_flags: StatusFlags,
-}
-
-impl Handshake {
-    pub(crate) fn parse(buffer: impl Into<Bytes>) -> io::Result<Self> {
-        let mut b = buffer.into();
-        let protocol_version = b.get_u8();
-        let server_version = b.split_to(null_terminated_pos(b.chunk()));
-        b.advance(1);
-        let connection_id = b.get_u32_le();
-        let scramble_1 = b.split_to(8).to_vec();
-        b.advance(1);
-        let capabilities_1 = b.get_u16_le();
-        let character_set = b.get_u8().into();
-        let status_flags = StatusFlags::from_bits_truncate(b.get_u16_le());
-        let capabilities_2 = b.get_u16_le();
-        let scramble_len = b.get_u8();
-        b.advance(10);
-
-        let capabilities = CapabilityFlags::from_bits_truncate(
-            capabilities_1 as u32 | ((capabilities_2 as u32) << 16),
-        );
-
-        let mut scramble_2 = None;
-        if capabilities.contains(CapabilityFlags::CLIENT_SECURE_CONNECTION) {
-            scramble_2 = Some(
-                b.split_to(max(12, scramble_len as i8 - 9) as usize)
-                    .to_vec(),
-            );
-            b.advance(1);
-        }
-
-        let mut auth_plugin_name = None;
-        if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
-            auth_plugin_name = Some(b.mysql_null_terminated_string().unwrap());
-        }
-
-        Ok(Self {
-            capabilities,
-            protocol_version,
-            scramble_1,
-            scramble_2,
-            auth_plugin_name,
-            status_flags,
-            character_set,
-        })
-    }
-
-    pub fn status_flags(&self) -> StatusFlags {
-        self.status_flags
-    }
-
-    pub fn character_set(&self) -> CharacterSet {
-        self.character_set
-    }
-
-    pub fn protocol_version(&self) -> u8 {
-        self.protocol_version
-    }
-
-    pub fn capabilities(&self) -> CapabilityFlags {
-        self.capabilities
-    }
-
-    pub fn nonce(&self) -> Vec<u8> {
-        let mut out = self.scramble_1.clone();
-
-        if let Some(ref scramble_2) = self.scramble_2 {
-            out.extend_from_slice(scramble_2);
-        }
-
-        out
-    }
-
-    pub fn auth_plugin_name(&self) -> &str {
-        self.auth_plugin_name
-            .as_ref()
-            .map(String::as_str)
-            .unwrap_or("") // TODO: potentially have a saner default here...
-    }
-}
-
-#[derive(Debug)]
-pub struct Packet {
-    sequence_id: u8,
-    payload: Vec<u8>,
-}
-
-impl Packet {
-    pub fn check(b: &mut impl Buf) -> bool {
-        if b.remaining() < 4 {
-            return false;
-        }
-
-        let payload_len = b.get_uint_le(3) as usize;
-        b.advance(1);
-        b.remaining() >= payload_len
-    }
-
-    pub fn parse(b: &mut impl Buf) -> io::Result<Self> {
-        let payload_len = b.get_uint_le(3) as usize;
-        let sequence_id = b.get_u8();
-
-        let mut payload = vec![0; payload_len];
-        b.copy_to_slice(payload.as_mut_slice());
-
-        Ok(Self {
-            sequence_id,
-            payload,
-        })
-    }
-
-    pub fn sequence_id(&self) -> u8 {
-        self.sequence_id
-    }
-
-    pub fn take_payload(self) -> Vec<u8> {
-        self.payload
-    }
-}
-
-#[derive(Debug)]
-pub struct Row(Vec<Value>);
-
-impl Row {
-    pub(crate) fn parse(buffer: impl Into<Bytes>, columns: &Vec<Column>) -> io::Result<Self> {
-        let mut values = Vec::with_capacity(columns.len());
-        let mut b = buffer.into();
-
-        for i in 0..columns.len() {
-            let value = parse_value_from_text(&mut b, &columns[i])?;
-            values.push(value);
-        }
-
-        Ok(Self(values))
-    }
-
-    pub fn values(&self) -> &[Value] {
-        self.0.as_slice()
-    }
-}
-
-#[derive(Debug)]
-pub struct Column {
-    catalog: String,
-    schema: String,
-    table: String,
-    name: String,
-    org_table: String,
-    character_set: CharacterSet,
-    column_length: u32,
-    column_type: ColumnType,
-    flags: ColumnFlags,
-    decimals: u8,
-}
-
-impl Column {
-    pub(crate) fn parse(buffer: impl Into<Bytes>) -> io::Result<Self> {
-        let mut b = buffer.into();
-        let catalog = b.mysql_get_lenc_string().unwrap();
-        assert_eq!("def", catalog.as_str());
-        let schema = b.mysql_get_lenc_string().unwrap();
-        let table = b.mysql_get_lenc_string().unwrap();
-        let org_table = b.mysql_get_lenc_string().unwrap();
-        let name = b.mysql_get_lenc_string().unwrap();
-        let org_name = b.mysql_get_lenc_string().unwrap();
-        let fixed_len = b.mysql_get_lenc_uint().unwrap();
-        assert_eq!(0x0C, fixed_len);
-        let character_set = (b.get_u16_le() as u8).into();
-        let column_length = b.get_u32_le();
-        let column_type = b.get_u8().into();
-        let flags = ColumnFlags::from_bits_truncate(b.get_u16_le());
-        let decimals = b.get_u8();
-
-        Ok(Self {
-            catalog,
-            schema,
-            table,
-            name,
-            org_table,
-            character_set,
-            column_length,
-            column_type,
-            flags,
-            decimals,
-        })
-    }
-
-    pub fn column_type(&self) -> ColumnType {
-        self.column_type
-    }
-
-    pub fn flags(&self) -> ColumnFlags {
-        self.flags
-    }
-}
-
-// https://dev.mysql.com/doc/internals/en/packet-ERR_Packet.html
-#[derive(Debug)]
-pub struct ServerError {
-    error_code: u16,
-    state_marker: Option<String>,
-    state: Option<String>,
-    error_message: String,
-}
-
-impl ServerError {
-    pub(crate) fn parse(
-        buffer: impl Into<Bytes>,
-        capability_flags: CapabilityFlags,
-    ) -> io::Result<Self> {
-        let mut b = buffer.into();
-        let _header = b.get_u8();
-        let error_code = b.get_u16_le();
-
-        let mut state_marker = None;
-        let mut state = None;
-
-        if capability_flags.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
-            let state_marker = Some(b.mysql_get_fixed_length_string(1).unwrap());
-            let state = Some(b.mysql_get_fixed_length_string(5).unwrap());
-        }
-
-        let error_message = b.mysql_get_eof_string().unwrap();
-        Ok(Self {
-            error_code,
-            state_marker,
-            state,
-            error_message,
-        })
-    }
-}
-
-// https://dev.mysql.com/doc/internals/en/packet-OK_Packet.html
-#[derive(Debug)]
-pub struct ServerOk {
-    affected_rows: u64,
-    last_inserted_id: u64,
-    status_flags: Option<StatusFlags>,
-    warnings: Option<u16>,
-    info: String,
-    session_state_changes: Option<String>,
-}
-
-impl ServerOk {
-    pub(crate) fn parse(
-        buffer: impl Into<Bytes>,
-        capability_flags: CapabilityFlags,
-    ) -> io::Result<Self> {
-        let mut b = buffer.into();
-        let _header = b.get_u8();
-        let affected_rows = b.mysql_get_lenc_uint().unwrap();
-        let last_inserted_id = b.mysql_get_lenc_uint().unwrap();
-
-        let mut status_flags = None;
-        let mut warnings = None;
-        if capability_flags.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
-            status_flags = Some(StatusFlags::from_bits_truncate(b.get_u16_le()));
-            warnings = Some(b.get_u16_le());
-        } else if capability_flags.contains(CapabilityFlags::CLIENT_TRANSACTIONS) {
-            status_flags = Some(StatusFlags::from_bits_truncate(b.get_u16_le()));
-        }
-
-        let (info, session_state_changes) =
-            if capability_flags.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
-                let info = b.mysql_get_lenc_string().unwrap();
-
-                let has_session_state_changes = status_flags
-                    .map(|f| f.contains(StatusFlags::SERVER_SESSION_STATE_CHANGED))
-                    .unwrap_or(false);
-
-                let mut session_state_changes = None;
-                if has_session_state_changes {
-                    session_state_changes = Some(b.mysql_get_lenc_string().unwrap())
-                }
-
-                (info, session_state_changes)
-            } else {
-                let info = b.mysql_get_eof_string().unwrap();
-                (info, None)
-            };
-
-        Ok(Self {
-            affected_rows,
-            last_inserted_id,
-            status_flags,
-            warnings,
-            info,
-            session_state_changes,
-        })
-    }
-
-    pub fn affected_rows(&self) -> u64 {
-        self.affected_rows
-    }
-    pub fn last_inserted_id(&self) -> u64 {
-        self.last_inserted_id
-    }
-    pub fn status_flags(&self) -> Option<StatusFlags> {
-        self.status_flags
-    }
-    pub fn warnings(&self) -> Option<u16> {
-        self.warnings
-    }
-}
-
-fn parse_value_from_text(b: &mut impl Buf, column: &Column) -> io::Result<Value> {
-    // TODO: I HAVE NO IDEA HOW TO HANDLE THIS CLEANLY JUST YET...
-    // IF MYSQL ALWAYS RETURNS THE VALUES INTO THE CLIENT FORMATTED COLLATION, THEN WE CAN LAZILY CONVERT IT TO UTF8 AND SUPPORT METHODS TO TRANSCODE FROM ONE FORMAT TO THE OTHER
-    // OTHERWISE, WE HAVE TO DO THE CONVERSION OURSELVES BASED ON THE COLUMN COLLATION.
-    //
-    // ALWAYS ASSUME UTF-8, but in theory, the client could have a completely different charset
-    // We should convert it into a value based off of the column's charset, back into our client charset, and so on.
-    if let Some(0xFB) = b.peek_u8() {
-        Ok(Value::Null)
-    } else {
-        let bytes = b.mysql_get_lenc_bytes().unwrap();
-        Ok(Value::Bytes(bytes))
-    }
-}
-
-pub fn null_terminated_pos(b: &[u8]) -> usize {
-    b.iter().position(|b| *b == 0x00).unwrap_or(b.len())
 }

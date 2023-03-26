@@ -397,7 +397,7 @@ impl TableMapEvent {
                     column_metas[i] = 0_u16;
                 }
 
-                _ => panic!("{:?} not supported", t),
+                _ => unimplemented!(),
             }
         }
 

@@ -80,14 +80,32 @@ pub trait BufExt: Buf {
                 io::ErrorKind::Other,
                 "Invalid length-encoded integer value",
             )),
-            x => Ok(x as u64),
+            x => Ok(x.into()),
         }
     }
 }
 
 pub trait BufMutExt: BufMut {
-    fn put_lenc_uint(&mut self, v: u64) -> io::Result<u64> {
-        todo!()
+    fn mysql_put_lenc_uint(&mut self, v: u64) {
+        if v < 251 {
+            self.put_u8(v as u8);
+            return;
+        }
+
+        if v < 2_u64.pow(16) {
+            self.put_u8(0xFC);
+            self.put_uint_le(v, 2);
+            return;
+        }
+
+        if v < 2_u64.pow(24) {
+            self.put_u8(0xFD);
+            self.put_uint_le(v, 3);
+            return;
+        }
+
+        self.put_u8(0xFE);
+        self.put_uint_le(v, 8);
     }
 }
 
