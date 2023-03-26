@@ -2,6 +2,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::cmp::max;
 use std::io;
 use std::net::SocketAddr;
+use std::slice::{ChunksExact, ChunksExactMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::TcpStream;
 
@@ -118,8 +119,9 @@ impl Connection {
         let payload = self.read_payload().await;
 
         match payload {
-            Ok(payload) => self.parse_and_handle_server_ok(payload),
-            Err(err) if err.kind() == io::ErrorKind::ConnectionAborted => Ok(()),
+            Ok(payload) => Err(self.parse_and_handle_server_error(payload)),
+            // read_exact will return an UnexpectedEof if the stream is unable to fill the buffer.
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
             Err(err) => Err(err),
         }
     }
@@ -129,10 +131,7 @@ impl Connection {
         let payload = self.read_payload().await?;
 
         match payload.get(0) {
-            Some(0xFF) => {
-                let err = ServerError::parse(payload, self.capabilities)?;
-                Err(self.handle_server_error(err))
-            }
+            Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
             Some(_) => {
                 let handshake = Handshake::parse(payload)?;
                 self.handle_handshake(handshake).await.map_err(Into::into)
@@ -145,7 +144,10 @@ impl Connection {
     }
 
     fn handle_server_error(&mut self, err: ServerError) -> io::Error {
-        panic!("err = {:?}", err);
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Server error {}: {}", err.error_code, err.error_message),
+        )
     }
 
     async fn handle_handshake(&mut self, p: Handshake) -> io::Result<()> {
@@ -161,7 +163,6 @@ impl Connection {
         self.capabilities = p.capabilities & default_client_capabilities(&self.opts);
         self.status_flags = p.status_flags;
         self.server_character_set = p.character_set;
-        // potentially keep the server version too?
 
         if self.opts.use_ssl {
             // TODO: ssl
@@ -194,12 +195,15 @@ impl Connection {
 
     /// Send a text query to MYSQL and yield only the first result.
     pub async fn pop(&mut self, query: impl AsRef<str>) -> io::Result<QueryResults> {
-        self.query(query)
-            .await
-            .map(|QueryResults { columns, mut rows }| QueryResults {
+        self.query(query).await.map(
+            |QueryResults {
+                 columns,
+                 values: mut rows,
+             }| QueryResults {
                 columns,
-                rows: rows.pop().map(|r| vec![r]).unwrap_or_default(),
-            })
+                values: rows.pop().map(|r| vec![r]).unwrap_or_default(),
+            },
+        )
     }
 
     pub async fn ping(&mut self) -> io::Result<()> {
@@ -207,10 +211,11 @@ impl Connection {
 
         let payload = self.read_payload().await?;
         match payload.get(0) {
-            Some(0x00) => ServerOk::parse(payload, self.capabilities)
-                .map(|ok| self.handle_ok(ok))
-                .map_err(Into::into),
-            _ => unimplemented!(),
+            Some(0x00) => self.parse_and_handle_server_ok(payload),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Unexpected response from mysql",
+            )),
         }
     }
 
@@ -247,10 +252,7 @@ impl Connection {
 
         match payload.get(0) {
             Some(0x00) => self.parse_and_handle_server_ok(payload),
-            Some(0xFF) => {
-                let err = ServerError::parse(payload, self.capabilities)?;
-                Err(self.handle_server_error(err))
-            }
+            Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
             Some(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid data while parsing generic response",
@@ -271,16 +273,16 @@ impl Connection {
                 self.parse_and_handle_server_ok(payload)?;
                 todo!();
             }
-            Some(0xFF) => {
-                let err = ServerError::parse(payload, self.capabilities)?;
-                Err(self.handle_server_error(err))
-            }
+            Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
             Some(0xFB) => todo!("infile not supported"),
             Some(_) => {
                 let column_count = payload.as_slice().mysql_get_lenc_uint().unwrap() as usize;
                 let columns = self.read_columns(column_count).await?;
                 let rows = self.read_rows(&columns).await?;
-                let query_results = QueryResults { columns, rows };
+                let query_results = QueryResults {
+                    columns,
+                    values: rows,
+                };
                 Ok(query_results)
             }
             None => Err(io::Error::new(
@@ -297,8 +299,7 @@ impl Connection {
             let payload = self.read_payload().await?;
             match payload.get(0) {
                 Some(0x00) => {
-                    let _ =
-                        ServerOk::parse(payload, self.capabilities).map(|ok| self.handle_ok(ok))?;
+                    self.parse_and_handle_server_ok(payload)?;
                     break;
                 }
                 Some(_) => {
@@ -316,7 +317,7 @@ impl Connection {
         Ok(columns)
     }
 
-    async fn read_rows(&mut self, columns: &Vec<Column>) -> io::Result<Vec<Row>> {
+    async fn read_rows(&mut self, columns: &Vec<Column>) -> io::Result<Vec<RowValue>> {
         // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::ResultsetRow
         let mut rows = Vec::new();
         loop {
@@ -324,11 +325,11 @@ impl Connection {
 
             match payload.get(0) {
                 Some(0x00) | Some(0xFE) => {
-                    ServerOk::parse(payload, self.capabilities).map(|ok| self.handle_ok(ok))?;
+                    self.parse_and_handle_server_ok(payload)?;
                     break;
                 }
                 Some(_) => {
-                    let row = Row::parse(payload, columns)?;
+                    let row = RowValue::parse(payload, columns)?;
                     rows.push(row);
                 }
                 None => {
@@ -350,8 +351,7 @@ impl Connection {
             MYSQL_NATIVE_PASSWORD_PLUGIN_NAME | CACHING_SHA2_PASSWORD_PLUGIN_NAME => {
                 if payload.as_slice() == &[0x01, 0x03] {
                     let payload = self.read_payload().await?;
-                    self.parse_and_handle_server_ok(payload)?;
-                    return Ok(());
+                    return self.parse_and_handle_server_ok(payload);
                 }
 
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "todo"));
@@ -360,7 +360,7 @@ impl Connection {
         }
     }
 
-    fn handle_ok(&mut self, ok: ServerOk) {
+    fn handle_server_ok(&mut self, ok: ServerOk) {
         self.affected_rows = ok.affected_rows;
         self.last_inserted_id = ok.last_inserted_id;
         self.status_flags = ok.status_flags.unwrap_or(StatusFlags::empty());
@@ -485,10 +485,7 @@ impl Connection {
                 let p = BinlogEventPacket::parse(payload)?;
                 Ok(Some(p.into_binlog_event()?))
             }
-            Some(0xFF) => {
-                self.parse_and_handle_server_error(payload)?;
-                todo!();
-            }
+            Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
             Some(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid data while parsing binlog event response",
@@ -501,14 +498,14 @@ impl Connection {
     }
 
     fn parse_and_handle_server_ok(&mut self, payload: Vec<u8>) -> io::Result<()> {
-        ServerOk::parse(payload, self.capabilities)
-            .map(|ok| self.handle_ok(ok))
-            .map_err(Into::into)
+        ServerOk::parse(payload, self.capabilities).map(|ok| self.handle_server_ok(ok))
     }
 
-    fn parse_and_handle_server_error(&mut self, payload: Vec<u8>) -> io::Result<()> {
-        let err = ServerError::parse(payload, self.capabilities)?;
-        Err(self.handle_server_error(err))
+    fn parse_and_handle_server_error(&mut self, payload: Vec<u8>) -> io::Error {
+        match ServerError::parse(payload, self.capabilities) {
+            Ok(err) => self.handle_server_error(err),
+            Err(err) => err,
+        }
     }
 
     async fn ensure_checksum_is_disabled(&mut self) -> io::Result<()> {
@@ -808,26 +805,61 @@ impl ServerError {
 #[derive(Debug, Default)]
 pub struct QueryResults {
     columns: Vec<Column>,
-    rows: Vec<Row>,
+    values: Vec<RowValue>,
+}
+
+impl QueryResults {
+    pub fn row(&self, i: usize) -> &[RowValue] {
+        let start = i * self.columns.len();
+        let end = start + self.columns.len();
+        &self.values[start..end]
+    }
+
+    pub fn row_mut(&mut self, i: usize) -> &mut [RowValue] {
+        let start = i * self.columns.len();
+        let end = start + self.columns.len();
+        &mut self.values[start..end]
+    }
+
+    pub fn rows_len(&self) -> usize {
+        self.values.len() / self.columns.len()
+    }
+
+    pub fn rows(&self) -> Option<ChunksExact<'_, RowValue>> {
+        if self.columns.len() > 0 {
+            Some(self.values.chunks_exact(self.columns.len()))
+        } else {
+            None
+        }
+    }
+
+    pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, RowValue>> {
+        if self.columns.len() > 0 {
+            Some(self.values.chunks_exact_mut(self.columns.len()))
+        } else {
+            None
+        }
+    }
 }
 
 // https://mariadb.com/kb/en/connection/#sslrequest-packet
 // https://dev.mysql.com/doc/refman/8.0/en/charset-connection.html
 
 #[derive(Debug)]
-pub struct Row(Vec<Value>);
+pub struct RowValue(Value);
 
-impl Row {
+impl RowValue {
     fn parse(buffer: impl AsRef<[u8]>, columns: &Vec<Column>) -> io::Result<Self> {
-        let mut b = buffer.as_ref();
-        let mut values = Vec::with_capacity(columns.len());
+        todo!()
+        // let mut b = buffer.as_ref();
+        // let mut values = Vec::with_capacity(columns.len());
 
-        for i in 0..columns.len() {
-            let value = parse_value_from_text(&mut b, &columns[i])?;
-            values.push(value);
-        }
+        // for i in 0..columns.len() {
+        //     let value = parse_value_from_text(&mut b, &columns[i])?;
+        //     values.push(value);
+        // }
 
-        Ok(Self(values))
+        // Ok(Self(values))
     }
 }
 
@@ -876,20 +908,4 @@ impl Column {
             decimals,
         })
     }
-}
-
-fn parse_value_from_text(b: &mut impl Buf, column: &Column) -> io::Result<Value> {
-    // TODO: I HAVE NO IDEA HOW TO HANDLE THIS CLEANLY JUST YET...
-    // IF MYSQL ALWAYS RETURNS THE VALUES INTO THE CLIENT FORMATTED COLLATION, THEN WE CAN LAZILY CONVERT IT TO UTF8 AND SUPPORT METHODS TO TRANSCODE FROM ONE FORMAT TO THE OTHER
-    // OTHERWISE, WE HAVE TO DO THE CONVERSION OURSELVES BASED ON THE COLUMN COLLATION.
-    //
-    // ALWAYS ASSUME UTF-8, but in theory, the client could have a completely different charset
-    // We should convert it into a value based off of the column's charset, back into our client charset, and so on.
-    // if let Some(0xFB) = b.peek_u8() {
-    //     Ok(Value::Null)
-    // } else {
-    //     let bytes = b.mysql_get_lenc_bytes().unwrap();
-    //     Ok(Value::Bytes(bytes))
-    // }
-    todo!()
 }

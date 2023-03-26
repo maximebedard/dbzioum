@@ -1,4 +1,3 @@
-use std::fmt;
 use std::slice::{ChunksExact, ChunksExactMut};
 use std::{io, net::SocketAddr};
 
@@ -229,17 +228,21 @@ impl Connection {
         Ok(())
     }
 
+    pub async fn ping(&mut self) -> io::Result<()> {
+        self.simple_query("SELECT 1").await.map(|_| ())
+    }
+
     pub async fn start_replication(
         &mut self,
-        slot: Option<impl AsRef<str> + fmt::Display>,
-        location: impl AsRef<str> + fmt::Display,
+        slot: Option<impl AsRef<str>>,
+        location: impl AsRef<str>,
         tid: Option<i32>,
     ) -> io::Result<()> {
         let mut query = "START_REPLICATION".to_string();
         if let Some(slot) = slot {
-            query = format!("{} SLOT {}", query, slot);
+            query = format!("{} SLOT {}", query, slot.as_ref());
         }
-        query = format!("{} {}", query, location);
+        query = format!("{} {}", query, location.as_ref());
         if let Some(tid) = tid {
             query = format!("{} TIMELINE {}", query, tid);
         }
@@ -247,56 +250,39 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn create_replication_slot(
-        &mut self,
-        slot: impl AsRef<str> + fmt::Display,
-    ) -> io::Result<()> {
-        self.simple_query(format!("CREATE_REPLICATION_SLOT {} LOGICAL wal2json", slot))
-            .await?;
-        Ok(())
+    pub async fn create_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<()> {
+        self.simple_query(format!(
+            "CREATE_REPLICATION_SLOT {} LOGICAL wal2json",
+            slot.as_ref()
+        ))
+        .await
+        .map(|_| ())
     }
 
-    pub async fn delete_replication_slot(
-        &mut self,
-        slot: impl AsRef<str> + fmt::Display,
-    ) -> io::Result<()> {
-        self.simple_query(format!("DROP_REPLICATION_SLOT {}", slot))
-            .await?;
-        Ok(())
+    pub async fn delete_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<()> {
+        self.simple_query(format!("DROP_REPLICATION_SLOT {}", slot.as_ref()))
+            .await
+            .map(|_| ())
     }
 
-    pub async fn replication_slot_exists(
-        &mut self,
-        slot: impl AsRef<str> + fmt::Display,
-    ) -> io::Result<bool> {
-        let result = self
-            .simple_query(format!(
-                "select * from pg_replication_slots where slot_name = '{}';",
-                slot
-            ))
-            .await?;
-        Ok(result.columns.len() > 0)
+    pub async fn replication_slot_exists(&mut self, slot: impl AsRef<str>) -> io::Result<bool> {
+        self.simple_query(format!(
+            "select * from pg_replication_slots where slot_name = '{}';",
+            slot.as_ref()
+        ))
+        .await
+        .map(|result| result.values.len() > 0)
     }
 
     pub async fn identify_system(&mut self) -> io::Result<SimpleQueryResult> {
         self.simple_query("IDENTIFY_SYSTEM").await
     }
 
-    pub async fn show(
-        &mut self,
-        name: impl AsRef<str> + fmt::Display,
-    ) -> io::Result<SimpleQueryResult> {
-        self.simple_query(format!("SHOW {}", name)).await
-    }
-
     pub async fn timeline_history(&mut self, tid: i32) -> io::Result<SimpleQueryResult> {
         self.simple_query(format!("TIMELINE_HISTORY {}", tid)).await
     }
 
-    async fn write_query_command(
-        &mut self,
-        command: impl AsRef<str> + fmt::Display,
-    ) -> io::Result<()> {
+    async fn write_query_command(&mut self, command: impl AsRef<str>) -> io::Result<()> {
         let len = command.as_ref().as_bytes().len() + 1 + 4;
         self.stream.write_u8(b'Q').await?;
         self.stream.write_i32(len as i32).await?;
@@ -306,14 +292,14 @@ impl Connection {
         Ok(())
     }
 
-    async fn simple_query(
+    pub async fn simple_query(
         &mut self,
-        command: impl AsRef<str> + fmt::Display,
+        command: impl AsRef<str>,
     ) -> io::Result<SimpleQueryResult> {
         self.write_query_command(command).await?;
 
-        let mut fields: Vec<SimpleField> = Vec::new();
         let mut columns: Vec<SimpleColumn> = Vec::new();
+        let mut values: Vec<SimpleRowValue> = Vec::new();
 
         loop {
             match self.stream.read_u8().await? {
@@ -397,9 +383,9 @@ impl Connection {
                     //     Int16
                     //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
                     self.stream.read_i32().await?; // skip len
-                    let num_fields = self.stream.read_i16().await?;
-                    let mut tmp_fields = Vec::with_capacity(num_fields as usize);
-                    for i in 0..num_fields {
+                    let num_columns = self.stream.read_i16().await?;
+                    let mut tmp_columns = Vec::with_capacity(num_columns as usize);
+                    for i in 0..num_columns {
                         let name = self.read_c_string().await?;
                         let oid = self.stream.read_i32().await?;
                         let attr_number = self.stream.read_i16().await?;
@@ -408,7 +394,7 @@ impl Connection {
                         let type_modifier = self.stream.read_i32().await?;
                         let format = self.stream.read_i16().await?;
 
-                        tmp_fields.push(SimpleField {
+                        tmp_columns.push(SimpleColumn {
                             name,
                             oid,
                             attr_number,
@@ -418,7 +404,7 @@ impl Connection {
                             format,
                         });
                     }
-                    fields = tmp_fields;
+                    columns = tmp_columns;
                 }
                 b'D' => {
                     // DataRow (B)
@@ -435,22 +421,22 @@ impl Connection {
                     //         The value of the column, in the format indicated by the associated format code. n is the above length.
 
                     self.stream.read_i32().await?; // skip len
-                    let num_columns = self.stream.read_i16().await?;
-                    let mut tmp_columns = Vec::with_capacity(num_columns as usize);
-                    for i in 0..num_columns {
+                    let num_values = self.stream.read_i16().await?;
+                    let mut tmp_values = Vec::with_capacity(num_values as usize);
+                    for i in 0..num_values {
                         let len = self.stream.read_i32().await?;
 
                         if len > 0 {
                             let mut buffer = vec![0; len as usize];
                             self.stream.read_exact(&mut buffer).await?;
-                            tmp_columns.push(Some(String::from_utf8(buffer).unwrap()));
+                            tmp_values.push(Some(String::from_utf8(buffer).unwrap()));
                         } else if len == 0 {
-                            tmp_columns.push(Some("".to_string()));
+                            tmp_values.push(Some("".to_string()));
                         } else if len == -1 {
-                            tmp_columns.push(None);
+                            tmp_values.push(None);
                         }
                     }
-                    columns = tmp_columns;
+                    values = tmp_values;
                 }
                 b'I' => {
                     // EmptyQueryResponse (B)
@@ -479,7 +465,7 @@ impl Connection {
             }
         }
 
-        Ok(SimpleQueryResult { fields, columns })
+        Ok(SimpleQueryResult { columns, values })
     }
 
     async fn read_ready_for_query(&mut self) -> io::Result<()> {
@@ -571,7 +557,7 @@ impl Connection {
 }
 
 #[derive(Debug)]
-pub struct SimpleField {
+pub struct SimpleColumn {
     name: String,
     oid: i32,
     attr_number: i16,
@@ -581,26 +567,42 @@ pub struct SimpleField {
     format: i16,
 }
 
-pub type SimpleColumn = Option<String>;
+pub type SimpleRowValue = Option<String>;
 
 #[derive(Debug)]
 pub struct SimpleQueryResult {
-    pub fields: Vec<SimpleField>,
     pub columns: Vec<SimpleColumn>,
+    pub values: Vec<SimpleRowValue>,
 }
 
 impl SimpleQueryResult {
-    pub fn rows(&self) -> Option<ChunksExact<'_, SimpleColumn>> {
-        if self.fields.len() > 0 {
-            Some(self.columns.chunks_exact(self.fields.len()))
+    pub fn row(&self, i: usize) -> &[SimpleRowValue] {
+        let start = i * self.columns.len();
+        let end = start + self.columns.len();
+        &self.values[start..end]
+    }
+
+    pub fn row_mut(&mut self, i: usize) -> &mut [SimpleRowValue] {
+        let start = i * self.columns.len();
+        let end = start + self.columns.len();
+        &mut self.values[start..end]
+    }
+
+    pub fn rows_len(&self) -> usize {
+        self.values.len() / self.columns.len()
+    }
+
+    pub fn rows(&self) -> Option<ChunksExact<'_, SimpleRowValue>> {
+        if self.columns.len() > 0 {
+            Some(self.values.chunks_exact(self.columns.len()))
         } else {
             None
         }
     }
 
-    pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, SimpleColumn>> {
-        if self.fields.len() > 0 {
-            Some(self.columns.chunks_exact_mut(self.fields.len()))
+    pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, SimpleRowValue>> {
+        if self.columns.len() > 0 {
+            Some(self.values.chunks_exact_mut(self.columns.len()))
         } else {
             None
         }
