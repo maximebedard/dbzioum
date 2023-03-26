@@ -15,98 +15,10 @@
 // 00000080  38 0d 00 08 00 12 00 04  04 04 04 12 00 00 5f 00  |8............._.|
 // 00000090  04 1a 08 00 00 00 08 08  08 02 00 00 00 0a 0a 0a  |................|
 
-use super::buf_ext::BufExt;
 use super::protocol::ColumnType;
+use super::{buf_ext::BufExt, protocol::BinlogEventType};
 use bytes::{Buf, Bytes};
 use std::io;
-
-use std::iter::Iterator;
-
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-#[repr(u8)]
-enum EventType {
-    UNKNOWN_EVENT,
-    START_EVENT_V3,
-    QUERY_EVENT,
-    STOP_EVENT,
-    ROTATE_EVENT,
-    INTVAR_EVENT,
-    LOAD_EVENT,
-    SLAVE_EVENT,
-    CREATE_FILE_EVENT,
-    APPEND_BLOCK_EVENT,
-    EXEC_LOAD_EVENT,
-    DELETE_FILE_EVENT,
-    NEW_LOAD_EVENT,
-    RAND_EVENT,
-    USER_VAR_EVENT,
-    FORMAT_DESCRIPTION_EVENT,
-    XID_EVENT,
-    BEGIN_LOAD_QUERY_EVENT,
-    EXECUTE_LOAD_QUERY_EVENT,
-    TABLE_MAP_EVENT,
-    WRITE_ROWS_EVENTV0,
-    UPDATE_ROWS_EVENTV0,
-    DELETE_ROWS_EVENTV0,
-    WRITE_ROWS_EVENTV1,
-    UPDATE_ROWS_EVENTV1,
-    DELETE_ROWS_EVENTV1,
-    INCIDENT_EVENT,
-    HEARTBEAT_EVENT,
-    IGNORABLE_EVENT,
-    ROWS_QUERY_EVENT,
-    WRITE_ROWS_EVENTV2,
-    UPDATE_ROWS_EVENTV2,
-    DELETE_ROWS_EVENTV2,
-    GTID_EVENT,
-    ANONYMOUS_GTID_EVENT,
-    PREVIOUS_GTIDS_EVENT,
-}
-
-impl From<u8> for EventType {
-    fn from(x: u8) -> EventType {
-        match x {
-            0x00_u8 => EventType::UNKNOWN_EVENT,
-            0x01_u8 => EventType::START_EVENT_V3,
-            0x02_u8 => EventType::QUERY_EVENT,
-            0x03_u8 => EventType::STOP_EVENT,
-            0x04_u8 => EventType::ROTATE_EVENT,
-            0x05_u8 => EventType::INTVAR_EVENT,
-            0x06_u8 => EventType::LOAD_EVENT,
-            0x07_u8 => EventType::SLAVE_EVENT,
-            0x08_u8 => EventType::CREATE_FILE_EVENT,
-            0x09_u8 => EventType::APPEND_BLOCK_EVENT,
-            0x0a_u8 => EventType::EXEC_LOAD_EVENT,
-            0x0b_u8 => EventType::DELETE_FILE_EVENT,
-            0x0c_u8 => EventType::NEW_LOAD_EVENT,
-            0x0d_u8 => EventType::RAND_EVENT,
-            0x0e_u8 => EventType::USER_VAR_EVENT,
-            0x0f_u8 => EventType::FORMAT_DESCRIPTION_EVENT,
-            0x10_u8 => EventType::XID_EVENT,
-            0x11_u8 => EventType::BEGIN_LOAD_QUERY_EVENT,
-            0x12_u8 => EventType::EXECUTE_LOAD_QUERY_EVENT,
-            0x13_u8 => EventType::TABLE_MAP_EVENT,
-            0x14_u8 => EventType::WRITE_ROWS_EVENTV0,
-            0x15_u8 => EventType::UPDATE_ROWS_EVENTV0,
-            0x16_u8 => EventType::DELETE_ROWS_EVENTV0,
-            0x17_u8 => EventType::WRITE_ROWS_EVENTV1,
-            0x18_u8 => EventType::UPDATE_ROWS_EVENTV1,
-            0x19_u8 => EventType::DELETE_ROWS_EVENTV1,
-            0x1a_u8 => EventType::INCIDENT_EVENT,
-            0x1b_u8 => EventType::HEARTBEAT_EVENT,
-            0x1c_u8 => EventType::IGNORABLE_EVENT,
-            0x1d_u8 => EventType::ROWS_QUERY_EVENT,
-            0x1e_u8 => EventType::WRITE_ROWS_EVENTV2,
-            0x1f_u8 => EventType::UPDATE_ROWS_EVENTV2,
-            0x20_u8 => EventType::DELETE_ROWS_EVENTV2,
-            0x21_u8 => EventType::GTID_EVENT,
-            0x22_u8 => EventType::ANONYMOUS_GTID_EVENT,
-            0x23_u8 => EventType::PREVIOUS_GTIDS_EVENT,
-            _ => EventType::UNKNOWN_EVENT,
-        }
-    }
-}
 
 // pub fn parse_event2(mut payload: &[u8]) -> io::Result<()> {
 //     // skip OK byte
@@ -175,7 +87,7 @@ pub struct BinlogEventPacket {
     server_id: u32,
     log_pos: u32,
     flags: u16,
-    event_type: EventType,
+    event_type: BinlogEventType,
     payload: Vec<u8>,
 }
 
@@ -194,7 +106,7 @@ impl BinlogEventPacket {
         b.advance(1);
 
         let timestamp = b.get_u32_le();
-        let event_type = b.get_u8().into();
+        let event_type = b.get_u8().try_into().unwrap();
         let server_id = b.get_u32_le();
         let event_size = (b.get_u32_le() - 19) as usize;
         let log_pos = b.get_u32_le();
@@ -213,54 +125,56 @@ impl BinlogEventPacket {
 
     pub fn into_binlog_event(self) -> io::Result<BinlogEvent> {
         match self.event_type {
-            EventType::TABLE_MAP_EVENT => {
+            BinlogEventType::TABLE_MAP_EVENT => {
                 Ok(BinlogEvent::TableMap(TableMapEvent::parse(self.payload)?))
             }
-            EventType::ROTATE_EVENT => Ok(BinlogEvent::Rotate(RotateEvent::parse(self.payload)?)),
-            EventType::FORMAT_DESCRIPTION_EVENT => Ok(BinlogEvent::Format(
+            BinlogEventType::ROTATE_EVENT => {
+                Ok(BinlogEvent::Rotate(RotateEvent::parse(self.payload)?))
+            }
+            BinlogEventType::FORMAT_DESCRIPTION_EVENT => Ok(BinlogEvent::Format(
                 FormatDescriptionEvent::parse(self.payload)?,
             )),
-            EventType::WRITE_ROWS_EVENTV0 => Ok(BinlogEvent::Insert(RowEvent::parse(
+            BinlogEventType::WRITE_ROWS_EVENTV0 => Ok(BinlogEvent::Insert(RowEvent::parse(
                 self.payload,
                 false,
                 false,
             )?)),
-            EventType::WRITE_ROWS_EVENTV1 => Ok(BinlogEvent::Insert(RowEvent::parse(
+            BinlogEventType::WRITE_ROWS_EVENTV1 => Ok(BinlogEvent::Insert(RowEvent::parse(
                 self.payload,
                 false,
                 false,
             )?)),
-            EventType::WRITE_ROWS_EVENTV2 => Ok(BinlogEvent::Insert(RowEvent::parse(
-                self.payload,
-                true,
-                false,
-            )?)),
-            EventType::UPDATE_ROWS_EVENTV0 => Ok(BinlogEvent::Update(RowEvent::parse(
-                self.payload,
-                false,
-                false,
-            )?)),
-            EventType::UPDATE_ROWS_EVENTV1 => Ok(BinlogEvent::Update(RowEvent::parse(
-                self.payload,
-                false,
-                true,
-            )?)),
-            EventType::UPDATE_ROWS_EVENTV2 => Ok(BinlogEvent::Update(RowEvent::parse(
+            BinlogEventType::WRITE_ROWS_EVENTV2 => Ok(BinlogEvent::Insert(RowEvent::parse(
                 self.payload,
                 true,
+                false,
+            )?)),
+            BinlogEventType::UPDATE_ROWS_EVENTV0 => Ok(BinlogEvent::Update(RowEvent::parse(
+                self.payload,
+                false,
+                false,
+            )?)),
+            BinlogEventType::UPDATE_ROWS_EVENTV1 => Ok(BinlogEvent::Update(RowEvent::parse(
+                self.payload,
+                false,
                 true,
             )?)),
-            EventType::DELETE_ROWS_EVENTV0 => Ok(BinlogEvent::Delete(RowEvent::parse(
+            BinlogEventType::UPDATE_ROWS_EVENTV2 => Ok(BinlogEvent::Update(RowEvent::parse(
+                self.payload,
+                true,
+                true,
+            )?)),
+            BinlogEventType::DELETE_ROWS_EVENTV0 => Ok(BinlogEvent::Delete(RowEvent::parse(
                 self.payload,
                 false,
                 false,
             )?)),
-            EventType::DELETE_ROWS_EVENTV1 => Ok(BinlogEvent::Delete(RowEvent::parse(
+            BinlogEventType::DELETE_ROWS_EVENTV1 => Ok(BinlogEvent::Delete(RowEvent::parse(
                 self.payload,
                 false,
                 false,
             )?)),
-            EventType::DELETE_ROWS_EVENTV2 => Ok(BinlogEvent::Delete(RowEvent::parse(
+            BinlogEventType::DELETE_ROWS_EVENTV2 => Ok(BinlogEvent::Delete(RowEvent::parse(
                 self.payload,
                 true,
                 false,
@@ -341,7 +255,7 @@ impl TableMapEvent {
         let column_types: Vec<ColumnType> = b[..column_count]
             .iter()
             .cloned()
-            .map(ColumnType::from)
+            .map(|v| ColumnType::try_from(v).unwrap())
             .collect();
 
         let mut column_metas = vec![0; column_count];
@@ -548,7 +462,7 @@ impl RowEvent {
 
 #[cfg(test)]
 mod test {
-    use super::{BinlogEvent, BinlogEventPacket, EventType};
+    use super::{BinlogEvent, BinlogEventPacket, BinlogEventType};
 
     #[test]
     fn parses_rotate() {
@@ -596,9 +510,9 @@ mod test {
                                                \x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00";
 
         let event = BinlogEventPacket::parse(ANONYMOUS_GTID_EVENT).unwrap();
-        assert_eq!(event.event_type, EventType::ANONYMOUS_GTID_EVENT);
+        assert_eq!(event.event_type, BinlogEventType::ANONYMOUS_GTID_EVENT);
         // match event.into_binlog_event().unwrap() {
-        //     BinlogEvent::Unhandled(EventType::ANONYMOUS_GTID_EVENT) => {},
+        //     BinlogEvent::Unhandled(BinlogEventType::ANONYMOUS_GTID_EVENT) => {},
         //     unexpected => panic!("unexpected {:?}", unexpected),
         // }
     }
@@ -612,7 +526,7 @@ mod test {
                                       \x4e";
 
         let event = BinlogEventPacket::parse(QUERY_EVENT).unwrap();
-        assert_eq!(event.event_type, EventType::QUERY_EVENT);
+        assert_eq!(event.event_type, BinlogEventType::QUERY_EVENT);
     }
 
     #[test]
@@ -669,7 +583,7 @@ mod test {
                                     \x00\x00\x00\x72\x0e\x00\x00\x00\x00\x00\x00";
 
         let event = BinlogEventPacket::parse(XID_EVENT).unwrap();
-        assert_eq!(event.event_type, EventType::XID_EVENT);
+        assert_eq!(event.event_type, BinlogEventType::XID_EVENT);
     }
 
     // #[test]

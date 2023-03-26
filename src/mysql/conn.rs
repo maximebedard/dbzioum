@@ -668,7 +668,7 @@ impl Handshake {
         let scramble_1 = scramble_1_slice.to_vec();
         b.advance(1);
         let capabilities_1 = b.get_u16_le();
-        let character_set = b.get_u8().into();
+        let character_set = b.get_u8().try_into().unwrap();
         let status_flags = StatusFlags::from_bits_truncate(b.get_u16_le());
         let capabilities_2 = b.get_u16_le();
 
@@ -889,9 +889,9 @@ impl Column {
         let org_name = b.mysql_get_lenc_string().unwrap();
         let fixed_len = b.mysql_get_lenc_uint().unwrap();
         assert_eq!(0x0C, fixed_len);
-        let character_set = (b.get_u16_le() as u8).into();
+        let character_set = (b.get_u16_le() as u8).try_into().unwrap();
         let column_length = b.get_u32_le();
-        let column_type = b.get_u8().into();
+        let column_type = b.get_u8().try_into().unwrap();
         let flags = ColumnFlags::from_bits_truncate(b.get_u16_le());
         let decimals = b.get_u8();
 
