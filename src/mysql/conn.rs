@@ -8,11 +8,11 @@ use tokio::net::TcpStream;
 
 use super::buf_ext::{BufExt, BufMutExt};
 use super::protocol::{
-    BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType, Command, StatusFlags,
-    CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
+    BinlogDumpFlags, BinlogEventType, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType,
+    Command, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN,
+    MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
 use super::protocol_binlog::{BinlogEvent, BinlogEventPacket};
-use super::value::Value;
 
 #[derive(Debug)]
 pub struct ConnectionOptions {
@@ -37,31 +37,6 @@ impl Default for ConnectionOptions {
             server_id: None,
             use_compression: false,
             use_ssl: false,
-        }
-    }
-}
-
-pub struct ReplicationOptions {
-    pub hostname: Option<String>,
-    pub user: Option<String>,
-    pub password: Option<String>,
-    pub server_id: u32,
-    pub port: u16,
-}
-
-impl Default for ReplicationOptions {
-    fn default() -> Self {
-        let hostname = None;
-        let user = None;
-        let password = None;
-        let server_id = 1;
-        let port = 3306;
-        Self {
-            hostname,
-            user,
-            password,
-            server_id,
-            port,
         }
     }
 }
@@ -134,7 +109,7 @@ impl Connection {
             Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
             Some(_) => {
                 let handshake = Handshake::parse(payload)?;
-                self.handle_handshake(handshake).await.map_err(Into::into)
+                self.handle_handshake(handshake).await
             }
             None => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -187,23 +162,9 @@ impl Connection {
 
     /// Send a text query to MYSQL and returns a result set.
     pub async fn query(&mut self, query: impl AsRef<str>) -> io::Result<QueryResults> {
-        // TODO: Vec<T> could potentially be a stream if we want to support multi result sets...
         self.write_command(Command::COM_QUERY, query.as_ref().as_bytes())
             .await?;
         self.read_results().await
-    }
-
-    /// Send a text query to MYSQL and yield only the first result.
-    pub async fn pop(&mut self, query: impl AsRef<str>) -> io::Result<QueryResults> {
-        self.query(query).await.map(
-            |QueryResults {
-                 columns,
-                 values: mut rows,
-             }| QueryResults {
-                columns,
-                values: rows.pop().map(|r| vec![r]).unwrap_or_default(),
-            },
-        )
     }
 
     pub async fn ping(&mut self) -> io::Result<()> {
@@ -271,18 +232,15 @@ impl Connection {
         match payload.get(0) {
             Some(0x00) => {
                 self.parse_and_handle_server_ok(payload)?;
-                todo!();
+                Ok(QueryResults::default())
             }
             Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
             Some(0xFB) => todo!("infile not supported"),
             Some(_) => {
                 let column_count = payload.as_slice().mysql_get_lenc_uint().unwrap() as usize;
                 let columns = self.read_columns(column_count).await?;
-                let rows = self.read_rows(&columns).await?;
-                let query_results = QueryResults {
-                    columns,
-                    values: rows,
-                };
+                let values = self.read_row_values(&columns).await?;
+                let query_results = QueryResults { columns, values };
                 Ok(query_results)
             }
             None => Err(io::Error::new(
@@ -317,9 +275,9 @@ impl Connection {
         Ok(columns)
     }
 
-    async fn read_rows(&mut self, columns: &Vec<Column>) -> io::Result<Vec<RowValue>> {
+    async fn read_row_values(&mut self, columns: &Vec<Column>) -> io::Result<Vec<RowValue>> {
         // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::ResultsetRow
-        let mut rows = Vec::new();
+        let mut row_values = Vec::new();
         loop {
             let payload = self.read_payload().await?;
 
@@ -329,18 +287,35 @@ impl Connection {
                     break;
                 }
                 Some(_) => {
-                    let row = RowValue::parse(payload, columns)?;
-                    rows.push(row);
+                    let mut buffer = payload.as_slice();
+                    for i in 0..columns.len() {
+                        match buffer.get(0) {
+                            Some(0xFB) => {
+                                buffer.advance(1);
+                                row_values.push(None);
+                            }
+                            Some(_) => {
+                                let value = buffer.mysql_get_lenc_string()?;
+                                row_values.push(Some(value));
+                            }
+                            None => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "Unexpected EOF while parsing query row value",
+                                ))
+                            }
+                        }
+                    }
                 }
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "Unexpected EOF while parsing query row response",
+                        "Unexpected EOF while parsing query row",
                     ))
                 }
             }
         }
-        Ok(rows)
+        Ok(row_values)
     }
 
     async fn authenticate(&mut self, auth_plugin_name: &str, nonce: &[u8]) -> io::Result<()> {
@@ -419,6 +394,7 @@ impl Connection {
     async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
         let mut header = vec![0; 4];
         self.stream.read_exact(&mut header).await?;
+
         let mut header_buffer = header.as_slice();
         let payload_len = header_buffer.get_uint_le(3);
         let sequence_id = header_buffer.get_u8();
@@ -429,62 +405,43 @@ impl Connection {
         return Ok((sequence_id, payload));
     }
 
-    async fn get_system_variable(&mut self, var: impl AsRef<str>) -> io::Result<QueryResults> {
-        self.pop(format!("SELECT @@{}", var.as_ref())).await
+    // Returns a stream that yields binlog events, starting from the very beginning of the current log.
+    pub async fn start_binlog_stream(mut self, server_id: u32) -> io::Result<BinlogStream> {
+        let master_status = self.query("SHOW MASTER STATUS").await?;
+        println!("{:?}", master_status);
+        let log_file = master_status.values[0].as_ref().unwrap();
+        let log_pos = master_status.values[1].as_ref().unwrap().parse().unwrap();
+        println!("binlog file = {}", log_file);
+        println!("position = {}", log_pos);
+        self.resume_binlog_stream(server_id, log_file, log_pos)
+            .await
     }
 
-    /// Returns a stream that yields binlog events, starting from the very beginning of the current log.
-    // pub async fn binlog_stream<'a>(
-    //     &'a mut self,
-    //     replication_opts: impl Into<ReplicationOptions>,
-    // ) -> DriverResult<impl Stream<Item = DriverResult<BinlogEvent>> + 'a> {
-    //     let master_status = self.pop("SHOW MASTER STATUS").await.and_then(|r| {
-    //         r.map(Ok)
-    //             .unwrap_or_else(|| Err(DriverError::ReplicationDisabled))
-    //     })?;
+    // Returns a stream that yields binlog events, starting from a given position and binlog file.
+    pub async fn resume_binlog_stream(
+        mut self,
+        server_id: u32,
+        log_file: impl Into<String>,
+        log_pos: u32,
+    ) -> io::Result<BinlogStream> {
+        let log_file = log_file.into();
+        self.disable_master_binlog_checksum().await?;
+        self.register_as_replica(server_id).await?;
+        self.dump_binlog(server_id, log_file.as_str(), log_pos)
+            .await?;
+        Ok(BinlogStream {
+            conn: self,
+            server_id,
+            log_file,
+            log_pos,
+        })
+    }
 
-    //     let values = master_status.values();
-    //     println!("{:?}", values);
-    //     let file = values[0].as_str().expect("Must be string").to_string();
-    //     let position = values[1].as_u32().expect("Must be u32");
-    //     let opts = replication_opts.into();
-    //     println!("binlog file = {}", file);
-    //     println!("position = {}", position);
-    //     self.resume_binlog_stream(opts, file, position).await
-    // }
-
-    /// Returns a stream that yields binlog events, starting from a given position and binlog file.
-    // pub async fn resume_binlog_stream<'a>(
-    //     &'a mut self,
-    //     replication_opts: impl Into<ReplicationOptions>,
-    //     file: impl AsRef<str>,
-    //     position: u32,
-    // ) -> DriverResult<impl Stream<Item = DriverResult<BinlogEvent>> + 'a> {
-    //     let replication_opts = replication_opts.into();
-    //     let server_id = replication_opts.server_id();
-
-    //     self.ensure_checksum_is_disabled().await?;
-    //     self.register_as_replica(&replication_opts).await?;
-    //     self.dump_binlog(server_id, file, position).await?;
-
-    //     let stream = futures::stream::unfold(self, |conn| async move {
-    //         conn.read_binlog_event()
-    //             .await
-    //             .transpose()
-    //             .map(|evt| (evt, conn))
-    //     });
-
-    //     Ok(stream)
-    // }
-
-    async fn read_binlog_event(&mut self) -> io::Result<Option<BinlogEvent>> {
+    async fn read_binlog_event_packet(&mut self) -> io::Result<BinlogEventPacket> {
         let payload = self.read_payload().await?;
 
         match payload.get(0) {
-            Some(0x00) => {
-                let p = BinlogEventPacket::parse(payload)?;
-                Ok(Some(p.into_binlog_event()?))
-            }
+            Some(0x00) => BinlogEventPacket::parse(payload),
             Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
             Some(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -508,12 +465,12 @@ impl Connection {
         }
     }
 
-    async fn ensure_checksum_is_disabled(&mut self) -> io::Result<()> {
+    async fn disable_master_binlog_checksum(&mut self) -> io::Result<()> {
         self.query("SET @master_binlog_checksum='NONE'").await?;
         Ok(())
         // TODO: it most likely better to check the value before actually trying to set it.
 
-        // let checksum = self.get_system_variable("binlog_checksum")
+        // let checksum = self.query("SELECT @@binlog_checksum")
         //   .await
         //   .and_then(QueryResult::value_as_str);
 
@@ -531,27 +488,17 @@ impl Connection {
         //       }
     }
 
-    async fn register_as_replica(
-        &mut self,
-        replication_opts: &ReplicationOptions,
-    ) -> io::Result<()> {
-        let hostname = replication_opts
-            .hostname
-            .as_ref()
-            .map(String::as_bytes)
-            .unwrap_or(b"");
-        let user = replication_opts
-            .user
-            .as_ref()
-            .map(String::as_bytes)
-            .unwrap_or(b"");
-        let password = replication_opts
+    async fn register_as_replica(&mut self, server_id: u32) -> io::Result<()> {
+        let ip = self.opts.addr.ip().to_string();
+        let hostname = ip.as_bytes();
+        let port = self.opts.addr.port();
+        let user = self.opts.user.as_bytes();
+        let password = self
+            .opts
             .password
             .as_ref()
-            .map(String::as_bytes)
+            .map(|v| v.as_bytes())
             .unwrap_or(b"");
-        let server_id = replication_opts.server_id;
-        let port = replication_opts.port;
 
         let payload_len = 4 + 1 + hostname.len() + 1 + user.len() + 1 + password.len() + 2 + 4 + 4;
 
@@ -570,9 +517,7 @@ impl Connection {
 
         self.write_command(Command::COM_REGISTER_SLAVE, &b[..])
             .await?;
-        self.read_generic_reponse().await?;
-
-        Ok(())
+        self.read_generic_reponse().await
     }
 
     async fn dump_binlog(
@@ -592,9 +537,7 @@ impl Connection {
         b.put_u32_le(server_id);
         b.put(file);
 
-        self.write_command(Command::COM_BINLOG_DUMP, &b[..]).await?;
-
-        Ok(())
+        self.write_command(Command::COM_BINLOG_DUMP, &b[..]).await
     }
 }
 
@@ -778,7 +721,6 @@ pub struct ServerError {
 
 impl ServerError {
     fn parse(buffer: impl AsRef<[u8]>, capability_flags: CapabilityFlags) -> io::Result<Self> {
-        // let mut b = buffer.into();
         let mut b = buffer.as_ref();
         let _header = b.get_u8();
         let error_code = b.get_u16_le();
@@ -804,8 +746,8 @@ impl ServerError {
 /// Owned results for 0..N rows.
 #[derive(Debug, Default)]
 pub struct QueryResults {
-    columns: Vec<Column>,
-    values: Vec<RowValue>,
+    pub columns: Vec<Column>,
+    pub values: Vec<RowValue>,
 }
 
 impl QueryResults {
@@ -822,7 +764,11 @@ impl QueryResults {
     }
 
     pub fn rows_len(&self) -> usize {
-        self.values.len() / self.columns.len()
+        if self.columns.len() > 0 {
+            self.values.len() / self.columns.len()
+        } else {
+            0
+        }
     }
 
     pub fn rows(&self) -> Option<ChunksExact<'_, RowValue>> {
@@ -844,24 +790,7 @@ impl QueryResults {
 
 // https://mariadb.com/kb/en/connection/#sslrequest-packet
 // https://dev.mysql.com/doc/refman/8.0/en/charset-connection.html
-
-#[derive(Debug)]
-pub struct RowValue(Value);
-
-impl RowValue {
-    fn parse(buffer: impl AsRef<[u8]>, columns: &Vec<Column>) -> io::Result<Self> {
-        todo!()
-        // let mut b = buffer.as_ref();
-        // let mut values = Vec::with_capacity(columns.len());
-
-        // for i in 0..columns.len() {
-        //     let value = parse_value_from_text(&mut b, &columns[i])?;
-        //     values.push(value);
-        // }
-
-        // Ok(Self(values))
-    }
-}
+pub type RowValue = Option<String>;
 
 #[derive(Debug)]
 pub struct Column {
@@ -907,5 +836,38 @@ impl Column {
             flags,
             decimals,
         })
+    }
+}
+
+pub struct BinlogStream {
+    conn: Connection,
+    server_id: u32,
+    log_file: String,
+    log_pos: u32,
+}
+
+impl BinlogStream {
+    pub async fn close(self) -> io::Result<()> {
+        // shutdown the underlying stream instead of trying to gracefully shutdown the connection.
+        self.conn.stream.into_inner().shutdown().await
+    }
+
+    pub async fn recv(&mut self) -> io::Result<BinlogEventPacket> {
+        self.conn.read_binlog_event_packet().await.map(|v| {
+            self.log_pos = v.log_pos;
+            v
+        })
+    }
+
+    pub fn server_id(&self) -> u32 {
+        self.server_id
+    }
+
+    pub fn log_file(&self) -> &String {
+        &self.log_file
+    }
+
+    pub fn log_pos(&self) -> u32 {
+        self.log_pos
     }
 }

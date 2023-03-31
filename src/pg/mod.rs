@@ -384,7 +384,6 @@ impl Connection {
                     //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
                     self.stream.read_i32().await?; // skip len
                     let num_columns = self.stream.read_i16().await?;
-                    let mut tmp_columns = Vec::with_capacity(num_columns as usize);
                     for i in 0..num_columns {
                         let name = self.read_c_string().await?;
                         let oid = self.stream.read_i32().await?;
@@ -394,7 +393,7 @@ impl Connection {
                         let type_modifier = self.stream.read_i32().await?;
                         let format = self.stream.read_i16().await?;
 
-                        tmp_columns.push(SimpleColumn {
+                        columns.push(SimpleColumn {
                             name,
                             oid,
                             attr_number,
@@ -404,7 +403,6 @@ impl Connection {
                             format,
                         });
                     }
-                    columns = tmp_columns;
                 }
                 b'D' => {
                     // DataRow (B)
@@ -422,21 +420,19 @@ impl Connection {
 
                     self.stream.read_i32().await?; // skip len
                     let num_values = self.stream.read_i16().await?;
-                    let mut tmp_values = Vec::with_capacity(num_values as usize);
                     for i in 0..num_values {
                         let len = self.stream.read_i32().await?;
 
                         if len > 0 {
                             let mut buffer = vec![0; len as usize];
                             self.stream.read_exact(&mut buffer).await?;
-                            tmp_values.push(Some(String::from_utf8(buffer).unwrap()));
+                            values.push(Some(String::from_utf8(buffer).unwrap()));
                         } else if len == 0 {
-                            tmp_values.push(Some("".to_string()));
+                            values.push(Some("".to_string()));
                         } else if len == -1 {
-                            tmp_values.push(None);
+                            values.push(None);
                         }
                     }
-                    values = tmp_values;
                 }
                 b'I' => {
                     // EmptyQueryResponse (B)
@@ -589,7 +585,11 @@ impl SimpleQueryResult {
     }
 
     pub fn rows_len(&self) -> usize {
-        self.values.len() / self.columns.len()
+        if self.columns.len() > 0 {
+            self.values.len() / self.columns.len()
+        } else {
+            0
+        }
     }
 
     pub fn rows(&self) -> Option<ChunksExact<'_, SimpleRowValue>> {

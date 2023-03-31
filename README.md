@@ -13,6 +13,7 @@ CDC for postgres with BQ sink. Uses wal2json codec to decode replication events 
   - [x] simple query support
   - [x] create/exists/delete replication slot
   - [ ] start replication stream
+    - [ ] supports row based replication events
 - [ ] simple mysql client (> v8)
   - [ ] auth
     - [ ] mysql_native_password

@@ -28,6 +28,29 @@ async fn test_connection_server_info() {
 }
 
 #[tokio::test]
+async fn test_query() {
+    let mut conn = setup_connection().await.unwrap();
+    let results = conn
+        .simple_query("SELECT 1,2,3 UNION ALL SELECT 4,5,6")
+        .await
+        .unwrap();
+    assert_eq!(results.columns.len(), 3);
+    assert_eq!(results.values.len(), 6);
+    assert_eq!(results.rows_len(), 2);
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_noop_query() {
+    let mut conn = setup_connection().await.unwrap();
+    let results = conn.simple_query("NULL").await.unwrap();
+    assert_eq!(results.columns.len(), 0);
+    assert_eq!(results.values.len(), 0);
+    assert_eq!(results.rows_len(), 0);
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_connection_replication() {
     let mut conn = setup_connection().await.unwrap();
     conn.create_replication_slot("foo").await.unwrap();
