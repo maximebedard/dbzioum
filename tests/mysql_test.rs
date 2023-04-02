@@ -1,4 +1,4 @@
-use ps2bq::mysql::{Connection, ConnectionOptions};
+use ps2bq::mysql::{protocol_binlog::BinlogEvent, Connection, ConnectionOptions};
 use std::{env, io};
 
 #[tokio::test]
@@ -46,16 +46,15 @@ async fn test_noop_query() {
 
 async fn test_binlog_inserts() {
     let mut conn = setup_connection().await.unwrap();
-    // let results = conn.query("SHOW MASTER STATUS").await.unwrap();
-    // let log_file = results.values[0].as_ref().unwrap();
-    // let log_pos = results.values[1].as_ref().unwrap().parse().unwrap();
+    let binlog_cursor = conn.binlog_cursor().await.unwrap();
 
     let mut stream = setup_connection()
         .await
         .unwrap()
-        .start_binlog_stream(1)
+        .binlog_stream(1, binlog_cursor)
         .await
         .unwrap();
+
     match conn.query("DROP TABLE Users;").await {
         Err(err) if err.to_string().contains("Unknown table 'test.Users'") => {}
         Err(err) => panic!("{}", err),
@@ -68,16 +67,23 @@ async fn test_binlog_inserts() {
         .await
         .unwrap();
 
-    let results = conn.query("SHOW MASTER STATUS").await.unwrap();
-    let log_file = results.values[0].as_ref().unwrap();
-    let log_pos = results.values[1].as_ref().unwrap().parse().unwrap();
+    let binlog_status = conn.binlog_cursor().await.unwrap();
 
+    let mut events = vec![];
     loop {
-        if stream.log_pos() >= log_pos {
+        if stream.binlog_cursor() >= &binlog_status {
             break;
         }
-        stream.recv().await.ok();
+        events.push(stream.recv().await.ok().unwrap());
     }
+
+    events
+        .iter()
+        .filter_map(|packet| match &packet.event {
+            BinlogEvent::Insert(v) => Some(v),
+            _ => None,
+        })
+        .for_each(|v| println!("{:?}", v));
 }
 
 async fn setup_connection() -> io::Result<Connection> {

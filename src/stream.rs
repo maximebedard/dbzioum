@@ -1,7 +1,7 @@
 use std::env;
 use tokio::task::JoinHandle;
 
-use crate::mysql;
+use crate::mysql::{self, BinlogCursor};
 
 use super::pg;
 
@@ -35,7 +35,7 @@ pub struct MysqlStream;
 impl MysqlStream {
     pub fn spawn() -> (Self, JoinHandle<()>) {
         let handle = tokio::task::spawn(async move {
-            let conn_mysql = mysql::Connection::connect(mysql::ConnectionOptions {
+            let mut conn_mysql = mysql::Connection::connect(mysql::ConnectionOptions {
                 user: "mysql".to_string(),
                 password: Some("mysql".to_string()),
                 database: Some("test".to_string()),
@@ -48,19 +48,13 @@ impl MysqlStream {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1);
-            let file = env::var("MYSQL_BINLOG_FILE").ok();
-            let position = env::var("MYSQL_BINLOG_POSITION")
-                .ok()
-                .and_then(|v| v.parse().ok());
 
-            let mut stream = match (file, position) {
-                (Some(file), Some(position)) => conn_mysql
-                    .resume_binlog_stream(server_id, file, position)
-                    .await
-                    .unwrap(),
-                (None, None) => conn_mysql.start_binlog_stream(server_id).await.unwrap(),
-                (_, _) => unimplemented!(),
-            };
+            let binlog_cursor = conn_mysql.binlog_cursor().await.unwrap();
+
+            let mut stream = conn_mysql
+                .binlog_stream(server_id, binlog_cursor)
+                .await
+                .unwrap();
 
             let interrupt = tokio::signal::ctrl_c();
             tokio::pin!(interrupt);

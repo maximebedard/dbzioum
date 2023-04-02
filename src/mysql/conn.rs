@@ -1,5 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use std::cmp::max;
+use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
 use std::slice::{ChunksExact, ChunksExactMut};
@@ -8,9 +9,8 @@ use tokio::net::TcpStream;
 
 use super::buf_ext::{BufExt, BufMutExt};
 use super::protocol::{
-    BinlogDumpFlags, BinlogEventType, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType,
-    Command, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN,
-    MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
+    BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType, Command, StatusFlags,
+    CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
 use super::protocol_binlog::{BinlogEvent, BinlogEventPacket};
 
@@ -41,6 +41,7 @@ impl Default for ConnectionOptions {
     }
 }
 
+#[derive(Debug)]
 pub struct Connection {
     stream: BufStream<TcpStream>,
     capabilities: CapabilityFlags,
@@ -405,35 +406,33 @@ impl Connection {
         return Ok((sequence_id, payload));
     }
 
-    // Returns a stream that yields binlog events, starting from the very beginning of the current log.
-    pub async fn start_binlog_stream(mut self, server_id: u32) -> io::Result<BinlogStream> {
-        let master_status = self.query("SHOW MASTER STATUS").await?;
-        println!("{:?}", master_status);
-        let log_file = master_status.values[0].as_ref().unwrap();
-        let log_pos = master_status.values[1].as_ref().unwrap().parse().unwrap();
-        println!("binlog file = {}", log_file);
-        println!("position = {}", log_pos);
-        self.resume_binlog_stream(server_id, log_file, log_pos)
-            .await
+    pub async fn binlog_cursor(&mut self) -> io::Result<BinlogCursor> {
+        let mut values = self.query("SHOW MASTER STATUS").await.map(|mut v| {
+            v.values.reverse();
+            v.values
+        })?;
+        let log_file = values.pop().unwrap().unwrap();
+        let log_position = values.pop().unwrap().unwrap().parse().unwrap();
+        Ok(BinlogCursor {
+            log_file,
+            log_position,
+        })
     }
 
     // Returns a stream that yields binlog events, starting from a given position and binlog file.
-    pub async fn resume_binlog_stream(
+    pub async fn binlog_stream(
         mut self,
         server_id: u32,
-        log_file: impl Into<String>,
-        log_pos: u32,
+        binlog_cursor: impl Into<BinlogCursor>,
     ) -> io::Result<BinlogStream> {
-        let log_file = log_file.into();
+        let binlog_cursor = binlog_cursor.into();
         self.disable_master_binlog_checksum().await?;
         self.register_as_replica(server_id).await?;
-        self.dump_binlog(server_id, log_file.as_str(), log_pos)
-            .await?;
+        self.dump_binlog(server_id, &binlog_cursor).await?;
         Ok(BinlogStream {
             conn: self,
             server_id,
-            log_file,
-            log_pos,
+            binlog_cursor,
         })
     }
 
@@ -523,16 +522,15 @@ impl Connection {
     async fn dump_binlog(
         &mut self,
         server_id: u32,
-        file: impl AsRef<str>,
-        position: u32,
+        binlog_cursor: &BinlogCursor,
     ) -> io::Result<()> {
-        let file = file.as_ref().as_bytes();
+        let file = binlog_cursor.log_file.as_bytes();
         let file_len = file.len();
 
         let payload_len = 4 + 2 + 4 + file_len + 1;
 
         let mut b = BytesMut::with_capacity(payload_len);
-        b.put_u32_le(position);
+        b.put_u32_le(binlog_cursor.log_position);
         b.put_u16_le(BinlogDumpFlags::empty().bits());
         b.put_u32_le(server_id);
         b.put(file);
@@ -839,35 +837,45 @@ impl Column {
     }
 }
 
+#[derive(Debug, PartialEq, PartialOrd)]
+pub struct BinlogCursor {
+    pub log_file: String,
+    pub log_position: u32,
+}
+
+#[derive(Debug)]
 pub struct BinlogStream {
     conn: Connection,
     server_id: u32,
-    log_file: String,
-    log_pos: u32,
+    binlog_cursor: BinlogCursor,
 }
 
 impl BinlogStream {
     pub async fn close(self) -> io::Result<()> {
-        // shutdown the underlying stream instead of trying to gracefully shutdown the connection.
+        // force shutdown the underlying stream since the stream is no longer in duplex mode.
         self.conn.stream.into_inner().shutdown().await
     }
 
     pub async fn recv(&mut self) -> io::Result<BinlogEventPacket> {
-        self.conn.read_binlog_event_packet().await.map(|v| {
-            self.log_pos = v.log_pos;
-            v
-        })
+        let packet = self.conn.read_binlog_event_packet().await?;
+
+        self.binlog_cursor.log_position = packet.log_position;
+        match &packet.event {
+            BinlogEvent::Rotate(v) => {
+                self.binlog_cursor.log_file = v.next_log_file.clone();
+                self.binlog_cursor.log_position = v.next_log_position;
+            }
+            _ => {}
+        }
+
+        Ok(packet)
     }
 
     pub fn server_id(&self) -> u32 {
         self.server_id
     }
 
-    pub fn log_file(&self) -> &String {
-        &self.log_file
-    }
-
-    pub fn log_pos(&self) -> u32 {
-        self.log_pos
+    pub fn binlog_cursor(&self) -> &BinlogCursor {
+        &self.binlog_cursor
     }
 }

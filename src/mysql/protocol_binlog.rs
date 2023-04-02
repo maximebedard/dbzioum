@@ -7,14 +7,13 @@ use std::io;
 pub struct BinlogEventPacket {
     pub timestamp: u32,
     pub server_id: u32,
-    pub log_pos: u32,
+    pub log_position: u32,
     pub flags: u16,
-    pub event_type: BinlogEventType,
-    payload: Vec<u8>,
+    pub event: BinlogEvent,
 }
 
 impl BinlogEventPacket {
-    pub(crate) fn parse(buffer: impl AsRef<[u8]>) -> io::Result<BinlogEventPacket> {
+    pub fn parse(buffer: impl AsRef<[u8]>) -> io::Result<BinlogEventPacket> {
         let mut b = buffer.as_ref();
 
         // skip OK byte
@@ -24,60 +23,55 @@ impl BinlogEventPacket {
         let event_type = b.get_u8().try_into().unwrap();
         let server_id = b.get_u32_le();
         let event_size = (b.get_u32_le() - 19) as usize;
-        let log_pos = b.get_u32_le();
+        let log_position = b.get_u32_le();
         let flags = b.get_u16_le();
         let payload = b.to_vec();
+
+        let event = match event_type {
+            BinlogEventType::TABLE_MAP_EVENT => {
+                TableMapEvent::parse(&payload).map(BinlogEvent::TableMap)
+            }
+            BinlogEventType::ROTATE_EVENT => RotateEvent::parse(&payload).map(BinlogEvent::Rotate),
+            BinlogEventType::FORMAT_DESCRIPTION_EVENT => {
+                FormatDescriptionEvent::parse(&payload).map(BinlogEvent::Format)
+            }
+            BinlogEventType::WRITE_ROWS_EVENTV0 => {
+                RowEvent::parse(&payload, false, false).map(BinlogEvent::Insert)
+            }
+            BinlogEventType::WRITE_ROWS_EVENTV1 => {
+                RowEvent::parse(&payload, false, false).map(BinlogEvent::Insert)
+            }
+            BinlogEventType::WRITE_ROWS_EVENTV2 => {
+                RowEvent::parse(&payload, true, false).map(BinlogEvent::Insert)
+            }
+            BinlogEventType::UPDATE_ROWS_EVENTV0 => {
+                RowEvent::parse(&payload, false, false).map(BinlogEvent::Update)
+            }
+            BinlogEventType::UPDATE_ROWS_EVENTV1 => {
+                RowEvent::parse(&payload, false, true).map(BinlogEvent::Update)
+            }
+            BinlogEventType::UPDATE_ROWS_EVENTV2 => {
+                RowEvent::parse(&payload, true, true).map(BinlogEvent::Update)
+            }
+            BinlogEventType::DELETE_ROWS_EVENTV0 => {
+                RowEvent::parse(&payload, false, false).map(BinlogEvent::Delete)
+            }
+            BinlogEventType::DELETE_ROWS_EVENTV1 => {
+                RowEvent::parse(&payload, false, false).map(BinlogEvent::Delete)
+            }
+            BinlogEventType::DELETE_ROWS_EVENTV2 => {
+                RowEvent::parse(&payload, true, false).map(BinlogEvent::Delete)
+            }
+            not_supported => Ok(BinlogEvent::NotSupported(not_supported)),
+        }?;
 
         Ok(BinlogEventPacket {
             timestamp,
             server_id,
-            log_pos,
+            log_position,
             flags,
-            event_type,
-            payload,
+            event,
         })
-    }
-
-    pub fn binlog_event(&self) -> io::Result<BinlogEvent> {
-        match self.event_type {
-            BinlogEventType::TABLE_MAP_EVENT => {
-                TableMapEvent::parse(&self.payload).map(BinlogEvent::TableMap)
-            }
-            BinlogEventType::ROTATE_EVENT => {
-                RotateEvent::parse(&self.payload).map(BinlogEvent::Rotate)
-            }
-            BinlogEventType::FORMAT_DESCRIPTION_EVENT => {
-                FormatDescriptionEvent::parse(&self.payload).map(BinlogEvent::Format)
-            }
-            BinlogEventType::WRITE_ROWS_EVENTV0 => {
-                RowEvent::parse(&self.payload, false, false).map(BinlogEvent::Insert)
-            }
-            BinlogEventType::WRITE_ROWS_EVENTV1 => {
-                RowEvent::parse(&self.payload, false, false).map(BinlogEvent::Insert)
-            }
-            BinlogEventType::WRITE_ROWS_EVENTV2 => {
-                RowEvent::parse(&self.payload, true, false).map(BinlogEvent::Insert)
-            }
-            BinlogEventType::UPDATE_ROWS_EVENTV0 => {
-                RowEvent::parse(&self.payload, false, false).map(BinlogEvent::Update)
-            }
-            BinlogEventType::UPDATE_ROWS_EVENTV1 => {
-                RowEvent::parse(&self.payload, false, true).map(BinlogEvent::Update)
-            }
-            BinlogEventType::UPDATE_ROWS_EVENTV2 => {
-                RowEvent::parse(&self.payload, true, true).map(BinlogEvent::Update)
-            }
-            BinlogEventType::DELETE_ROWS_EVENTV0 => {
-                RowEvent::parse(&self.payload, false, false).map(BinlogEvent::Delete)
-            }
-            BinlogEventType::DELETE_ROWS_EVENTV1 => {
-                RowEvent::parse(&self.payload, false, false).map(BinlogEvent::Delete)
-            }
-            BinlogEventType::DELETE_ROWS_EVENTV2 => {
-                RowEvent::parse(&self.payload, true, false).map(BinlogEvent::Delete)
-            }
-            unhandled_event_type => unimplemented!(),
-        }
     }
 }
 
@@ -89,23 +83,24 @@ pub enum BinlogEvent {
     Insert(RowEvent),
     Update(RowEvent),
     Delete(RowEvent),
+    NotSupported(BinlogEventType),
 }
 
 #[derive(Debug)]
 pub struct RotateEvent {
-    pub position: u64,
-    pub next_log_name: String,
+    pub next_log_position: u32,
+    pub next_log_file: String,
 }
 
 impl RotateEvent {
     fn parse(buffer: impl AsRef<[u8]>) -> io::Result<Self> {
         let mut b = buffer.as_ref();
-        let position = b.get_u64_le();
-        let next_log_name = String::from_utf8(b.to_vec()).unwrap();
+        let next_log_position = b.get_u64_le() as u32;
+        let next_log_file = String::from_utf8(b.to_vec()).unwrap();
 
         Ok(Self {
-            position,
-            next_log_name,
+            next_log_position,
+            next_log_file,
         })
     }
 }
@@ -323,11 +318,11 @@ mod test {
                                        \x00\x20\x00\x96\x00\x00\x00\x00\x00\x00\x00\x73\x68\x6f\x70\x69\x66\
                                        \x79\x2d\x62\x69\x6e\x2e\x30\x30\x30\x30\x30\x35";
 
-        let event = BinlogEventPacket::parse(ROTATE_EVENT).unwrap();
-        match event.binlog_event().unwrap() {
+        let packet = BinlogEventPacket::parse(ROTATE_EVENT).unwrap();
+        match packet.event {
             BinlogEvent::Rotate(packet) => {
-                assert_eq!(150, packet.position);
-                assert_eq!("shopify-bin.000005", packet.next_log_name);
+                assert_eq!(150, packet.next_log_position);
+                assert_eq!("shopify-bin.000005", packet.next_log_file);
             }
             unexpected => panic!("unexpected {:?}", unexpected),
         }
@@ -344,8 +339,8 @@ mod test {
                                                    \x02\x00\x00\x00\x0a\x0a\x0a\x2a\x2a\x00\x12\x34\x00\x00\xc2\x36\x0c\
                                                    \xdf";
 
-        let event = BinlogEventPacket::parse(FORMAT_DESCRIPTION_EVENT).unwrap();
-        match event.binlog_event().unwrap() {
+        let packet = BinlogEventPacket::parse(FORMAT_DESCRIPTION_EVENT).unwrap();
+        match packet.event {
             BinlogEvent::Format(packet) => {
                 assert_eq!(4, packet.version);
                 assert_eq!("5.7.18-16-log", packet.server_version);
@@ -362,12 +357,11 @@ mod test {
                                                \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\
                                                \x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00";
 
-        let event = BinlogEventPacket::parse(ANONYMOUS_GTID_EVENT).unwrap();
-        assert_eq!(event.event_type, BinlogEventType::ANONYMOUS_GTID_EVENT);
-        // match event.binlog_event().unwrap() {
-        //     BinlogEvent::Unhandled(BinlogEventType::ANONYMOUS_GTID_EVENT) => {},
-        //     unexpected => panic!("unexpected {:?}", unexpected),
-        // }
+        let packet = BinlogEventPacket::parse(ANONYMOUS_GTID_EVENT).unwrap();
+        match packet.event {
+            BinlogEvent::NotSupported(BinlogEventType::ANONYMOUS_GTID_EVENT) => {}
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -378,8 +372,11 @@ mod test {
                                       \x64\x04\x21\x00\x21\x00\x2d\x00\x70\x65\x74\x73\x00\x42\x45\x47\x49\
                                       \x4e";
 
-        let event = BinlogEventPacket::parse(QUERY_EVENT).unwrap();
-        assert_eq!(event.event_type, BinlogEventType::QUERY_EVENT);
+        let packet = BinlogEventPacket::parse(QUERY_EVENT).unwrap();
+        match packet.event {
+            BinlogEvent::NotSupported(BinlogEventType::QUERY_EVENT) => {}
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -388,8 +385,8 @@ mod test {
                                           \x00\x00\x00\x2d\x0a\x00\x00\x00\x00\x01\x00\x04\x70\x65\x74\x73\x00\
                                           \x04\x63\x61\x74\x73\x00\x04\x03\x0f\x0f\x0a\x04\x58\x02\x58\x02\x00";
 
-        let event = BinlogEventPacket::parse(TABLE_MAP_EVENT).unwrap();
-        match event.binlog_event().unwrap() {
+        let packet = BinlogEventPacket::parse(TABLE_MAP_EVENT).unwrap();
+        match packet.event {
             BinlogEvent::TableMap(packet) => {
                 assert_eq!(2605, packet.table_id);
                 assert_eq!(1, packet.flags);
@@ -409,8 +406,8 @@ mod test {
                                            \x00\x00\x00\x07\x00\x43\x68\x61\x72\x6c\x69\x65\x05\x00\x52\x69\x76\
                                            \x65\x72\xb5\xc0\x0f";
 
-        let event = BinlogEventPacket::parse(INSERT_ROW_EVENT).unwrap();
-        match event.binlog_event().unwrap() {
+        let packet = BinlogEventPacket::parse(INSERT_ROW_EVENT).unwrap();
+        match packet.event {
             BinlogEvent::Insert(packet) => {
                 assert_eq!(2605, packet.table_id);
                 assert_eq!(1, packet.flags);
@@ -435,7 +432,10 @@ mod test {
             b"\x00\xfc\x5a\x5d\x5d\x10\x01\x00\x00\x00\x1b\x00\x00\x00\x9b\x01\x00\
                                     \x00\x00\x00\x72\x0e\x00\x00\x00\x00\x00\x00";
 
-        let event = BinlogEventPacket::parse(XID_EVENT).unwrap();
-        assert_eq!(event.event_type, BinlogEventType::XID_EVENT);
+        let packet = BinlogEventPacket::parse(XID_EVENT).unwrap();
+        match packet.event {
+            BinlogEvent::NotSupported(BinlogEventType::XID_EVENT) => {}
+            _ => panic!(),
+        }
     }
 }
