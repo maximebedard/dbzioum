@@ -4,10 +4,10 @@ use tokio::task::JoinHandle;
 pub struct HttpServer;
 
 impl HttpServer {
-    pub fn spawn() -> (Self, JoinHandle<()>) {
-        let handle = tokio::task::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-        });
-        (Self, handle)
-    }
+  pub fn spawn() -> (Self, JoinHandle<()>) {
+    let handle = tokio::task::spawn(async move {
+      tokio::signal::ctrl_c().await.ok();
+    });
+    (Self, handle)
+  }
 }
