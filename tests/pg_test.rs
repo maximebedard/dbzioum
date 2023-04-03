@@ -1,5 +1,5 @@
-use ps2bq::pg::{Connection, ConnectionOptions};
-use std::{env, io};
+use ps2bq::pg::{Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem};
+use std::{env, io, time::Duration};
 
 #[tokio::test]
 async fn test_ping() {
@@ -12,8 +12,8 @@ async fn test_ping() {
 async fn test_connection_server_info() {
   let mut conn = setup_connection().await.unwrap();
 
-  let result = conn.identify_system().await.unwrap();
-  assert_eq!(result.values.last().unwrap(), &env::var("POSTGRES_DATABASE").ok());
+  let IdentifySystem { dbname, .. } = conn.identify_system().await.unwrap();
+  assert_eq!(dbname, env::var("POSTGRES_DATABASE").ok());
 
   let result = conn.simple_query("SHOW SERVER_VERSION").await.unwrap();
   assert_eq!(
@@ -47,11 +47,75 @@ async fn test_noop_query() {
 #[tokio::test]
 async fn test_connection_replication() {
   let mut conn = setup_connection().await.unwrap();
+  if conn.replication_slot_exists("foo").await.unwrap() {
+    conn.delete_replication_slot("foo").await.unwrap();
+    assert!(!conn.replication_slot_exists("foo").await.unwrap());
+  }
+
   conn.create_replication_slot("foo").await.unwrap();
   assert!(conn.replication_slot_exists("foo").await.unwrap());
 
   conn.delete_replication_slot("foo").await.unwrap();
   assert!(!conn.replication_slot_exists("foo").await.unwrap());
+
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_connection_replication_inserts() {
+  let mut conn = setup_connection().await.unwrap();
+
+  if conn.replication_slot_exists("bar").await.unwrap() {
+    conn.delete_replication_slot("bar").await.unwrap();
+    assert!(!conn.replication_slot_exists("bar").await.unwrap());
+  }
+
+  let CreateReplicationSlot {
+    slot_name,
+    consistent_point,
+    ..
+  } = conn.create_replication_slot("bar").await.unwrap();
+
+  let mut stream = conn
+    .duplicate()
+    .await
+    .unwrap()
+    .start_replication_stream(slot_name, consistent_point)
+    .await
+    .unwrap();
+
+  match conn.simple_query("DROP TABLE Users;").await {
+    Err(err) if err.to_string().contains("table \"users\" does not exist") => {}
+    Err(err) => panic!("{}", err),
+    Ok(_) => {}
+  }
+  conn
+    .simple_query("CREATE TABLE Users (id int, name varchar(255));")
+    .await
+    .unwrap();
+  conn.simple_query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
+
+  let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+  loop {
+    tokio::select! {
+      event = stream.recv() => {
+        match event {
+          Ok(event) => {
+            println!("{:?}", event);
+            stream.commit().await.unwrap();
+          },
+          Err(err) => panic!("{}", err),
+        }
+      },
+      _ = interval.tick() => {
+        stream.write_status_update().await.unwrap();
+        println!("TICK");
+      },
+    }
+  }
+
+  stream.close().await.unwrap();
   conn.close().await.unwrap();
 }
 

@@ -45,7 +45,8 @@ async fn test_binlog_inserts() {
   let mut conn = setup_connection().await.unwrap();
   let binlog_cursor = conn.binlog_cursor().await.unwrap();
 
-  let mut stream = setup_connection()
+  let mut stream = conn
+    .duplicate()
     .await
     .unwrap()
     .binlog_stream(1, binlog_cursor)
@@ -88,6 +89,9 @@ async fn test_binlog_inserts() {
   }
 
   println!("{:?}", events);
+
+  stream.close().await.unwrap();
+  conn.close().await.unwrap();
 }
 
 async fn setup_connection() -> io::Result<Connection> {

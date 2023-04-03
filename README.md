@@ -7,24 +7,28 @@ CDC for postgres with BQ sink. Uses wal2json codec to decode replication events 
 - [ ] simple postgresql client (> v11)
   - [ ] auth
     - [x] password
-    - [ ] md5
+    - [ ] ~md5~ (deprecated)
     - [ ] scram-sha-256
     - [ ] ssl
   - [x] simple query support
   - [x] create/exists/delete replication slot
   - [ ] create replication stream using replication slot
+    - [x] read wal2json v2 events
+    - [ ] commit cursor position
+    - [ ] buffering
 - [ ] simple mysql client (> v8)
   - [ ] auth
     - [x] mysql_native_password
     - [ ] caching_sha2_password (see https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password)
     - [ ] ssl
-  - [ ] simple query support
-  - [ ] switch connection to replica
+  - [x] simple query support
+  - [x] switch connection to replica
   - [ ] stream binary log events
     - [x] supports row based replication events
-    - [ ] parse row event values
-  - [ ] start replication stream from scratch
-    - [ ] reload internal state (fetch tables metadata behind a read lock https://dev.mysql.com/doc/mysql-replication-excerpt/8.0/en/replication-howto-rawdata.html)
+      - [ ] parse row event values
+      - [ ] combine TableMapEvents + Insert/Update/Delete events in the streamer
+    - [ ] commit cursor position
+    - [ ] buffering
 - [ ] gcp clients
   - [x] auth
     - [x] service account

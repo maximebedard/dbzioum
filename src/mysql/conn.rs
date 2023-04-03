@@ -14,7 +14,7 @@ use super::protocol::{
 };
 use super::protocol_binlog::{BinlogEvent, BinlogEventPacket};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConnectionOptions {
   pub addr: SocketAddr,
   pub user: String,
@@ -88,6 +88,10 @@ impl Connection {
     connection.handshake().await?;
 
     Ok(connection)
+  }
+
+  pub async fn duplicate(&self) -> io::Result<Self> {
+    Self::connect(self.opts.clone()).await
   }
 
   pub async fn close(mut self) -> io::Result<()> {
@@ -845,6 +849,10 @@ impl BinlogStream {
     }
 
     Ok(packet)
+  }
+
+  pub async fn commit(&mut self) -> io::Result<()> {
+    todo!("should commit the current position of the stream somewhere")
   }
 
   pub fn server_id(&self) -> u32 {

@@ -1,6 +1,7 @@
 use ps2bq::gcp::{AccessTokenManager, Storage};
 
 #[tokio::test]
+#[ignore = "incomplete"]
 async fn test_gcp_storage() {
   let (access_token_manager, _handle) = AccessTokenManager::spawn(vec![]);
   let storage = Storage::new(access_token_manager);

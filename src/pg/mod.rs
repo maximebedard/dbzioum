@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::slice::{ChunksExact, ChunksExactMut};
 use std::{io, net::SocketAddr};
 
@@ -48,6 +49,10 @@ impl Connection {
     }
     connection.startup().await?;
     Ok(connection)
+  }
+
+  pub async fn duplicate(&self) -> io::Result<Self> {
+    Self::connect(self.options.clone()).await
   }
 
   async fn ssl_handshake(&mut self) -> io::Result<()> {
@@ -166,7 +171,7 @@ impl Connection {
           }
         }
         b'E' => {
-          self.read_backend_error().await?;
+          return Err(self.read_backend_error().await);
         }
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
@@ -212,7 +217,7 @@ impl Connection {
           break;
         }
         b'E' => {
-          self.read_backend_error().await?;
+          return Err(self.read_backend_error().await);
         }
         b'N' => {
           self.read_backend_notice().await?;
@@ -229,29 +234,125 @@ impl Connection {
     self.simple_query("SELECT 1").await.map(|_| ())
   }
 
-  pub async fn start_replication(
-    &mut self,
-    slot: Option<impl AsRef<str>>,
+  pub async fn start_replication_stream(
+    mut self,
+    slot: impl AsRef<str>,
     location: impl AsRef<str>,
-    tid: Option<i32>,
-  ) -> io::Result<()> {
-    let mut query = "START_REPLICATION".to_string();
-    if let Some(slot) = slot {
-      query = format!("{} SLOT {}", query, slot.as_ref());
+  ) -> io::Result<ReplicationStream> {
+    let command = format!(
+      "START_REPLICATION SLOT {} LOGICAL {} (\"format-version\" '2')",
+      slot.as_ref(),
+      location.as_ref()
+    );
+    self.write_query_command(command).await?;
+
+    match self.stream.read_u8().await? {
+      b'E' => {
+        return Err(self.read_backend_error().await);
+      }
+      b'W' => {
+        self.stream.read_i32().await?; // skip len
+        let format = self.stream.read_i8().await?;
+        let num_columns = self.stream.read_i16().await?;
+        let mut column_formats = Vec::with_capacity(num_columns as usize);
+        for i in 0..column_formats.len() {
+          column_formats.push(self.stream.read_i16().await?);
+        }
+
+        assert_eq!(0, format);
+        assert_eq!(0, num_columns);
+        assert!(column_formats.is_empty());
+      }
+      code => {
+        panic!("Unexpected backend message: {:?}", char::from(code))
+      }
     }
-    query = format!("{} {}", query, location.as_ref());
-    if let Some(tid) = tid {
-      query = format!("{} TIMELINE {}", query, tid);
-    }
-    self.write_query_command(query).await?;
-    Ok(())
+
+    Ok(ReplicationStream {
+      conn: self,
+      received: None,
+      commited: None,
+    })
   }
 
-  pub async fn create_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<()> {
-    self
+  async fn read_replication_event(&mut self) -> io::Result<ReplicationEvent> {
+    match self.stream.read_u8().await? {
+      b'E' => Err(self.read_backend_error().await),
+      b'd' => {
+        let len = self.stream.read_i32().await?;
+
+        match self.stream.read_u8().await? {
+          b'w' => {
+            let start = self.stream.read_i64().await?;
+            let end = self.stream.read_i64().await?;
+            let system_clock = self.stream.read_i64().await?;
+            let mut buffer = vec![0; len as usize - 4 - 1 - 8 - 8 - 8];
+            self.stream.read_exact(&mut buffer).await?;
+
+            let data_change = serde_json::from_slice::<DataChange>(buffer.as_slice())
+              .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+            Ok(ReplicationEvent::Data {
+              start,
+              end,
+              system_clock,
+              data_change,
+            })
+          }
+          b'k' => {
+            // https://www.postgresql.org/docs/current/protocol-replication.html
+            let end = self.stream.read_i64().await?;
+            let system_clock = self.stream.read_i64().await?;
+            let must_reply_status = self.stream.read_u8().await?;
+
+            Ok(ReplicationEvent::KeepAlive {
+              end,
+              system_clock,
+              must_reply: must_reply_status == 1,
+            })
+          }
+          code => {
+            panic!("Unexpected backend message: {:?}", char::from(code))
+          }
+        }
+      }
+      code => {
+        panic!("Unexpected backend message: {:?}", char::from(code))
+      }
+    }
+  }
+
+  pub async fn write_status_update(&mut self, a: i64, b: i64, c: i64) -> io::Result<()> {
+    self.stream.write_u8(b'r').await?;
+    self.stream.write_i64(a).await?;
+    self.stream.write_i64(b).await?;
+    self.stream.write_i64(c).await?;
+    let system_clock = 1_i64;
+    self.stream.write_i64(system_clock).await?;
+    self.stream.write_u8(0).await?;
+    self.stream.flush().await
+  }
+
+  pub async fn create_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<CreateReplicationSlot> {
+    let mut values = self
       .simple_query(format!("CREATE_REPLICATION_SLOT {} LOGICAL wal2json", slot.as_ref()))
       .await
-      .map(|_| ())
+      .map(|mut v| {
+        v.values.reverse();
+        v.values
+      })?;
+
+    let slot_name = values.pop().unwrap().unwrap();
+    let consistent_point = values.pop().unwrap().unwrap().parse().unwrap();
+    let snapshot_name = values.pop().unwrap();
+    let output_plugin = values.pop().unwrap();
+
+    Ok(CreateReplicationSlot {
+      slot_name,
+      consistent_point,
+      snapshot_name,
+      output_plugin,
+    })
   }
 
   pub async fn delete_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<()> {
@@ -271,8 +372,23 @@ impl Connection {
       .map(|result| result.values.len() > 0)
   }
 
-  pub async fn identify_system(&mut self) -> io::Result<SimpleQueryResult> {
-    self.simple_query("IDENTIFY_SYSTEM").await
+  pub async fn identify_system(&mut self) -> io::Result<IdentifySystem> {
+    let mut values = self.simple_query("IDENTIFY_SYSTEM").await.map(|mut v| {
+      v.values.reverse();
+      v.values
+    })?;
+
+    let systemid = values.pop().unwrap().unwrap();
+    let timeline = values.pop().unwrap().unwrap().parse().unwrap();
+    let xlogpos = values.pop().unwrap().unwrap();
+    let dbname = values.pop().unwrap();
+
+    Ok(IdentifySystem {
+      systemid,
+      timeline,
+      xlogpos,
+      dbname,
+    })
   }
 
   pub async fn timeline_history(&mut self, tid: i32) -> io::Result<SimpleQueryResult> {
@@ -442,8 +558,7 @@ impl Connection {
           break;
         }
         b'E' => {
-          self.read_backend_error().await?;
-          break;
+          return Err(self.read_backend_error().await);
         }
         b'N' => {
           self.read_backend_notice().await?;
@@ -498,7 +613,7 @@ impl Connection {
     Ok(())
   }
 
-  async fn read_backend_error(&mut self) -> io::Result<()> {
+  async fn read_backend_error(&mut self) -> io::Error {
     // https://www.postgresql.org/docs/11/protocol-error-fields.html
     // ErrorResponse (B)
     //     Byte1('E')
@@ -511,19 +626,33 @@ impl Connection {
     //     String
     //         The field value.
 
-    self.stream.read_i32().await?; // skip len
+    // skip len
+    if let Err(err) = self.stream.read_i32().await {
+      return err;
+    }
 
+    let mut fields = BTreeMap::new();
     loop {
-      match self.stream.read_u8().await? {
-        0 => break,
-        token => {
-          let msg = self.read_c_string().await?;
-          println!("{:?}: {:?}", char::from(token), msg);
-        }
+      match self.stream.read_u8().await {
+        Ok(0) => break,
+        Ok(token) => match self.read_c_string().await {
+          Ok(msg) => {
+            fields.insert(char::from(token), msg);
+          }
+          Err(err) => return err,
+        },
+        Err(err) => return err,
       }
     }
 
-    Ok(())
+    if fields.is_empty() {
+      io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server")
+    } else {
+      io::Error::new(
+        io::ErrorKind::Other,
+        format!("Server error {}: {}", fields[&'C'], fields[&'M']),
+      )
+    }
   }
 
   async fn read_c_string(&mut self) -> io::Result<String> {
@@ -601,4 +730,108 @@ impl SimpleQueryResult {
       None
     }
   }
+}
+
+#[derive(Debug)]
+pub struct IdentifySystem {
+  pub systemid: String,
+  pub timeline: u64,
+  pub xlogpos: String,
+  pub dbname: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct CreateReplicationSlot {
+  pub slot_name: String,
+  pub consistent_point: String,
+  pub snapshot_name: Option<String>,
+  pub output_plugin: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ReplicationStream {
+  conn: Connection,
+  received: Option<i64>,
+  commited: Option<i64>,
+}
+
+impl ReplicationStream {
+  pub async fn recv(&mut self) -> io::Result<ReplicationEvent> {
+    let event = self.conn.read_replication_event().await?;
+
+    if let ReplicationEvent::Data { start, .. } = &event {
+      self.received.replace(start.clone());
+    }
+
+    Ok(event)
+  }
+
+  pub async fn write_status_update(&mut self) -> io::Result<()> {
+    if let Some(commited) = self.commited {
+      self.conn.write_status_update(commited, commited, commited).await?;
+    }
+    Ok(())
+  }
+
+  pub async fn commit(&mut self) -> io::Result<()> {
+    self.commited = self.received;
+    Ok(())
+  }
+
+  pub async fn close(self) -> io::Result<()> {
+    self.conn.close().await
+  }
+}
+
+#[derive(Debug)]
+pub enum ReplicationEvent {
+  Data {
+    start: i64,
+    end: i64,
+    system_clock: i64,
+    data_change: DataChange,
+  },
+  KeepAlive {
+    end: i64,
+    system_clock: i64,
+    must_reply: bool,
+  },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "action")]
+pub enum DataChange {
+  #[serde(rename = "M")]
+  Message {
+    transactional: bool,
+    prefix: String,
+    content: String,
+  },
+
+  #[serde(rename = "B")]
+  Begin,
+
+  #[serde(rename = "C")]
+  Commit,
+
+  #[serde(rename = "I")]
+  Insert(RowChange),
+
+  #[serde(rename = "D")]
+  Delete(RowChange),
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RowChange {
+  schema: String,
+  table: String,
+  columns: Vec<ColumnChange>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ColumnChange {
+  name: String,
+  #[serde(rename = "type")]
+  column_type: String,
+  value: serde_json::Value,
 }
