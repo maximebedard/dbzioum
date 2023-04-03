@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::slice::{ChunksExact, ChunksExactMut};
+use std::time::{Duration, SystemTime};
 use std::{io, net::SocketAddr};
 
 use tokio::{
@@ -322,12 +323,19 @@ impl Connection {
     }
   }
 
-  pub async fn write_status_update(&mut self, a: i64, b: i64, c: i64) -> io::Result<()> {
+  pub async fn write_status_update(&mut self, written: i64, flushed: i64, applied: i64) -> io::Result<()> {
+    let dt = SystemTime::now()
+      .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800))
+      .unwrap();
+
+    let system_clock = dt.as_micros() as i64;
+
+    self.stream.write_u8(b'd').await?;
+    self.stream.write_i32(1 + 4 + 8 + 8 + 8 + 8 + 1).await?;
     self.stream.write_u8(b'r').await?;
-    self.stream.write_i64(a).await?;
-    self.stream.write_i64(b).await?;
-    self.stream.write_i64(c).await?;
-    let system_clock = 1_i64;
+    self.stream.write_i64(written).await?;
+    self.stream.write_i64(flushed).await?;
+    self.stream.write_i64(applied).await?;
     self.stream.write_i64(system_clock).await?;
     self.stream.write_u8(0).await?;
     self.stream.flush().await

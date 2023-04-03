@@ -95,7 +95,7 @@ async fn test_connection_replication_inserts() {
     .unwrap();
   conn.simple_query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
 
-  let mut interval = tokio::time::interval(Duration::from_secs(10));
+  let mut interval = tokio::time::interval(Duration::from_secs(8));
 
   loop {
     tokio::select! {
@@ -110,7 +110,6 @@ async fn test_connection_replication_inserts() {
       },
       _ = interval.tick() => {
         stream.write_status_update().await.unwrap();
-        println!("TICK");
       },
     }
   }
