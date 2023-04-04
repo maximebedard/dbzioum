@@ -429,7 +429,8 @@ impl Connection {
     Ok(BinlogStream {
       conn: self,
       server_id,
-      binlog_cursor,
+      commited: None,
+      received: binlog_cursor,
     })
   }
 
@@ -817,7 +818,7 @@ impl Column {
   }
 }
 
-#[derive(Debug, PartialEq, PartialOrd)]
+#[derive(Debug, PartialEq, PartialOrd, Clone)]
 pub struct BinlogCursor {
   pub log_file: String,
   pub log_position: u32,
@@ -827,7 +828,8 @@ pub struct BinlogCursor {
 pub struct BinlogStream {
   conn: Connection,
   server_id: u32,
-  binlog_cursor: BinlogCursor,
+  commited: Option<BinlogCursor>,
+  received: BinlogCursor,
 }
 
 impl BinlogStream {
@@ -839,11 +841,13 @@ impl BinlogStream {
   pub async fn recv(&mut self) -> io::Result<BinlogEventPacket> {
     let packet = self.conn.read_binlog_event_packet().await?;
 
-    self.binlog_cursor.log_position = packet.log_position;
+    self.received.log_position = packet.log_position;
+
     match &packet.event {
       BinlogEvent::Rotate(v) => {
-        self.binlog_cursor.log_file = v.next_log_file.clone();
-        self.binlog_cursor.log_position = v.next_log_position;
+        let log_file = v.next_log_file.clone();
+        let log_position = v.next_log_position;
+        self.received = BinlogCursor { log_file, log_position };
       }
       _ => {}
     }
@@ -852,14 +856,21 @@ impl BinlogStream {
   }
 
   pub async fn commit(&mut self) -> io::Result<()> {
-    todo!("should commit the current position of the stream somewhere")
+    self.commited.replace(self.received.clone());
+    Ok(())
   }
 
   pub fn server_id(&self) -> u32 {
     self.server_id
   }
 
-  pub fn binlog_cursor(&self) -> &BinlogCursor {
-    &self.binlog_cursor
+  // Reference to the cursor of the most recent event commited
+  pub fn commited(&self) -> &Option<BinlogCursor> {
+    &self.commited
+  }
+
+  // Reference to the cursor of the most recent event received
+  pub fn received(&self) -> &BinlogCursor {
+    &self.received
   }
 }

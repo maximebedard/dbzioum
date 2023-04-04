@@ -62,19 +62,22 @@ async fn test_binlog_inserts() {
     .query("CREATE TABLE Users (id int, name varchar(255));")
     .await
     .unwrap();
+  conn.query("TRUNCATE Users").await.unwrap();
   conn.query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
 
-  let binlog_status = conn.binlog_cursor().await.unwrap();
+  let cursor = conn.binlog_cursor().await.unwrap();
 
   let mut table_map_evt = None;
   let mut events = vec![];
   loop {
     // Wait for the stream to have caught up with the master
-    if stream.binlog_cursor() >= &binlog_status {
-      break;
+    if let Some(commited) = stream.commited() {
+      if commited >= &cursor {
+        break;
+      }
     }
 
-    let packet = stream.recv().await.ok().unwrap();
+    let packet = stream.recv().await.unwrap();
 
     // Insert/Update/Delete are always preceded by a TableMap event.
     match packet.event {
@@ -86,12 +89,13 @@ async fn test_binlog_inserts() {
       }
       _ => {}
     }
+
+    stream.commit().await.unwrap();
   }
 
   println!("{:?}", events);
 
-  stream.close().await.unwrap();
-  conn.close().await.unwrap();
+  tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
 
 async fn setup_connection() -> io::Result<Connection> {

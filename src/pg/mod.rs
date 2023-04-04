@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::slice::{ChunksExact, ChunksExactMut};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{io, net::SocketAddr};
 
@@ -238,14 +240,19 @@ impl Connection {
   pub async fn start_replication_stream(
     mut self,
     slot: impl AsRef<str>,
-    location: impl AsRef<str>,
+    wal_cursor: impl Into<WalCursor>,
   ) -> io::Result<ReplicationStream> {
+    let wal_cursor = wal_cursor.into();
     let command = format!(
       "START_REPLICATION SLOT {} LOGICAL {} (\"format-version\" '2')",
       slot.as_ref(),
-      location.as_ref()
+      &wal_cursor
     );
     self.write_query_command(command).await?;
+
+    // TODO: support timelines
+    // After streaming all the WAL on a timeline that is not the latest one, the server will end streaming by exiting the COPY mode. When the client acknowledges this by also exiting COPY mode, the server sends a result set with one row and two columns, indicating the next timeline in this server's history. The first column is the next timeline's ID (type int8), and the second column is the WAL location where the switch happened (type text). Usually, the switch position is the end of the WAL that was streamed, but there are corner cases where the server can send some WAL from the old timeline that it has not itself replayed before promoting. Finally, the server sends two CommandComplete messages (one that ends the CopyData and the other ends the START_REPLICATION itself), and is ready to accept a new command.
+    // WAL data is sent as a series of CopyData messages. (This allows other information to be intermixed; in particular the server can send an ErrorResponse message if it encounters a failure after beginning to stream.) The payload of each CopyData message from server to the client contains a message of one of the following formats:
 
     match self.stream.read_u8().await? {
       b'E' => {
@@ -271,8 +278,8 @@ impl Connection {
 
     Ok(ReplicationStream {
       conn: self,
-      received: None,
       commited: None,
+      received: wal_cursor,
     })
   }
 
@@ -388,13 +395,13 @@ impl Connection {
 
     let systemid = values.pop().unwrap().unwrap();
     let timeline = values.pop().unwrap().unwrap().parse().unwrap();
-    let xlogpos = values.pop().unwrap().unwrap();
+    let wal_cursor = values.pop().unwrap().unwrap().parse().unwrap();
     let dbname = values.pop().unwrap();
 
     Ok(IdentifySystem {
       systemid,
       timeline,
-      xlogpos,
+      wal_cursor,
       dbname,
     })
   }
@@ -744,14 +751,14 @@ impl SimpleQueryResult {
 pub struct IdentifySystem {
   pub systemid: String,
   pub timeline: u64,
-  pub xlogpos: String,
+  pub wal_cursor: WalCursor,
   pub dbname: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct CreateReplicationSlot {
   pub slot_name: String,
-  pub consistent_point: String,
+  pub consistent_point: WalCursor,
   pub snapshot_name: Option<String>,
   pub output_plugin: Option<String>,
 }
@@ -759,30 +766,43 @@ pub struct CreateReplicationSlot {
 #[derive(Debug)]
 pub struct ReplicationStream {
   conn: Connection,
-  received: Option<i64>,
-  commited: Option<i64>,
+  commited: Option<WalCursor>,
+  received: WalCursor,
 }
 
 impl ReplicationStream {
   pub async fn recv(&mut self) -> io::Result<ReplicationEvent> {
     let event = self.conn.read_replication_event().await?;
 
-    if let ReplicationEvent::Data { start, .. } = &event {
-      self.received.replace(start.clone());
+    match &event {
+      ReplicationEvent::Data { end, .. } => {
+        self.received.lsn = end.clone();
+      }
+      ReplicationEvent::KeepAlive { end, .. } => {
+        self.received.lsn = end.clone();
+      }
     }
 
     Ok(event)
   }
 
   pub async fn write_status_update(&mut self) -> io::Result<()> {
-    if let Some(commited) = self.commited {
-      self.conn.write_status_update(commited, commited, commited).await?;
+    if let Some(WalCursor { lsn, .. }) = self.commited {
+      self.conn.write_status_update(lsn, lsn, lsn).await?;
     }
     Ok(())
   }
 
+  pub fn commited(&self) -> &Option<WalCursor> {
+    &self.commited
+  }
+
+  pub fn received(&self) -> &WalCursor {
+    &self.received
+  }
+
   pub async fn commit(&mut self) -> io::Result<()> {
-    self.commited = self.received;
+    self.commited.replace(self.received.clone());
     Ok(())
   }
 
@@ -816,6 +836,9 @@ pub enum DataChange {
     content: String,
   },
 
+  #[serde(rename = "T")]
+  Truncate { schema: String, table: String },
+
   #[serde(rename = "B")]
   Begin,
 
@@ -842,4 +865,27 @@ pub struct ColumnChange {
   #[serde(rename = "type")]
   column_type: String,
   value: serde_json::Value,
+}
+
+#[derive(Debug, PartialEq, PartialOrd, Clone)]
+pub struct WalCursor {
+  tid: i8,
+  lsn: i64,
+}
+
+impl Display for WalCursor {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}/{:X}", self.tid, self.lsn)
+  }
+}
+
+impl FromStr for WalCursor {
+  type Err = ();
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    let (tid, lsn) = s.split_once("/").ok_or(())?;
+    let tid = tid.parse().map_err(|_| ())?;
+    let lsn = i64::from_str_radix(lsn, 16).map_err(|_| ())?;
+    Ok(Self { tid, lsn })
+  }
 }

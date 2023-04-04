@@ -37,7 +37,7 @@ async fn test_query() {
 #[tokio::test]
 async fn test_noop_query() {
   let mut conn = setup_connection().await.unwrap();
-  let results = conn.simple_query("NULL").await.unwrap();
+  let results = conn.simple_query(";").await.unwrap();
   assert_eq!(results.columns.len(), 0);
   assert_eq!(results.values.len(), 0);
   assert_eq!(results.rows_len(), 0);
@@ -93,15 +93,26 @@ async fn test_connection_replication_inserts() {
     .simple_query("CREATE TABLE Users (id int, name varchar(255));")
     .await
     .unwrap();
+  conn.simple_query("TRUNCATE Users;").await.unwrap();
   conn.simple_query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
 
-  let mut interval = tokio::time::interval(Duration::from_secs(8));
+  let IdentifySystem { wal_cursor, .. } = conn.identify_system().await.unwrap();
+
+  // default healthcheck is configured to 10s.
+  let mut interval = tokio::time::interval(Duration::from_secs(10));
 
   loop {
+    if let Some(commited) = stream.commited() {
+      if commited >= &wal_cursor {
+        break;
+      }
+    }
+
     tokio::select! {
       event = stream.recv() => {
         match event {
           Ok(event) => {
+            // TODO: do some processing.
             println!("{:?}", event);
             stream.commit().await.unwrap();
           },
@@ -114,8 +125,7 @@ async fn test_connection_replication_inserts() {
     }
   }
 
-  stream.close().await.unwrap();
-  conn.close().await.unwrap();
+  tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
 
 async fn setup_connection() -> io::Result<Connection> {
