@@ -90,11 +90,17 @@ async fn test_connection_replication_inserts() {
     Ok(_) => {}
   }
   conn
-    .simple_query("CREATE TABLE Users (id int, name varchar(255));")
+    .simple_query("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
     .await
     .unwrap();
   conn.simple_query("TRUNCATE Users;").await.unwrap();
   conn.simple_query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
+  conn.simple_query("INSERT INTO Users VALUES (2, 'yan');").await.unwrap();
+  conn.simple_query("DELETE FROM Users WHERE id = 2;").await.unwrap();
+  conn
+    .simple_query("UPDATE Users SET name = 'chad' WHERE id = 1;")
+    .await
+    .unwrap();
 
   let IdentifySystem { wal_cursor, .. } = conn.identify_system().await.unwrap();
 
@@ -102,6 +108,7 @@ async fn test_connection_replication_inserts() {
   let mut interval = tokio::time::interval(Duration::from_secs(10));
 
   loop {
+    // Wait for the stream to have caught up with the master
     if let Some(commited) = stream.commited() {
       if commited >= &wal_cursor {
         break;

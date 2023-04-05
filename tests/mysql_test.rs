@@ -62,8 +62,14 @@ async fn test_binlog_inserts() {
     .query("CREATE TABLE Users (id int, name varchar(255));")
     .await
     .unwrap();
-  conn.query("TRUNCATE Users").await.unwrap();
+  conn.query("TRUNCATE Users;").await.unwrap();
   conn.query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
+  conn.query("INSERT INTO Users VALUES (2, 'yan');").await.unwrap();
+  conn.query("DELETE FROM Users WHERE id = 2;").await.unwrap();
+  conn
+    .query("UPDATE Users SET name = 'chad' WHERE id = 1;")
+    .await
+    .unwrap();
 
   let cursor = conn.binlog_cursor().await.unwrap();
 
@@ -93,7 +99,7 @@ async fn test_binlog_inserts() {
     stream.commit().await.unwrap();
   }
 
-  println!("{:?}", events);
+  println!("{:#?}", events);
 
   tokio::try_join!(stream.close(), conn.close()).unwrap();
 }

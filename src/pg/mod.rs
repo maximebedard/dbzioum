@@ -23,6 +23,7 @@ pub struct ConnectionOptions {
   pub use_ssl: bool,
   pub password: Option<String>,
   pub database: Option<String>,
+  pub handle_notices_as_errors: bool,
 }
 
 impl Default for ConnectionOptions {
@@ -33,6 +34,7 @@ impl Default for ConnectionOptions {
       use_ssl: false,
       password: None,
       database: None,
+      handle_notices_as_errors: true,
     }
   }
 }
@@ -284,48 +286,54 @@ impl Connection {
   }
 
   async fn read_replication_event(&mut self) -> io::Result<ReplicationEvent> {
-    match self.stream.read_u8().await? {
-      b'E' => Err(self.read_backend_error().await),
-      b'd' => {
-        let len = self.stream.read_i32().await?;
+    loop {
+      match self.stream.read_u8().await? {
+        b'E' => return Err(self.read_backend_error().await),
+        b'N' => {
+          self.read_backend_notice().await?;
+        }
+        b'd' => {
+          let len = self.stream.read_i32().await?;
 
-        match self.stream.read_u8().await? {
-          b'w' => {
-            let start = self.stream.read_i64().await?;
-            let end = self.stream.read_i64().await?;
-            let system_clock = self.stream.read_i64().await?;
-            let mut buffer = vec![0; len as usize - 4 - 1 - 8 - 8 - 8];
-            self.stream.read_exact(&mut buffer).await?;
+          match self.stream.read_u8().await? {
+            b'w' => {
+              let start = self.stream.read_i64().await?;
+              let end = self.stream.read_i64().await?;
+              let system_clock = self.stream.read_i64().await?;
+              let mut buffer = vec![0; len as usize - 4 - 1 - 8 - 8 - 8];
+              self.stream.read_exact(&mut buffer).await?;
 
-            let data_change = serde_json::from_slice::<DataChange>(buffer.as_slice())
-              .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+              // println!("{}", std::str::from_utf8(&buffer).unwrap());
+              let data_change = serde_json::from_slice::<DataChange>(buffer.as_slice())
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
-            Ok(ReplicationEvent::Data {
-              start,
-              end,
-              system_clock,
-              data_change,
-            })
-          }
-          b'k' => {
-            // https://www.postgresql.org/docs/current/protocol-replication.html
-            let end = self.stream.read_i64().await?;
-            let system_clock = self.stream.read_i64().await?;
-            let must_reply_status = self.stream.read_u8().await?;
+              return Ok(ReplicationEvent::Data {
+                start,
+                end,
+                system_clock,
+                data_change,
+              });
+            }
+            b'k' => {
+              // https://www.postgresql.org/docs/current/protocol-replication.html
+              let end = self.stream.read_i64().await?;
+              let system_clock = self.stream.read_i64().await?;
+              let must_reply_status = self.stream.read_u8().await?;
 
-            Ok(ReplicationEvent::KeepAlive {
-              end,
-              system_clock,
-              must_reply: must_reply_status == 1,
-            })
-          }
-          code => {
-            panic!("Unexpected backend message: {:?}", char::from(code))
+              return Ok(ReplicationEvent::KeepAlive {
+                end,
+                system_clock,
+                must_reply: must_reply_status == 1,
+              });
+            }
+            code => {
+              panic!("Unexpected backend message: {:?}", char::from(code))
+            }
           }
         }
-      }
-      code => {
-        panic!("Unexpected backend message: {:?}", char::from(code))
+        code => {
+          panic!("Unexpected backend message: {:?}", char::from(code))
+        }
       }
     }
   }
@@ -577,7 +585,6 @@ impl Connection {
         }
         b'N' => {
           self.read_backend_notice().await?;
-          break;
         }
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
@@ -614,16 +621,18 @@ impl Connection {
     //     String
     //         The field value.
 
-    self.stream.read_i32().await?; // skip len
-
-    loop {
-      match self.stream.read_u8().await? {
-        0 => break,
-        token => {
-          let msg = self.read_c_string().await?;
-          println!("{:?}: {:?}", char::from(token), msg);
-        }
+    let fields = self.read_fields().await?;
+    if self.options.handle_notices_as_errors {
+      if fields.is_empty() {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "missing notice fields from server",
+        ));
       }
+      return Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!("Server notice {}: {}", fields[&'C'], fields[&'M']),
+      ));
     }
     Ok(())
   }
@@ -640,34 +649,35 @@ impl Connection {
     //         A code identifying the field type; if zero, this is the message terminator and no string follows. The presently defined field types are listed in Section 53.8. Since more field types might be added in future, frontends should silently ignore fields of unrecognized type.
     //     String
     //         The field value.
+    match self.read_fields().await {
+      Ok(fields) => {
+        if fields.is_empty() {
+          return io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server");
+        }
 
-    // skip len
-    if let Err(err) = self.stream.read_i32().await {
-      return err;
+        return io::Error::new(
+          io::ErrorKind::Other,
+          format!("Server error {}: {}", fields[&'C'], fields[&'M']),
+        );
+      }
+      Err(err) => err,
     }
+  }
+
+  async fn read_fields(&mut self) -> io::Result<BTreeMap<char, String>> {
+    self.stream.read_i32().await?; // skip len
 
     let mut fields = BTreeMap::new();
     loop {
-      match self.stream.read_u8().await {
-        Ok(0) => break,
-        Ok(token) => match self.read_c_string().await {
-          Ok(msg) => {
-            fields.insert(char::from(token), msg);
-          }
-          Err(err) => return err,
-        },
-        Err(err) => return err,
+      match self.stream.read_u8().await? {
+        0 => break,
+        token => {
+          let msg = self.read_c_string().await?;
+          fields.insert(char::from(token), msg);
+        }
       }
     }
-
-    if fields.is_empty() {
-      io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server")
-    } else {
-      io::Error::new(
-        io::ErrorKind::Other,
-        format!("Server error {}: {}", fields[&'C'], fields[&'M']),
-      )
-    }
+    Ok(fields)
   }
 
   async fn read_c_string(&mut self) -> io::Result<String> {
@@ -846,17 +856,26 @@ pub enum DataChange {
   Commit,
 
   #[serde(rename = "I")]
-  Insert(RowChange),
+  Insert {
+    schema: String,
+    table: String,
+    columns: Vec<ColumnChange>,
+  },
+
+  #[serde(rename = "U")]
+  Update {
+    schema: String,
+    table: String,
+    columns: Vec<ColumnChange>,
+    identity: Vec<ColumnChange>,
+  },
 
   #[serde(rename = "D")]
-  Delete(RowChange),
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct RowChange {
-  schema: String,
-  table: String,
-  columns: Vec<ColumnChange>,
+  Delete {
+    schema: String,
+    table: String,
+    identity: Vec<ColumnChange>,
+  },
 }
 
 #[derive(Debug, serde::Deserialize)]
