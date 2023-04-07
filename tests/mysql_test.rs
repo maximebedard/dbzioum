@@ -59,7 +59,7 @@ async fn test_binlog_inserts() {
     Ok(_) => {}
   }
   conn
-    .query("CREATE TABLE Users (id int, name varchar(255));")
+    .query("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
     .await
     .unwrap();
   conn.query("TRUNCATE Users;").await.unwrap();

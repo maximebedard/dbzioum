@@ -582,3 +582,43 @@ impl TryFrom<u8> for BinlogEventType {
     }
   }
 }
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u8)]
+pub enum ColumnMetadataType {
+  SIGNEDNESS = 1,
+  DEFAULT_CHARSET = 2,
+  COLUMN_CHARSET = 3,
+  COLUMN_NAME = 4,
+  SET_STR_VALUE = 5,
+  ENUM_STR_VALUE = 6,
+  GEOMETRY_TYPE = 7,
+  SIMPLE_PRIMARY_KEY = 8,
+  PRIMARY_KEY_WITH_PREFIX = 9,
+  ENUM_AND_SET_DEFAULT_CHARSET = 10,
+  ENUM_AND_SET_COLUMN_CHARSET = 11,
+  COLUMN_VISIBILITY = 12,
+}
+
+impl TryFrom<u8> for ColumnMetadataType {
+  type Error = u8;
+
+  fn try_from(v: u8) -> Result<Self, Self::Error> {
+    match v {
+      1 => Ok(ColumnMetadataType::SIGNEDNESS),
+      2 => Ok(ColumnMetadataType::DEFAULT_CHARSET),
+      3 => Ok(ColumnMetadataType::COLUMN_CHARSET),
+      4 => Ok(ColumnMetadataType::COLUMN_NAME),
+      5 => Ok(ColumnMetadataType::SET_STR_VALUE),
+      6 => Ok(ColumnMetadataType::ENUM_STR_VALUE),
+      7 => Ok(ColumnMetadataType::GEOMETRY_TYPE),
+      8 => Ok(ColumnMetadataType::SIMPLE_PRIMARY_KEY),
+      9 => Ok(ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX),
+      10 => Ok(ColumnMetadataType::ENUM_AND_SET_DEFAULT_CHARSET),
+      11 => Ok(ColumnMetadataType::ENUM_AND_SET_COLUMN_CHARSET),
+      12 => Ok(ColumnMetadataType::COLUMN_VISIBILITY),
+      unsupported => Err(unsupported),
+    }
+  }
+}

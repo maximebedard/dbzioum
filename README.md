@@ -27,7 +27,9 @@ CDC for postgres with BQ sink. Uses wal2json codec to decode replication events 
   - [x] switch connection to replica
   - [ ] stream binary log events
     - [x] supports row based replication events
+      - [x] support INSERT/UPDATE/DELETE events
       - [ ] parse row event values based on their column type
+      - [ ] support TRUNCATE events (via QUERY_EVENT)
       - [ ] combine TableMapEvents + Insert/Update/Delete events in the streamer
     - [ ] commit cursor position
     - [ ] buffering

@@ -589,7 +589,8 @@ impl Handshake {
     let server_version = b.mysql_null_terminated_string()?;
     b.advance(1);
     let connection_id = b.get_u32_le();
-    let (scramble_1_slice, mut b) = b.split_at(8);
+    let scramble_1_slice = &b[..8];
+    b = &b[8..];
     let scramble_1 = scramble_1_slice.to_vec();
     b.advance(1);
     let capabilities_1 = b.get_u16_le();
@@ -602,7 +603,9 @@ impl Handshake {
     let scramble_len = b.get_u8() as usize;
     b.advance(10);
 
-    let (scramble_2_slice, mut b) = b.split_at(max(12, scramble_len as i8 - 9) as usize);
+    let scramble_2_len = max(12, scramble_len as i8 - 9) as usize;
+    let scramble_2_slice = &b[..scramble_2_len];
+    b = &b[scramble_2_len..];
     b.advance(1);
     let scramble_2 = Some(scramble_2_slice.to_vec());
 

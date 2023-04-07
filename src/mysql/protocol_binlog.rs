@@ -1,3 +1,5 @@
+use crate::mysql::protocol::{CharacterSet, ColumnMetadataType};
+
 use super::protocol::ColumnType;
 use super::{buf_ext::BufExt, protocol::BinlogEventType};
 use bytes::Buf;
@@ -10,6 +12,7 @@ pub struct BinlogEventPacket {
   pub log_position: u32,
   pub flags: u16,
   pub event: BinlogEvent,
+  pub checksum: Vec<u8>,
 }
 
 impl BinlogEventPacket {
@@ -25,21 +28,27 @@ impl BinlogEventPacket {
     let event_size = (b.get_u32_le() - 19) as usize;
     let log_position = b.get_u32_le();
     let flags = b.get_u16_le();
-    let payload = b.to_vec();
+    let payload_len = b.remaining() - 4; // TODO: checksum is usually 4 bytes, but can be changed...
+    let payload = b[..payload_len].to_vec();
+    b = &b[payload_len..];
+    let checksum = b.to_vec();
 
     let event = match event_type {
       BinlogEventType::TABLE_MAP_EVENT => TableMapEvent::parse(&payload).map(BinlogEvent::TableMap),
-      BinlogEventType::ROTATE_EVENT => RotateEvent::parse(&payload).map(BinlogEvent::Rotate),
+      BinlogEventType::ROTATE_EVENT => {
+        // NOTE: Strangely enough, the checksum is actually the suffix of the binlog file name.
+        RotateEvent::parse(&payload, &checksum).map(BinlogEvent::Rotate)
+      }
       BinlogEventType::FORMAT_DESCRIPTION_EVENT => FormatDescriptionEvent::parse(&payload).map(BinlogEvent::Format),
-      BinlogEventType::WRITE_ROWS_EVENTV0 => RowEvent::parse(&payload, false, false).map(BinlogEvent::Insert),
-      BinlogEventType::WRITE_ROWS_EVENTV1 => RowEvent::parse(&payload, false, false).map(BinlogEvent::Insert),
-      BinlogEventType::WRITE_ROWS_EVENTV2 => RowEvent::parse(&payload, true, false).map(BinlogEvent::Insert),
-      BinlogEventType::UPDATE_ROWS_EVENTV0 => RowEvent::parse(&payload, false, false).map(BinlogEvent::Update),
-      BinlogEventType::UPDATE_ROWS_EVENTV1 => RowEvent::parse(&payload, false, true).map(BinlogEvent::Update),
-      BinlogEventType::UPDATE_ROWS_EVENTV2 => RowEvent::parse(&payload, true, true).map(BinlogEvent::Update),
-      BinlogEventType::DELETE_ROWS_EVENTV0 => RowEvent::parse(&payload, false, false).map(BinlogEvent::Delete),
-      BinlogEventType::DELETE_ROWS_EVENTV1 => RowEvent::parse(&payload, false, false).map(BinlogEvent::Delete),
-      BinlogEventType::DELETE_ROWS_EVENTV2 => RowEvent::parse(&payload, true, false).map(BinlogEvent::Delete),
+      BinlogEventType::WRITE_ROWS_EVENTV0 => RowEvent::parse(&payload, false, false, true).map(BinlogEvent::Insert),
+      BinlogEventType::WRITE_ROWS_EVENTV1 => RowEvent::parse(&payload, false, false, true).map(BinlogEvent::Insert),
+      BinlogEventType::WRITE_ROWS_EVENTV2 => RowEvent::parse(&payload, true, false, true).map(BinlogEvent::Insert),
+      BinlogEventType::UPDATE_ROWS_EVENTV0 => RowEvent::parse(&payload, false, true, true).map(BinlogEvent::Update),
+      BinlogEventType::UPDATE_ROWS_EVENTV1 => RowEvent::parse(&payload, false, true, true).map(BinlogEvent::Update),
+      BinlogEventType::UPDATE_ROWS_EVENTV2 => RowEvent::parse(&payload, true, true, true).map(BinlogEvent::Update),
+      BinlogEventType::DELETE_ROWS_EVENTV0 => RowEvent::parse(&payload, false, true, false).map(BinlogEvent::Delete),
+      BinlogEventType::DELETE_ROWS_EVENTV1 => RowEvent::parse(&payload, false, true, false).map(BinlogEvent::Delete),
+      BinlogEventType::DELETE_ROWS_EVENTV2 => RowEvent::parse(&payload, true, true, false).map(BinlogEvent::Delete),
       not_supported => Ok(BinlogEvent::NotSupported(not_supported)),
     }?;
 
@@ -49,6 +58,7 @@ impl BinlogEventPacket {
       log_position,
       flags,
       event,
+      checksum,
     })
   }
 }
@@ -71,10 +81,11 @@ pub struct RotateEvent {
 }
 
 impl RotateEvent {
-  fn parse(buffer: impl AsRef<[u8]>) -> io::Result<Self> {
+  fn parse(buffer: impl AsRef<[u8]>, checksum_buffer: impl AsRef<[u8]>) -> io::Result<Self> {
     let mut b = buffer.as_ref();
+    let cb = checksum_buffer.as_ref();
     let next_log_position = b.get_u64_le() as u32;
-    let next_log_file = String::from_utf8(b.to_vec()).unwrap();
+    let next_log_file = String::from_utf8([&b[..], &cb[..]].concat().to_vec()).unwrap();
 
     Ok(Self {
       next_log_position,
@@ -91,8 +102,59 @@ pub struct TableMapEvent {
   pub table: String,
   pub column_count: u64,
   pub column_types: Vec<ColumnType>,
-  pub column_metas: Vec<u16>,
+  pub column_metas: Vec<u64>,
   pub null_bitmap: Vec<u8>,
+  pub metadata: TableMapEventMetadata,
+}
+
+#[derive(Debug, Default)]
+pub struct TableMapEventMetadata {
+  pub signedness: Option<Vec<u8>>,
+  pub default_charset: Option<(CharacterSet, Vec<(usize, CharacterSet)>)>,
+  pub enum_and_set_default_charsets: Option<(CharacterSet, Vec<(usize, CharacterSet)>)>,
+  pub column_charsets: Option<Vec<CharacterSet>>,
+  pub enum_and_set_column_charsets: Option<Vec<CharacterSet>>,
+  pub column_names: Option<Vec<String>>,
+  pub set_str_values: Option<Vec<String>>,
+  pub enum_str_values: Option<Vec<String>>,
+}
+
+impl TableMapEventMetadata {
+  fn parse_default_charset(buffer: impl AsRef<[u8]>) -> io::Result<(CharacterSet, Vec<(usize, CharacterSet)>)> {
+    let mut b = buffer.as_ref();
+    let default_charset = b.mysql_get_lenc_uint()?;
+    let default_charset = (default_charset as u8).try_into().unwrap();
+
+    let mut pairs = Vec::new();
+    while b.remaining() > 0 {
+      let index = b.mysql_get_lenc_uint()?;
+      let index = index as usize;
+
+      let charset = b.mysql_get_lenc_uint()?;
+      let charset = (charset as u8).try_into().unwrap();
+
+      pairs.push((index, charset))
+    }
+
+    Ok((default_charset, pairs))
+  }
+
+  fn parse_column_charsets(buffer: impl AsRef<[u8]>) -> io::Result<Vec<CharacterSet>> {
+    let mut b = buffer.as_ref();
+
+    let mut column_charsets = Vec::new();
+    while b.remaining() > 0 {
+      let column_charset = b.mysql_get_lenc_uint()?;
+      let column_charset = (column_charset as u8).try_into().unwrap();
+      column_charsets.push(column_charset);
+    }
+
+    Ok(column_charsets)
+  }
+
+  fn parse_str_value(buffer: impl AsRef<[u8]>) -> io::Result<Vec<String>> {
+    todo!()
+  }
 }
 
 impl TableMapEvent {
@@ -102,63 +164,51 @@ impl TableMapEvent {
     let flags = b.get_u16_le();
 
     let schema_len = b.get_u8() as usize;
-    let (schema, mut b) = b.split_at(schema_len);
+    let schema = &b[..schema_len];
+    b = &b[schema_len..];
     let schema = String::from_utf8(schema.to_vec()).unwrap();
 
     // skip 0x00
     b.advance(1);
 
     let table_len = b.get_u8() as usize;
-    let (table, mut b) = b.split_at(table_len);
+    let table = &b[..table_len];
+    b = &b[table_len..];
     let table = String::from_utf8(table.to_vec()).unwrap();
 
     // skip 0x00
     b.advance(1);
 
     let column_count = b.mysql_get_lenc_uint().unwrap() as usize;
-    let column_types: Vec<ColumnType> = b[..column_count]
-      .iter()
-      .cloned()
-      .map(|v| ColumnType::try_from(v).unwrap())
-      .collect();
+    let mut column_types = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+      column_types.push(b.get_u8().try_into().unwrap());
+    }
+
+    let column_metas_buffer_len = b.mysql_get_lenc_uint().unwrap() as usize;
+    let mut column_metas_buffer = &b[..column_metas_buffer_len];
+    b = &b[column_metas_buffer_len..];
 
     let mut column_metas = vec![0; column_count];
 
-    let column_meta_reader_len = b.mysql_get_lenc_uint().unwrap() as usize;
-    let (mut column_meta_reader, b) = b.split_at(column_meta_reader_len);
-
     // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html#a1b84e5b226c76eaf9c0df8ed03ba1393
-
     for (i, t) in column_types.iter().enumerate() {
       match t {
-        // 2 bytes
-        ColumnType::MYSQL_TYPE_STRING
-        | ColumnType::MYSQL_TYPE_NEWDECIMAL
-        | ColumnType::MYSQL_TYPE_VAR_STRING
-        | ColumnType::MYSQL_TYPE_VARCHAR
-        | ColumnType::MYSQL_TYPE_BIT => {
-          // TODO: there is a off by one somewhere, and this should be using read_u16;
-          // println!("a {:?}, {:?}", t, column_meta_reader);
-          column_metas[i] = column_meta_reader.get_u8() as u16;
-        }
-
-        // 1 byte
-        ColumnType::MYSQL_TYPE_BLOB
+        ColumnType::MYSQL_TYPE_FLOAT
         | ColumnType::MYSQL_TYPE_DOUBLE
-        | ColumnType::MYSQL_TYPE_FLOAT
-        | ColumnType::MYSQL_TYPE_GEOMETRY
-        | ColumnType::MYSQL_TYPE_JSON => {
-          // println!("b {:?}", t);
-          column_metas[i] = column_meta_reader.get_u8() as u16;
+        | ColumnType::MYSQL_TYPE_BLOB
+        | ColumnType::MYSQL_TYPE_GEOMETRY => {
+          column_metas[i] = column_metas_buffer.get_u8().into();
         }
 
-        // maybe 1 byte?
-        ColumnType::MYSQL_TYPE_TIME2 | ColumnType::MYSQL_TYPE_DATETIME2 | ColumnType::MYSQL_TYPE_TIMESTAMP2 => {
-          // println!("c {:?}", t);
-          column_metas[i] = column_meta_reader.get_u8() as u16;
+        ColumnType::MYSQL_TYPE_VARCHAR
+        | ColumnType::MYSQL_TYPE_BIT
+        | ColumnType::MYSQL_TYPE_VAR_STRING
+        | ColumnType::MYSQL_TYPE_STRING
+        | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+          column_metas[i] = column_metas_buffer.get_u16_le().into();
         }
 
-        // 0 byte
         ColumnType::MYSQL_TYPE_DECIMAL
         | ColumnType::MYSQL_TYPE_TINY
         | ColumnType::MYSQL_TYPE_SHORT
@@ -171,19 +221,75 @@ impl TableMapEvent {
         | ColumnType::MYSQL_TYPE_TIME
         | ColumnType::MYSQL_TYPE_DATETIME
         | ColumnType::MYSQL_TYPE_YEAR => {
-          // println!("d {:?}", t);
-          column_metas[i] = 0_u16;
+          column_metas[i] = 0;
         }
 
-        _ => unimplemented!(),
+        ColumnType::MYSQL_TYPE_TIMESTAMP2
+        | ColumnType::MYSQL_TYPE_DATETIME2
+        | ColumnType::MYSQL_TYPE_TIME2
+        | ColumnType::MYSQL_TYPE_JSON
+        | ColumnType::MYSQL_TYPE_ENUM
+        | ColumnType::MYSQL_TYPE_SET
+        | ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+        | ColumnType::MYSQL_TYPE_LONG_BLOB => {
+          todo!();
+        }
       }
     }
 
-    let null_bitmap = if b.len() == (column_count + 7) / 8 {
-      b.to_vec()
-    } else {
-      Vec::new()
-    };
+    assert_eq!(column_metas_buffer.remaining(), 0);
+    let null_bitmap_len = (column_count + 7) / 8;
+    let null_bitmap = b[..null_bitmap_len].to_vec();
+    b = &b[null_bitmap_len..];
+
+    let mut metadata = TableMapEventMetadata::default();
+
+    while b.remaining() > 0 {
+      let metadata_type: ColumnMetadataType = b.get_u8().try_into().unwrap();
+      let metadata_len = b.mysql_get_lenc_uint().unwrap() as usize;
+      let metadata_buffer = &b[..metadata_len];
+      b = &b[metadata_len..];
+
+      // https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp#L141
+      match metadata_type {
+        ColumnMetadataType::SIGNEDNESS => {
+          let signedness = metadata_buffer.to_vec();
+          metadata.signedness = Some(signedness);
+        }
+        ColumnMetadataType::DEFAULT_CHARSET => {
+          let default_charset = TableMapEventMetadata::parse_default_charset(metadata_buffer)?;
+          metadata.default_charset = Some(default_charset)
+        }
+        ColumnMetadataType::COLUMN_CHARSET => {
+          let column_charset = TableMapEventMetadata::parse_column_charsets(metadata_buffer)?;
+          metadata.column_charsets = Some(column_charset)
+        }
+        ColumnMetadataType::COLUMN_NAME => {
+          todo!();
+        }
+        ColumnMetadataType::SET_STR_VALUE => {
+          let set_str_values = TableMapEventMetadata::parse_str_value(metadata_buffer)?;
+          metadata.set_str_values = Some(set_str_values);
+        }
+        ColumnMetadataType::ENUM_STR_VALUE => {
+          let enum_str_values = TableMapEventMetadata::parse_str_value(metadata_buffer)?;
+          metadata.enum_str_values = Some(enum_str_values);
+        }
+        ColumnMetadataType::GEOMETRY_TYPE => todo!(),
+        ColumnMetadataType::SIMPLE_PRIMARY_KEY => todo!(),
+        ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX => todo!(),
+        ColumnMetadataType::ENUM_AND_SET_DEFAULT_CHARSET => {
+          let enum_and_set_default_charsets = TableMapEventMetadata::parse_default_charset(metadata_buffer)?;
+          metadata.enum_and_set_default_charsets = Some(enum_and_set_default_charsets)
+        }
+        ColumnMetadataType::ENUM_AND_SET_COLUMN_CHARSET => {
+          let enum_and_set_column_charsets = TableMapEventMetadata::parse_column_charsets(metadata_buffer)?;
+          metadata.enum_and_set_column_charsets = Some(enum_and_set_column_charsets);
+        }
+        ColumnMetadataType::COLUMN_VISIBILITY => todo!(),
+      }
+    }
 
     Ok(Self {
       table_id,
@@ -194,6 +300,7 @@ impl TableMapEvent {
       column_types,
       column_metas,
       null_bitmap,
+      metadata,
     })
   }
 }
@@ -212,7 +319,9 @@ impl FormatDescriptionEvent {
     let mut b = buffer.as_ref();
     let version = b.get_u16_le();
 
-    let (server_version, mut b) = b.split_at(50);
+    let server_version = &b[..50];
+    b = &b[50..];
+
     let null_terminated = server_version.iter().position(|x| *x == 0x00).unwrap_or(0);
     let server_version = String::from_utf8(server_version[..null_terminated].to_vec()).unwrap();
 
@@ -235,42 +344,58 @@ impl FormatDescriptionEvent {
 pub struct RowEvent {
   pub table_id: u64,
   pub flags: u16,
-  pub extras: Vec<u8>,
+  pub extras: Option<Vec<u8>>,
   pub column_count: u64,
-  pub column_bitmap1: Vec<u8>,
-  pub column_bitmap2: Vec<u8>,
+  pub columns_before_image: Option<Vec<u8>>,
+  pub columns_after_image: Option<Vec<u8>>,
+  pub null_bitmap: Option<Vec<u8>>,
   pub rows: Vec<u8>,
 }
 
 impl RowEvent {
-  fn parse(buffer: impl AsRef<[u8]>, use_extras: bool, use_bitmap2: bool) -> io::Result<Self> {
+  fn parse(
+    buffer: impl AsRef<[u8]>,
+    use_extras: bool,
+    use_columns_before_image: bool,
+    use_columns_after_image: bool,
+  ) -> io::Result<Self> {
+    // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Rows__event.html
     let mut b = buffer.as_ref();
     let table_id = b.get_uint_le(6);
     let flags = b.get_u16_le();
 
-    let extras = if use_extras {
-      let extras_len = b.get_u16_le() as usize - 2;
-      let (extras_data, b) = b.split_at(extras_len);
-      let extras_data = extras_data.to_vec();
-      extras_data
-    } else {
-      Vec::new()
-    };
+    let mut extras = None;
+    if use_extras {
+      let extras_len = (b.get_u16_le() - 2) as usize;
+      let buffer = &b[..extras_len];
+      b = &b[extras_len..];
+      extras = Some(buffer.to_vec())
+    }
 
     let column_count = b.mysql_get_lenc_uint().unwrap();
 
     let bitmap_len = ((column_count + 7) / 8) as usize;
 
-    let (column_bitmap1, b) = b.split_at(bitmap_len);
-    let column_bitmap1 = column_bitmap1.to_vec();
+    let mut columns_before_image = None;
+    if use_columns_before_image {
+      let buffer = &b[..bitmap_len];
+      b = &b[bitmap_len..];
+      columns_before_image = Some(buffer.to_vec());
+    }
 
-    let column_bitmap2 = if use_bitmap2 {
-      let (column_bitmap2_data, b) = b.split_at(bitmap_len);
-      let column_bitmap2_data = column_bitmap2_data.to_vec();
-      column_bitmap2_data
-    } else {
-      Vec::new()
-    };
+    let mut columns_after_image = None;
+    if use_columns_after_image {
+      let buffer = &b[..bitmap_len];
+      b = &b[bitmap_len..];
+      columns_after_image = Some(buffer.to_vec());
+    }
+
+    let mut null_bitmap = None;
+    if bitmap_len > 0 {
+      let buffer = &b[..bitmap_len];
+      b = &b[bitmap_len..];
+      null_bitmap = Some(buffer.to_vec());
+    }
 
     //https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html
     // https://dev.mysql.com/doc/refman/8.0/en/mysqlbinlog-row-events.html
@@ -281,10 +406,15 @@ impl RowEvent {
       flags,
       extras,
       column_count,
-      column_bitmap1,
-      column_bitmap2,
+      columns_before_image,
+      columns_after_image,
+      null_bitmap,
       rows,
     })
+  }
+
+  pub fn values(t: &TableMapEvent) -> Vec<serde_json::Value> {
+    todo!()
   }
 }
 
