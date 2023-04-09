@@ -328,6 +328,11 @@ impl Connection {
     // 0x00 = Ok, 0xFF = Err, 0xFE = AuthSwitch, 0x01 = AuthMoreData
     match auth_plugin_name {
       MYSQL_NATIVE_PASSWORD_PLUGIN_NAME | CACHING_SHA2_PASSWORD_PLUGIN_NAME => {
+        if let Some(&0x00) = payload.get(0) {
+          return self.parse_and_handle_server_ok(payload);
+        }
+
+        // TODO: figure out what is this actually used for???
         if payload.as_slice() == &[0x01, 0x03] {
           let payload = self.read_payload().await?;
           return self.parse_and_handle_server_ok(payload);
@@ -423,7 +428,7 @@ impl Connection {
     binlog_cursor: impl Into<BinlogCursor>,
   ) -> io::Result<BinlogStream> {
     let binlog_cursor = binlog_cursor.into();
-    self.disable_master_binlog_checksum().await?;
+    self.source_configuration_check().await?;
     self.register_as_replica(server_id).await?;
     self.dump_binlog(server_id, &binlog_cursor).await?;
     Ok(BinlogStream {
@@ -462,27 +467,17 @@ impl Connection {
     }
   }
 
-  async fn disable_master_binlog_checksum(&mut self) -> io::Result<()> {
-    self.query("SET @master_binlog_checksum='NONE'").await?;
+  async fn source_configuration_check(&mut self) -> io::Result<()> {
+    // TODO: Actually remove this check.
+    self.query("SELECT @@GLOBAL.binlog_checksum;").await.map(|v| {
+      assert_eq!(v.values[0].as_ref().map(String::as_str), Some("NONE"));
+    })?;
+
+    self.query("SELECT @@GLOBAL.binlog_row_metadata;").await.map(|v| {
+      assert_eq!(v.values[0].as_ref().map(String::as_str), Some("FULL"));
+    })?;
+
     Ok(())
-    // TODO: it most likely better to check the value before actually trying to set it.
-
-    // let checksum = self.query("SELECT @@binlog_checksum")
-    //   .await
-    //   .and_then(QueryResult::value_as_str);
-
-    //       let checksum = self.get_system_var("binlog_checksum")
-    //           .map(from_value::<String>)
-    //           .unwrap_or("NONE".to_owned());
-
-    //       match checksum.as_ref() {
-    //           "NONE" => Ok(()),
-    //           "CRC32" => {
-    //               self.query("SET @master_binlog_checksum='NONE'")?;
-    //               Ok(())
-    //           }
-    //           _ => Err(DriverError(UnexpectedPacket)),
-    //       }
   }
 
   async fn register_as_replica(&mut self, server_id: u32) -> io::Result<()> {

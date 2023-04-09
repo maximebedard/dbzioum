@@ -30,7 +30,7 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
       - [x] support INSERT/UPDATE/DELETE events
       - [ ] parse row event values based on their column type
         - [x] Integers (integer, int, smallint, tinyint, mediumint, bigint)
-        - [x] Fixed point (decimal, numeric)
+        - [ ] Fixed point (decimal, numeric)
         - [x] Floating point (float, double)
         - [ ] Bit
         - [x] Strings/Bytes (CHAR, VARCHAR, BINARY, VARBINARY, BLOB, TEXT)
@@ -66,3 +66,15 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
 docker-compose up
 cargo test
 ```
+
+# Special configs
+
+- pg
+  - `wal_level=logical`
+- mysql ([ref gcp](https://cloud.google.com/datastream/docs/configure-your-source-mysql-database))
+  - `--default-authentication-plugin=mysql_native_password`
+  - `--binlog-format=ROW` (default)
+  - `--binlog-row-image=FULL` (default)
+  - `--binlog-checksum=NONE` (TODO: remove this)
+  - `--binlog-row-metadata=FULL`
+  - `GRANT REPLICATION SLAVE, SELECT, REPLICATION CLIENT ON *.* TO 'mysql'@'%';`

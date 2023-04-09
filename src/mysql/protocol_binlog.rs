@@ -102,7 +102,7 @@ pub struct TableMapEvent {
   pub table: String,
   pub column_count: usize,
   pub column_types: Vec<ColumnType>,
-  pub column_metas: Vec<u64>,
+  pub column_metas: Vec<u32>,
   pub null_bitmap: Vec<u8>,
   pub metadata: TableMapEventMetadata,
 }
@@ -248,7 +248,7 @@ impl TableMapEvent {
     while b.remaining() > 0 {
       let metadata_type: ColumnMetadataType = b.get_u8().try_into().unwrap();
       let metadata_len = b.mysql_get_lenc_uint().unwrap() as usize;
-      let metadata_buffer = &b[..metadata_len];
+      let mut metadata_buffer = &b[..metadata_len];
       b = &b[metadata_len..];
 
       // https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp#L141
@@ -266,7 +266,15 @@ impl TableMapEvent {
           metadata.column_charsets = Some(column_charset)
         }
         ColumnMetadataType::COLUMN_NAME => {
-          todo!();
+          let mut column_names = Vec::new();
+          while metadata_buffer.remaining() > 0 {
+            let len = metadata_buffer.mysql_get_lenc_uint()? as usize;
+            let buffer = metadata_buffer[..len].to_vec();
+            metadata_buffer = &metadata_buffer[len..];
+            column_names.push(String::from_utf8(buffer).unwrap());
+          }
+          println!("{:?}", column_names);
+          metadata.column_names = Some(column_names);
         }
         ColumnMetadataType::SET_STR_VALUE => {
           let set_str_values = TableMapEventMetadata::parse_str_value(metadata_buffer)?;
@@ -277,8 +285,12 @@ impl TableMapEvent {
           metadata.enum_str_values = Some(enum_str_values);
         }
         ColumnMetadataType::GEOMETRY_TYPE => todo!(),
-        ColumnMetadataType::SIMPLE_PRIMARY_KEY => todo!(),
-        ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX => todo!(),
+        ColumnMetadataType::SIMPLE_PRIMARY_KEY => {
+          // todo!();
+        }
+        ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX => {
+          todo!()
+        }
         ColumnMetadataType::ENUM_AND_SET_DEFAULT_CHARSET => {
           let enum_and_set_default_charsets = TableMapEventMetadata::parse_default_charset(metadata_buffer)?;
           metadata.enum_and_set_default_charsets = Some(enum_and_set_default_charsets)
@@ -287,7 +299,9 @@ impl TableMapEvent {
           let enum_and_set_column_charsets = TableMapEventMetadata::parse_column_charsets(metadata_buffer)?;
           metadata.enum_and_set_column_charsets = Some(enum_and_set_column_charsets);
         }
-        ColumnMetadataType::COLUMN_VISIBILITY => todo!(),
+        ColumnMetadataType::COLUMN_VISIBILITY => {
+          todo!()
+        }
       }
     }
 
@@ -305,7 +319,7 @@ impl TableMapEvent {
   }
 
   pub fn columns(&self) -> Vec<Column> {
-    let is_signed = |i: usize| -> bool {
+    let is_unsigned = |i: usize| -> bool {
       self
         .metadata
         .signedness
@@ -316,25 +330,26 @@ impl TableMapEvent {
 
     (0..self.column_count)
       .map(|i| {
+        let column_name = self.metadata.column_names.as_ref().unwrap()[i].clone();
         let column_type = self.column_types[i];
         let column_meta = self.column_metas[i];
         let is_nullable = self.null_bitmap[i / 8] & (1 << (i % 8)) != 0;
 
         let column_type_definition = match column_type {
-          ColumnType::MYSQL_TYPE_TINY if is_signed(i) => ColumnTypeDefinition::I8,
-          ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::U8,
+          ColumnType::MYSQL_TYPE_TINY if is_unsigned(i) => ColumnTypeDefinition::U8,
+          ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::I8,
 
-          ColumnType::MYSQL_TYPE_SHORT if is_signed(i) => ColumnTypeDefinition::I16,
-          ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::U16,
+          ColumnType::MYSQL_TYPE_SHORT if is_unsigned(i) => ColumnTypeDefinition::U16,
+          ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::I16,
 
-          ColumnType::MYSQL_TYPE_INT24 if is_signed(i) => ColumnTypeDefinition::I32,
-          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::U32,
+          ColumnType::MYSQL_TYPE_INT24 if is_unsigned(i) => ColumnTypeDefinition::U32,
+          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::I32,
 
-          ColumnType::MYSQL_TYPE_LONG if is_signed(i) => ColumnTypeDefinition::I32,
-          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::U32,
+          ColumnType::MYSQL_TYPE_LONG if is_unsigned(i) => ColumnTypeDefinition::U32,
+          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::I32,
 
-          ColumnType::MYSQL_TYPE_LONGLONG if is_signed(i) => ColumnTypeDefinition::I64,
-          ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::U64,
+          ColumnType::MYSQL_TYPE_LONGLONG if is_unsigned(i) => ColumnTypeDefinition::U64,
+          ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::I64,
 
           ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
             let precision = 0;
@@ -344,12 +359,12 @@ impl TableMapEvent {
 
           ColumnType::MYSQL_TYPE_FLOAT => {
             let pack_length = column_meta as u8;
-            assert_eq!(column_meta, 4); // Make sure that the server sizeof(float) == 4
+            assert_eq!(pack_length, 4); // Make sure that the server sizeof(float) == 4
             ColumnTypeDefinition::F32 { pack_length }
           }
           ColumnType::MYSQL_TYPE_DOUBLE => {
             let pack_length = column_meta as u8;
-            assert_eq!(column_meta, 8); // Make sure that the server sizeof(float) == 8
+            assert_eq!(pack_length, 8); // Make sure that the server sizeof(float) == 8
             ColumnTypeDefinition::F64 { pack_length }
           }
 
@@ -389,6 +404,7 @@ impl TableMapEvent {
         };
 
         Column {
+          column_name,
           is_nullable,
           column_type_definition,
         }
@@ -515,6 +531,7 @@ impl RowEvent {
         let Column {
           is_nullable,
           column_type_definition,
+          ..
         } = c;
 
         let is_null = self
@@ -522,6 +539,8 @@ impl RowEvent {
           .as_ref()
           .filter(|v| v[i / 8] & (1 << i % 8) != 0)
           .is_some();
+
+        println!("{:X?}", b);
 
         let value = match column_type_definition {
           ColumnTypeDefinition::U8 => Value::U8(b.get_u8()),
@@ -549,11 +568,9 @@ impl RowEvent {
           }
         };
 
-        if *is_nullable && is_null {
-          None
-        } else {
-          Some(value)
-        }
+        let vv = if *is_nullable && is_null { None } else { Some(value) };
+        println!("{:?}", vv);
+        vv
       })
       .collect()
   }
@@ -577,6 +594,7 @@ pub enum Value {
 
 #[derive(Debug)]
 pub struct Column {
+  column_name: String,
   is_nullable: bool,
   column_type_definition: ColumnTypeDefinition,
 }
@@ -728,3 +746,5 @@ mod test {
     }
   }
 }
+
+// https://dev.mysql.com/doc/refman/8.0/en/replication-options-binary-log.html

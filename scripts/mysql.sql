@@ -1,2 +1,0 @@
-GRANT REPLICATION CLIENT ON *.* TO 'mysql'@'%';
-GRANT REPLICATION SLAVE ON *.* TO 'mysql'@'%';
