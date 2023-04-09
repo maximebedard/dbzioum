@@ -100,7 +100,7 @@ pub struct TableMapEvent {
   pub flags: u16,
   pub schema: String,
   pub table: String,
-  pub column_count: u64,
+  pub column_count: usize,
   pub column_types: Vec<ColumnType>,
   pub column_metas: Vec<u64>,
   pub null_bitmap: Vec<u8>,
@@ -296,12 +296,104 @@ impl TableMapEvent {
       flags,
       schema: schema.into(),
       table: table.into(),
-      column_count: column_count as u64,
+      column_count,
       column_types,
       column_metas,
       null_bitmap,
       metadata,
     })
+  }
+
+  pub fn columns(&self) -> Vec<Column> {
+    let is_signed = |i: usize| -> bool {
+      self
+        .metadata
+        .signedness
+        .as_ref()
+        .filter(|v| v[i / 8] & (1 << (i % 8)) != 0)
+        .is_some()
+    };
+
+    (0..self.column_count)
+      .map(|i| {
+        let column_type = self.column_types[i];
+        let column_meta = self.column_metas[i];
+        let is_nullable = self.null_bitmap[i / 8] & (1 << (i % 8)) != 0;
+
+        let column_type_definition = match column_type {
+          ColumnType::MYSQL_TYPE_TINY if is_signed(i) => ColumnTypeDefinition::I8,
+          ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::U8,
+
+          ColumnType::MYSQL_TYPE_SHORT if is_signed(i) => ColumnTypeDefinition::I16,
+          ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::U16,
+
+          ColumnType::MYSQL_TYPE_INT24 if is_signed(i) => ColumnTypeDefinition::I32,
+          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::U32,
+
+          ColumnType::MYSQL_TYPE_LONG if is_signed(i) => ColumnTypeDefinition::I32,
+          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::U32,
+
+          ColumnType::MYSQL_TYPE_LONGLONG if is_signed(i) => ColumnTypeDefinition::I64,
+          ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::U64,
+
+          ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+            let precision = 0;
+            let scale = 0;
+            ColumnTypeDefinition::Decimal { precision, scale }
+          }
+
+          ColumnType::MYSQL_TYPE_FLOAT => {
+            let pack_length = column_meta as u8;
+            assert_eq!(column_meta, 4); // Make sure that the server sizeof(float) == 4
+            ColumnTypeDefinition::F32 { pack_length }
+          }
+          ColumnType::MYSQL_TYPE_DOUBLE => {
+            let pack_length = column_meta as u8;
+            assert_eq!(column_meta, 8); // Make sure that the server sizeof(float) == 8
+            ColumnTypeDefinition::F64 { pack_length }
+          }
+
+          ColumnType::MYSQL_TYPE_VARCHAR => {
+            let max_length = column_meta as u16;
+            let pack_length = if max_length > 255 { 2 } else { 1 };
+            ColumnTypeDefinition::String { pack_length }
+          }
+
+          ColumnType::MYSQL_TYPE_BLOB => {
+            let pack_length = column_meta as u8;
+            assert!(pack_length <= 4);
+            ColumnTypeDefinition::Blob { pack_length }
+          }
+
+          ColumnType::MYSQL_TYPE_TIMESTAMP => todo!(),
+          ColumnType::MYSQL_TYPE_DATE => todo!(),
+          ColumnType::MYSQL_TYPE_TIME => todo!(),
+          ColumnType::MYSQL_TYPE_DATETIME => todo!(),
+          ColumnType::MYSQL_TYPE_YEAR => todo!(),
+          ColumnType::MYSQL_TYPE_BIT => todo!(),
+          ColumnType::MYSQL_TYPE_TIMESTAMP2 => todo!(),
+          ColumnType::MYSQL_TYPE_DATETIME2 => todo!(),
+          ColumnType::MYSQL_TYPE_TIME2 => todo!(),
+          ColumnType::MYSQL_TYPE_JSON => todo!(),
+          ColumnType::MYSQL_TYPE_ENUM => todo!(),
+          ColumnType::MYSQL_TYPE_SET => todo!(),
+          ColumnType::MYSQL_TYPE_NULL => {
+            unreachable!()
+          }
+          ColumnType::MYSQL_TYPE_TINY_BLOB | ColumnType::MYSQL_TYPE_MEDIUM_BLOB | ColumnType::MYSQL_TYPE_LONG_BLOB => {
+            unreachable!()
+          }
+          ColumnType::MYSQL_TYPE_VAR_STRING => todo!(),
+          ColumnType::MYSQL_TYPE_STRING => todo!(),
+          ColumnType::MYSQL_TYPE_GEOMETRY => todo!(),
+        };
+
+        Column {
+          is_nullable,
+          column_type_definition,
+        }
+      })
+      .collect()
   }
 }
 
@@ -413,9 +505,97 @@ impl RowEvent {
     })
   }
 
-  pub fn values(t: &TableMapEvent) -> Vec<serde_json::Value> {
-    todo!()
+  pub fn values(&self, columns: &Vec<Column>) -> Vec<Option<Value>> {
+    let mut b = self.rows.as_slice();
+
+    columns
+      .iter()
+      .enumerate()
+      .map(|(i, c)| {
+        let Column {
+          is_nullable,
+          column_type_definition,
+        } = c;
+
+        let is_null = self
+          .null_bitmap
+          .as_ref()
+          .filter(|v| v[i / 8] & (1 << i % 8) != 0)
+          .is_some();
+
+        let value = match column_type_definition {
+          ColumnTypeDefinition::U8 => Value::U8(b.get_u8()),
+          ColumnTypeDefinition::U16 => Value::U16(b.get_u16_le()),
+          ColumnTypeDefinition::U32 => Value::U32(b.get_u32_le()),
+          ColumnTypeDefinition::U64 => Value::U64(b.get_u64_le()),
+          ColumnTypeDefinition::I8 => Value::I8(b.get_i8()),
+          ColumnTypeDefinition::I16 => Value::I16(b.get_i16_le()),
+          ColumnTypeDefinition::I32 => Value::I32(b.get_i32_le()),
+          ColumnTypeDefinition::I64 => Value::I64(b.get_i64_le()),
+          ColumnTypeDefinition::F32 { .. } => Value::F32(b.get_f32_le()),
+          ColumnTypeDefinition::F64 { .. } => Value::F64(b.get_f64_le()),
+          ColumnTypeDefinition::Decimal { precision, scale } => todo!(),
+          ColumnTypeDefinition::String { pack_length } => {
+            let len = b.get_uint_le(*pack_length as usize) as usize;
+            let buffer = b[..len].to_vec();
+            b = &b[len..];
+            Value::String(String::from_utf8(buffer).unwrap())
+          }
+          ColumnTypeDefinition::Blob { pack_length } => {
+            let len = b.get_uint_le(*pack_length as usize) as usize;
+            let blob = b[..len].to_vec();
+            b = &b[len..];
+            Value::Blob(blob)
+          }
+        };
+
+        if *is_nullable && is_null {
+          None
+        } else {
+          Some(value)
+        }
+      })
+      .collect()
   }
+}
+
+#[derive(Debug)]
+pub enum Value {
+  U8(u8),
+  U16(u16),
+  U32(u32),
+  U64(u64),
+  I8(i8),
+  I16(i16),
+  I32(i32),
+  I64(i64),
+  F32(f32),
+  F64(f64),
+  String(String),
+  Blob(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub struct Column {
+  is_nullable: bool,
+  column_type_definition: ColumnTypeDefinition,
+}
+
+#[derive(Debug)]
+pub enum ColumnTypeDefinition {
+  U8,
+  U16,
+  U32,
+  U64,
+  I8,
+  I16,
+  I32,
+  I64,
+  F32 { pack_length: u8 },
+  F64 { pack_length: u8 },
+  Decimal { precision: u8, scale: u8 },
+  String { pack_length: u8 },
+  Blob { pack_length: u8 },
 }
 
 #[cfg(test)]

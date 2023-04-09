@@ -59,12 +59,45 @@ async fn test_binlog_inserts() {
     Ok(_) => {}
   }
   conn
-    .query("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+    .query(
+      r#"
+      CREATE TABLE Users (
+        id int PRIMARY KEY,
+        name varchar(255),
+        a TINYINT,
+        b TINYINT UNSIGNED,
+        c SMALLINT,
+        d SMALLINT UNSIGNED,
+        e INT,
+        f INT UNSIGNED,
+        g BIGINT,
+        h BIGINT UNSIGNED,
+        i FLOAT,
+        j DOUBLE
+      );
+    "#,
+    )
     .await
     .unwrap();
   conn.query("TRUNCATE Users;").await.unwrap();
-  conn.query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
-  conn.query("INSERT INTO Users VALUES (2, 'yan');").await.unwrap();
+  conn
+    .query(
+      r#"
+    INSERT INTO Users
+    VALUES (1, 'boa', -127, 127, -32767, 32767, -2147483647, 2147483647, -2147483649, 2147483649, 3.14, 3.14);
+    "#,
+    )
+    .await
+    .unwrap();
+  conn
+    .query(
+      r#"
+    INSERT INTO Users
+    VALUES (2, 'yan', -127, 127, -32767, 32767, -2147483647, 2147483647, -2147483649, 2147483649, 3.14, 3.14);
+    "#,
+    )
+    .await
+    .unwrap();
   conn.query("DELETE FROM Users WHERE id = 2;").await.unwrap();
   conn
     .query("UPDATE Users SET name = 'chad' WHERE id = 1;")
@@ -99,7 +132,12 @@ async fn test_binlog_inserts() {
     stream.commit().await.unwrap();
   }
 
-  println!("{:#?}", events);
+  if let (z, BinlogEvent::Insert(v)) = &events[0] {
+    let columns = z.columns();
+    println!("{:#?}", &columns);
+    println!("{:?}", v.values(&columns));
+  }
+  // println!("{:#?}", events);
 
   tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
