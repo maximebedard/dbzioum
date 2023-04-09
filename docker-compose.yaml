@@ -2,7 +2,7 @@ version: "3.1"
 
 services:
   pg:
-    image: "ps2bq/pg"
+    image: "dbzioum/pg"
     build:
       context: scripts/pg
     restart: "always"

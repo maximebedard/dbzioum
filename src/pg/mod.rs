@@ -90,7 +90,7 @@ impl Connection {
       params.push(database.as_str());
     }
     params.push("application_name");
-    params.push("ps2bq");
+    params.push("dbzioum");
     params.push("replication");
     params.push("database");
 

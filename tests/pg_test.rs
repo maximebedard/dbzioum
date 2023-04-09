@@ -1,4 +1,4 @@
-use ps2bq::pg::{Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem};
+use dbzioum::pg::{Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem};
 use std::{env, io, time::Duration};
 
 #[tokio::test]

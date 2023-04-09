@@ -1,4 +1,4 @@
-use ps2bq::gcp::{AccessTokenManager, Storage};
+use dbzioum::gcp::{AccessTokenManager, Storage};
 
 #[tokio::test]
 #[ignore = "incomplete"]

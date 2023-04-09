@@ -163,6 +163,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbzioum"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bitflags 2.0.1",
+ "bytes",
+ "chrono",
+ "hyper",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -497,23 +514,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a2ca2c61bc9f3d74d2886294ab7b9853abd9c1ad903a3ac7815c58989bb7bab"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "ps2bq"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bitflags 2.0.1",
- "bytes",
- "chrono",
- "hyper",
- "rustls",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tokio",
 ]
 
 [[package]]

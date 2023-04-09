@@ -1,6 +1,6 @@
-# ps2bq
+# dbzioum
 
-CDC for postgres with BQ sink. Uses wal2json codec to decode replication events from postgres.
+Work in progress project that aims to be similar to [debezium](https://debezium.io/). It currently supports postgresql@11 and mysql@8.
 
 # TODOS:
 
@@ -29,11 +29,20 @@ CDC for postgres with BQ sink. Uses wal2json codec to decode replication events 
     - [x] supports row based replication events
       - [x] support INSERT/UPDATE/DELETE events
       - [ ] parse row event values based on their column type
+        - [x] Integers (integer, int, smallint, tinyint, mediumint, bigint)
+        - [x] Fixed point (decimal, numeric)
+        - [x] Floating point (float, double)
+        - [ ] Bit
+        - [x] Strings/Bytes (CHAR, VARCHAR, BINARY, VARBINARY, BLOB, TEXT)
+        - [ ] ENUM
+        - [ ] SET
+        - [ ] Date and Time
+        - [ ] JSON
       - [ ] support TRUNCATE events (via QUERY_EVENT)
       - [ ] combine TableMapEvents + Insert/Update/Delete events in the streamer
     - [ ] commit cursor position
     - [ ] buffering
-- [ ] gcp clients
+- [ ] gcp clients (no longer needed)
   - [x] auth
     - [x] service account
     - [x] user account
@@ -46,11 +55,9 @@ CDC for postgres with BQ sink. Uses wal2json codec to decode replication events 
     - [ ] load job
     - [ ] ...
     - [ ] tests
-- [] pg streamer task
-- [] mysql streamer task
-- [] sink task
-- [] http api task
-- [] ps2bq binary
+- [ ] bridge pg/mysql schema to standardized schema
+- [ ] stream values and write them to sink
+- [ ] standardize environment variables
   - [] standard enviroment variables for postgres client (https://www.postgresql.org/docs/current/libpq-envars.html)
 
 # testing

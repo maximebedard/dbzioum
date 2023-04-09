@@ -1,4 +1,4 @@
-use ps2bq::gcp::{AccessTokenManager, BigQuery};
+use dbzioum::gcp::{AccessTokenManager, BigQuery};
 
 #[tokio::test]
 #[ignore = "incomplete"]

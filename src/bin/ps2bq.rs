@@ -1,6 +1,6 @@
-use ps2bq::http::HttpServer;
-use ps2bq::sink::BigQuerySink;
-use ps2bq::stream::{MysqlStream, PostgresStream};
+use dbzioum::http::HttpServer;
+use dbzioum::sink::BigQuerySink;
+use dbzioum::stream::{MysqlStream, PostgresStream};
 
 #[tokio::main]
 async fn main() {
