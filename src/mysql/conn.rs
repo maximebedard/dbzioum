@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::cmp::max;
 use std::fmt::Debug;
 use std::io;
@@ -231,7 +231,7 @@ impl Connection {
 
   async fn read_results(&mut self) -> io::Result<QueryResults> {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html
-    let payload = self.read_payload().await?;
+    let mut payload = self.read_payload().await?;
 
     match payload.get(0) {
       Some(0x00) => {
@@ -241,7 +241,7 @@ impl Connection {
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(0xFB) => todo!("infile not supported"),
       Some(_) => {
-        let column_count = payload.as_slice().mysql_get_lenc_uint().unwrap() as usize;
+        let column_count = payload.mysql_get_lenc_uint().unwrap() as usize;
         let columns = self.read_columns(column_count).await?;
         let values = self.read_row_values(&columns).await?;
         let query_results = QueryResults { columns, values };
@@ -283,7 +283,7 @@ impl Connection {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::ResultsetRow
     let mut row_values = Vec::new();
     loop {
-      let payload = self.read_payload().await?;
+      let mut payload = self.read_payload().await?;
 
       match payload.get(0) {
         Some(0x00) | Some(0xFE) => {
@@ -291,15 +291,14 @@ impl Connection {
           break;
         }
         Some(_) => {
-          let mut buffer = payload.as_slice();
           for i in 0..columns.len() {
-            match buffer.get(0) {
+            match payload.get(0) {
               Some(0xFB) => {
-                buffer.advance(1);
+                payload.advance(1);
                 row_values.push(None);
               }
               Some(_) => {
-                let value = buffer.mysql_get_lenc_string()?;
+                let value = payload.mysql_get_lenc_string()?;
                 row_values.push(Some(value));
               }
               None => {
@@ -333,7 +332,7 @@ impl Connection {
         }
 
         // TODO: figure out what is this actually used for???
-        if payload.as_slice() == &[0x01, 0x03] {
+        if payload.chunk() == &[0x01, 0x03] {
           let payload = self.read_payload().await?;
           return self.parse_and_handle_server_ok(payload);
         }
@@ -351,7 +350,7 @@ impl Connection {
     self.warnings = ok.warnings.unwrap_or(0);
   }
 
-  async fn read_payload(&mut self) -> io::Result<Vec<u8>> {
+  async fn read_payload(&mut self) -> io::Result<Bytes> {
     let (sequence_id, payload) = self.read_packet().await?;
     self.check_sequence_id(sequence_id)?;
     println!("<< {:02X?}", payload);
@@ -397,7 +396,7 @@ impl Connection {
     self.write_payload(&b[..]).await
   }
 
-  async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+  async fn read_packet(&mut self) -> io::Result<(u8, Bytes)> {
     let mut header = vec![0; 4];
     self.stream.read_exact(&mut header).await?;
 
@@ -408,7 +407,7 @@ impl Connection {
     let mut payload = vec![0; payload_len as usize];
     self.stream.read_exact(&mut payload).await?;
 
-    return Ok((sequence_id, payload));
+    return Ok((sequence_id, payload.into()));
   }
 
   pub async fn binlog_cursor(&mut self) -> io::Result<BinlogCursor> {
@@ -443,7 +442,7 @@ impl Connection {
     let payload = self.read_payload().await?;
 
     match payload.get(0) {
-      Some(0x00) => BinlogEventPacket::parse(payload),
+      Some(0x00) => BinlogEventPacket::parse(payload.into()),
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(_) => Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -456,11 +455,11 @@ impl Connection {
     }
   }
 
-  fn parse_and_handle_server_ok(&mut self, payload: Vec<u8>) -> io::Result<()> {
+  fn parse_and_handle_server_ok(&mut self, payload: Bytes) -> io::Result<()> {
     ServerOk::parse(payload, self.capabilities).map(|ok| self.handle_server_ok(ok))
   }
 
-  fn parse_and_handle_server_error(&mut self, payload: Vec<u8>) -> io::Error {
+  fn parse_and_handle_server_error(&mut self, payload: Bytes) -> io::Error {
     match ServerError::parse(payload, self.capabilities) {
       Ok(err) => self.handle_server_error(err),
       Err(err) => err,
@@ -468,10 +467,12 @@ impl Connection {
   }
 
   async fn source_configuration_check(&mut self) -> io::Result<()> {
+    // This is fucking weird. Setting it on mysql doesn't work the same as setting it on a per-session basis.
+    self.query("SET @source_binlog_checksum='NONE'").await?;
     // TODO: Actually remove this check.
-    self.query("SELECT @@GLOBAL.binlog_checksum;").await.map(|v| {
-      assert_eq!(v.values[0].as_ref().map(String::as_str), Some("NONE"));
-    })?;
+    // self.query("SELECT @@GLOBAL.binlog_checksum;").await.map(|v| {
+    //   assert_eq!(v.values[0].as_ref().map(String::as_str), Some("NONE"));
+    // })?;
 
     self.query("SELECT @@GLOBAL.binlog_row_metadata;").await.map(|v| {
       assert_eq!(v.values[0].as_ref().map(String::as_str), Some("FULL"));

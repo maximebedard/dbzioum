@@ -21,7 +21,7 @@ services:
   mysql:
     image: "mysql:8"
     restart: "always"
-    command: --default-authentication-plugin=mysql_native_password --binlog-checksum=NONE --binlog-row-metadata=FULL
+    command: --default-authentication-plugin=mysql_native_password --binlog-row-metadata=FULL
     ports:
       - "3306:3306"
     environment:
@@ -29,3 +29,6 @@ services:
       MYSQL_PASSWORD: "mysql"
       MYSQL_DATABASE: "test"
       MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+#--source-verify-checksum=OFF
+#--binlog-checksum=NONE
+
