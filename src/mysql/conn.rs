@@ -1,11 +1,13 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::cmp::max;
-use std::fmt::Debug;
+
 use std::io;
 use std::net::SocketAddr;
 use std::slice::{ChunksExact, ChunksExactMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::TcpStream;
+
+use crate::debug::DebugBytesRef;
 
 use super::buf_ext::{BufExt, BufMutExt};
 use super::protocol::{
@@ -192,17 +194,17 @@ impl Connection {
     b.put_u8(cmd as u8);
     b.put(payload);
 
-    self.write_payload(&b[..]).await
+    self.write_payload(b.into()).await
   }
 
-  async fn write_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+  async fn write_payload(&mut self, payload: Bytes) -> io::Result<()> {
     for chunk in payload.chunks(MAX_PAYLOAD_LEN) {
       let mut b = BytesMut::with_capacity(4 + chunk.len());
       b.put_uint_le(chunk.len() as u64, 3);
       b.put_u8(self.sequence_id);
       b.put(chunk);
 
-      println!(">> {:02X?}", chunk);
+      println!(">> {:?}", DebugBytesRef(chunk));
 
       self.sequence_id = self.sequence_id.wrapping_add(1);
       self.stream.write(&b[..]).await?;
@@ -353,7 +355,7 @@ impl Connection {
   async fn read_payload(&mut self) -> io::Result<Bytes> {
     let (sequence_id, payload) = self.read_packet().await?;
     self.check_sequence_id(sequence_id)?;
-    println!("<< {:02X?}", payload);
+    println!("<< {:?}", DebugBytesRef(payload.chunk()));
     Ok(payload)
   }
 
@@ -393,7 +395,7 @@ impl Connection {
     b.put_u8(0);
 
     // TODO: connection attributes (e.g. name of the client, version, etc...)
-    self.write_payload(&b[..]).await
+    self.write_payload(b.into()).await
   }
 
   async fn read_packet(&mut self) -> io::Result<(u8, Bytes)> {

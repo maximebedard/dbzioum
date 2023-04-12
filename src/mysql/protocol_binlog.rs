@@ -527,6 +527,10 @@ impl RowEvent {
           .filter(|v| v[i / 8] & (1 << i % 8) != 0)
           .is_some();
 
+        if *is_nullable && is_null {
+          return None;
+        }
+
         let value = match column_type_definition {
           ColumnTypeDefinition::U8 => Value::U8(b.get_u8()),
           ColumnTypeDefinition::U16 => Value::U16(b.get_u16_le()),
@@ -552,11 +556,7 @@ impl RowEvent {
           ColumnTypeDefinition::Bit { pack_length } => Value::U64(b.get_uint(*pack_length)),
         };
 
-        if *is_nullable && is_null {
-          None
-        } else {
-          Some(value)
-        }
+        Some(value)
       })
       .collect()
   }
