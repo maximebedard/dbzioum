@@ -29,7 +29,6 @@ impl BinlogEventPacket {
     let payload_len = b.remaining() - 4; // TODO: checksum is usually 4 bytes, but can be changed...
     let payload = b.split_to(payload_len);
     let checksum = b;
-    println!("checksum={:X?}", checksum);
 
     let event = match event_type {
       BinlogEventType::TABLE_MAP_EVENT => TableMapEvent::parse(payload).map(BinlogEvent::TableMap),
@@ -106,7 +105,7 @@ pub struct TableMapEvent {
 
 #[derive(Debug, Default)]
 pub struct TableMapEventMetadata {
-  pub signedness: Option<Bytes>,
+  pub is_unsigned_integer_bitmap: Option<Bytes>,
   pub default_charset: Option<(CharacterSet, Vec<(usize, CharacterSet)>)>,
   pub enum_and_set_default_charsets: Option<(CharacterSet, Vec<(usize, CharacterSet)>)>,
   pub column_charsets: Option<Vec<CharacterSet>>,
@@ -174,13 +173,9 @@ impl TableMapEvent {
     // skip 0x00
     assert_eq!(0x00, b.get_u8());
 
-    println!("schema={}", schema);
-
     let table_len = b.mysql_get_lenc_uint().unwrap() as usize;
     let table = b.split_to(table_len);
     let table = std::str::from_utf8(table.chunk()).unwrap();
-
-    println!("table={}", table);
 
     // skip 0x00
     assert_eq!(0x00, b.get_u8());
@@ -190,8 +185,6 @@ impl TableMapEvent {
     for _ in 0..column_count {
       column_types.push(b.get_u8().try_into().unwrap());
     }
-
-    println!("{:?}", column_types);
 
     let column_metas_buffer_len = b.mysql_get_lenc_uint().unwrap() as usize;
     let mut column_metas_buffer = b.split_to(column_metas_buffer_len);
@@ -245,8 +238,8 @@ impl TableMapEvent {
     }
 
     assert_eq!(column_metas_buffer.remaining(), 0);
-    let null_bitmap_len = (column_count + 7) / 8;
-    let null_bitmap = b.split_to(null_bitmap_len);
+    let bitmap_len = (column_count + 7) / 8;
+    let null_bitmap = b.split_to(bitmap_len);
 
     let mut metadata = TableMapEventMetadata::default();
 
@@ -257,9 +250,7 @@ impl TableMapEvent {
 
       // https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp#L141
       match metadata_type {
-        ColumnMetadataType::SIGNEDNESS => {
-          metadata.signedness = Some(metadata_bytes);
-        }
+        ColumnMetadataType::SIGNEDNESS => metadata.is_unsigned_integer_bitmap = Some(metadata_bytes),
         ColumnMetadataType::DEFAULT_CHARSET => {
           let default_charset = TableMapEventMetadata::parse_default_charset(metadata_bytes)?;
           metadata.default_charset = Some(default_charset)
@@ -309,36 +300,37 @@ impl TableMapEvent {
   }
 
   pub fn columns(&self) -> Vec<Column> {
-    let is_unsigned = |i: usize| -> bool {
-      self
-        .metadata
-        .signedness
-        .as_ref()
-        .filter(|v| v[i / 8] & (1 << (i % 8)) != 0)
-        .is_some()
-    };
-
+    let mut j = 0;
     (0..self.column_count)
       .map(|i| {
         let column_name = self.metadata.column_names.as_ref().unwrap()[i].clone();
         let column_type = self.column_types[i];
         let column_meta = self.column_metas[i];
+        // SCAN from LSB to MSB
         let is_nullable = self.null_bitmap[i / 8] & (1 << (i % 8)) != 0;
 
+        // SCAN from MSB to LSB
+        let is_unsigned = self
+          .metadata
+          .is_unsigned_integer_bitmap
+          .as_ref()
+          .filter(|v| v[j / 8] & (0x80 >> (j % 8)) != 0)
+          .is_some();
+
         let column_type_definition = match column_type {
-          ColumnType::MYSQL_TYPE_TINY if is_unsigned(i) => ColumnTypeDefinition::U8,
+          ColumnType::MYSQL_TYPE_TINY if is_unsigned => ColumnTypeDefinition::U8,
           ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::I8,
 
-          ColumnType::MYSQL_TYPE_SHORT if is_unsigned(i) => ColumnTypeDefinition::U16,
+          ColumnType::MYSQL_TYPE_SHORT if is_unsigned => ColumnTypeDefinition::U16,
           ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::I16,
 
-          ColumnType::MYSQL_TYPE_INT24 if is_unsigned(i) => ColumnTypeDefinition::U32,
-          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::I32,
+          ColumnType::MYSQL_TYPE_INT24 if is_unsigned => ColumnTypeDefinition::U32 { pack_length: 3 },
+          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::I32 { pack_length: 3 },
 
-          ColumnType::MYSQL_TYPE_LONG if is_unsigned(i) => ColumnTypeDefinition::U32,
-          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::I32,
+          ColumnType::MYSQL_TYPE_LONG if is_unsigned => ColumnTypeDefinition::U32 { pack_length: 4 },
+          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::I32 { pack_length: 4 },
 
-          ColumnType::MYSQL_TYPE_LONGLONG if is_unsigned(i) => ColumnTypeDefinition::U64,
+          ColumnType::MYSQL_TYPE_LONGLONG if is_unsigned => ColumnTypeDefinition::U64,
           ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::I64,
 
           ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
@@ -348,24 +340,23 @@ impl TableMapEvent {
           }
 
           ColumnType::MYSQL_TYPE_FLOAT => {
-            let pack_length = column_meta as u8;
+            let pack_length = column_meta.try_into().unwrap();
             assert_eq!(pack_length, 4); // Make sure that the server sizeof(float) == 4
             ColumnTypeDefinition::F32 { pack_length }
           }
           ColumnType::MYSQL_TYPE_DOUBLE => {
-            let pack_length = column_meta as u8;
+            let pack_length = column_meta.try_into().unwrap();
             assert_eq!(pack_length, 8); // Make sure that the server sizeof(float) == 8
             ColumnTypeDefinition::F64 { pack_length }
           }
 
           ColumnType::MYSQL_TYPE_VARCHAR => {
-            let max_length = column_meta as u16;
-            let pack_length = if max_length > 255 { 2 } else { 1 };
+            let pack_length = if column_meta > 255 { 2 } else { 1 };
             ColumnTypeDefinition::String { pack_length }
           }
 
           ColumnType::MYSQL_TYPE_BLOB => {
-            let pack_length = column_meta as u8;
+            let pack_length = column_meta.try_into().unwrap();
             assert!(pack_length <= 4);
             ColumnTypeDefinition::Blob { pack_length }
           }
@@ -375,7 +366,15 @@ impl TableMapEvent {
           ColumnType::MYSQL_TYPE_TIME => todo!(),
           ColumnType::MYSQL_TYPE_DATETIME => todo!(),
           ColumnType::MYSQL_TYPE_YEAR => todo!(),
-          ColumnType::MYSQL_TYPE_BIT => todo!(),
+          ColumnType::MYSQL_TYPE_BIT => {
+            let bytes = column_meta.to_le_bytes();
+            let useless = bytes[0];
+            assert_eq!(0, useless);
+            let pack_length = bytes[1];
+            assert!(pack_length <= 8);
+            let pack_length = pack_length.try_into().unwrap();
+            ColumnTypeDefinition::Bit { pack_length }
+          }
           ColumnType::MYSQL_TYPE_TIMESTAMP2 => todo!(),
           ColumnType::MYSQL_TYPE_DATETIME2 => todo!(),
           ColumnType::MYSQL_TYPE_TIME2 => todo!(),
@@ -392,6 +391,15 @@ impl TableMapEvent {
           ColumnType::MYSQL_TYPE_STRING => todo!(),
           ColumnType::MYSQL_TYPE_GEOMETRY => todo!(),
         };
+
+        if let ColumnType::MYSQL_TYPE_TINY
+        | ColumnType::MYSQL_TYPE_SHORT
+        | ColumnType::MYSQL_TYPE_INT24
+        | ColumnType::MYSQL_TYPE_LONG
+        | ColumnType::MYSQL_TYPE_LONGLONG = column_type
+        {
+          j += 1;
+        }
 
         Column {
           column_name,
@@ -519,37 +527,36 @@ impl RowEvent {
           .filter(|v| v[i / 8] & (1 << i % 8) != 0)
           .is_some();
 
-        println!("{:X?}", b);
-
         let value = match column_type_definition {
           ColumnTypeDefinition::U8 => Value::U8(b.get_u8()),
           ColumnTypeDefinition::U16 => Value::U16(b.get_u16_le()),
-          ColumnTypeDefinition::U32 => Value::U32(b.get_u32_le()),
+          ColumnTypeDefinition::U32 { pack_length } => Value::U32(b.get_uint_le(*pack_length) as u32),
           ColumnTypeDefinition::U64 => Value::U64(b.get_u64_le()),
           ColumnTypeDefinition::I8 => Value::I8(b.get_i8()),
           ColumnTypeDefinition::I16 => Value::I16(b.get_i16_le()),
-          ColumnTypeDefinition::I32 => Value::I32(b.get_i32_le()),
+          ColumnTypeDefinition::I32 { pack_length } => Value::I32(b.get_int_le(*pack_length) as i32),
           ColumnTypeDefinition::I64 => Value::I64(b.get_i64_le()),
           ColumnTypeDefinition::F32 { .. } => Value::F32(b.get_f32_le()),
           ColumnTypeDefinition::F64 { .. } => Value::F64(b.get_f64_le()),
           ColumnTypeDefinition::Decimal { precision, scale } => todo!(),
           ColumnTypeDefinition::String { pack_length } => {
-            let len = b.get_uint_le(*pack_length as usize) as usize;
-            let buffer = b[..len].to_vec();
-            b = &b[len..];
-            Value::String(String::from_utf8(buffer).unwrap())
+            let len = b.get_uint_le(*pack_length).try_into().unwrap();
+            let buffer = b.copy_to_bytes(len);
+            Value::String(String::from_utf8(buffer.into()).unwrap())
           }
           ColumnTypeDefinition::Blob { pack_length } => {
-            let len = b.get_uint_le(*pack_length as usize) as usize;
-            let blob = b[..len].to_vec();
-            b = &b[len..];
-            Value::Blob(blob)
+            let len = b.get_uint_le(*pack_length).try_into().unwrap();
+            let buffer = b.copy_to_bytes(len);
+            Value::Blob(buffer)
           }
+          ColumnTypeDefinition::Bit { pack_length } => Value::U64(b.get_uint(*pack_length)),
         };
 
-        let vv = if *is_nullable && is_null { None } else { Some(value) };
-        println!("{:?}", vv);
-        vv
+        if *is_nullable && is_null {
+          None
+        } else {
+          Some(value)
+        }
       })
       .collect()
   }
@@ -568,7 +575,7 @@ pub enum Value {
   F32(f32),
   F64(f64),
   String(String),
-  Blob(Vec<u8>),
+  Blob(Bytes),
 }
 
 #[derive(Debug)]
@@ -582,17 +589,18 @@ pub struct Column {
 pub enum ColumnTypeDefinition {
   U8,
   U16,
-  U32,
+  U32 { pack_length: usize },
   U64,
   I8,
   I16,
-  I32,
+  I32 { pack_length: usize },
   I64,
-  F32 { pack_length: u8 },
-  F64 { pack_length: u8 },
+  F32 { pack_length: usize },
+  F64 { pack_length: usize },
+  Bit { pack_length: usize },
   Decimal { precision: u8, scale: u8 },
-  String { pack_length: u8 },
-  Blob { pack_length: u8 },
+  String { pack_length: usize },
+  Blob { pack_length: usize },
 }
 
 #[cfg(test)]

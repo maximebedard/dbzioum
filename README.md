@@ -32,8 +32,8 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
         - [x] Integers (integer, int, smallint, tinyint, mediumint, bigint)
         - [ ] Fixed point (decimal, numeric)
         - [x] Floating point (float, double)
-        - [ ] Bit
-        - [x] Strings/Bytes (CHAR, VARCHAR, BINARY, VARBINARY, BLOB, TEXT)
+        - [x] Bit
+        - [ ] Strings/Bytes (CHAR, ~VARCHAR~, BINARY, VARBINARY, ~BLOB~, TEXT)
         - [ ] ENUM
         - [ ] SET
         - [ ] Date and Time

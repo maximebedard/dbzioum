@@ -58,22 +58,34 @@ async fn test_binlog_inserts() {
     Err(err) => panic!("{}", err),
     Ok(_) => {}
   }
+
   conn
     .query(
       r#"
       CREATE TABLE Users (
         id int PRIMARY KEY,
+
         name varchar(255),
+
         a TINYINT,
         b TINYINT UNSIGNED,
+
         c SMALLINT,
         d SMALLINT UNSIGNED,
-        e INT,
-        f INT UNSIGNED,
-        g BIGINT,
-        h BIGINT UNSIGNED,
-        i FLOAT,
-        j DOUBLE
+
+        e MEDIUMINT,
+        f MEDIUMINT UNSIGNED,
+
+        g INT,
+        h INT UNSIGNED,
+
+        i BIGINT NOT NULL,
+        j BIGINT UNSIGNED,
+
+        k FLOAT,
+        l DOUBLE,
+
+        m BIT(64)
       );
     "#,
     )
@@ -84,7 +96,7 @@ async fn test_binlog_inserts() {
     .query(
       r#"
     INSERT INTO Users
-    VALUES (1, 'boa', -127, 127, -32767, 32767, -2147483647, 2147483647, -2147483649, 2147483649, 3.14, 3.14);
+    VALUES (1, 'bob', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001');
     "#,
     )
     .await
@@ -93,7 +105,7 @@ async fn test_binlog_inserts() {
     .query(
       r#"
     INSERT INTO Users
-    VALUES (2, 'yan', -127, 127, -32767, 32767, -2147483647, 2147483647, -2147483649, 2147483649, 3.14, 3.14);
+    VALUES (2, 'pat', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001');
     "#,
     )
     .await
