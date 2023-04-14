@@ -115,52 +115,6 @@ pub struct TableMapEventMetadata {
   pub enum_str_values: Option<Vec<String>>,
 }
 
-impl TableMapEventMetadata {
-  fn parse_default_charset(mut b: Bytes) -> io::Result<(CharacterSet, Vec<(usize, CharacterSet)>)> {
-    let default_charset = b.mysql_get_lenc_uint()?;
-    let default_charset = (default_charset as u8).try_into().unwrap();
-
-    let mut pairs = Vec::new();
-    while b.remaining() > 0 {
-      let index = b.mysql_get_lenc_uint()?;
-      let index = index as usize;
-
-      let charset = b.mysql_get_lenc_uint()?;
-      let charset = (charset as u8).try_into().unwrap();
-
-      pairs.push((index, charset))
-    }
-
-    Ok((default_charset, pairs))
-  }
-
-  fn parse_column_charsets(mut b: Bytes) -> io::Result<Vec<CharacterSet>> {
-    let mut column_charsets = Vec::new();
-    while b.remaining() > 0 {
-      let column_charset = b.mysql_get_lenc_uint()?;
-      let column_charset = (column_charset as u8).try_into().unwrap();
-      column_charsets.push(column_charset);
-    }
-
-    Ok(column_charsets)
-  }
-
-  fn parse_str_value(b: Bytes) -> io::Result<Vec<String>> {
-    todo!()
-  }
-
-  pub fn parse_strings(mut b: Bytes) -> io::Result<Vec<String>> {
-    let mut column_names = Vec::new();
-    while b.remaining() > 0 {
-      let len = b.mysql_get_lenc_uint()? as usize;
-      let column_name = b.split_to(len);
-      let column_name = std::str::from_utf8(column_name.chunk()).unwrap();
-      column_names.push(column_name.into());
-    }
-    Ok(column_names)
-  }
-}
-
 impl TableMapEvent {
   fn parse(mut b: Bytes) -> io::Result<Self> {
     let table_id = b.get_uint_le(6); // this is actually a fixed length (either 4 or 6 bytes)
@@ -243,6 +197,48 @@ impl TableMapEvent {
 
     let mut metadata = TableMapEventMetadata::default();
 
+    fn parse_default_charset(mut b: Bytes) -> io::Result<(CharacterSet, Vec<(usize, CharacterSet)>)> {
+      let default_charset = b.mysql_get_lenc_uint()?;
+      let default_charset = (default_charset as u8).try_into().unwrap();
+
+      let mut pairs = Vec::new();
+      while b.remaining() > 0 {
+        let index = b.mysql_get_lenc_uint()?;
+        let index = index as usize;
+
+        let charset = b.mysql_get_lenc_uint()?;
+        let charset = (charset as u8).try_into().unwrap();
+
+        pairs.push((index, charset))
+      }
+      Ok((default_charset, pairs))
+    }
+
+    fn parse_column_charsets(mut b: Bytes) -> io::Result<Vec<CharacterSet>> {
+      let mut column_charsets = Vec::new();
+      while b.remaining() > 0 {
+        let column_charset = b.mysql_get_lenc_uint()?;
+        let column_charset = (column_charset as u8).try_into().unwrap();
+        column_charsets.push(column_charset);
+      }
+      Ok(column_charsets)
+    }
+
+    fn parse_str_value(b: Bytes) -> io::Result<Vec<String>> {
+      todo!()
+    }
+
+    pub fn parse_strings(mut b: Bytes) -> io::Result<Vec<String>> {
+      let mut column_names = Vec::new();
+      while b.remaining() > 0 {
+        let len = b.mysql_get_lenc_uint()? as usize;
+        let column_name = b.split_to(len);
+        let column_name = std::str::from_utf8(column_name.chunk()).unwrap();
+        column_names.push(column_name.into());
+      }
+      Ok(column_names)
+    }
+
     while b.remaining() > 0 {
       let metadata_type: ColumnMetadataType = b.get_u8().try_into().unwrap();
       let metadata_len = b.mysql_get_lenc_uint().unwrap() as usize;
@@ -252,34 +248,34 @@ impl TableMapEvent {
       match metadata_type {
         ColumnMetadataType::SIGNEDNESS => metadata.is_unsigned_integer_bitmap = Some(metadata_bytes),
         ColumnMetadataType::DEFAULT_CHARSET => {
-          let default_charset = TableMapEventMetadata::parse_default_charset(metadata_bytes)?;
+          let default_charset = parse_default_charset(metadata_bytes)?;
           metadata.default_charset = Some(default_charset)
         }
         ColumnMetadataType::COLUMN_CHARSET => {
-          let column_charset = TableMapEventMetadata::parse_column_charsets(metadata_bytes)?;
+          let column_charset = parse_column_charsets(metadata_bytes)?;
           metadata.column_charsets = Some(column_charset)
         }
         ColumnMetadataType::COLUMN_NAME => {
-          let column_names = TableMapEventMetadata::parse_strings(metadata_bytes)?;
+          let column_names = parse_strings(metadata_bytes)?;
           metadata.column_names = Some(column_names);
         }
         ColumnMetadataType::SET_STR_VALUE => {
-          let set_str_values = TableMapEventMetadata::parse_str_value(metadata_bytes)?;
+          let set_str_values = parse_str_value(metadata_bytes)?;
           metadata.set_str_values = Some(set_str_values);
         }
         ColumnMetadataType::ENUM_STR_VALUE => {
-          let enum_str_values = TableMapEventMetadata::parse_str_value(metadata_bytes)?;
+          let enum_str_values = parse_str_value(metadata_bytes)?;
           metadata.enum_str_values = Some(enum_str_values);
         }
-        ColumnMetadataType::GEOMETRY_TYPE => todo!(),
+        ColumnMetadataType::GEOMETRY_TYPE => {}
         ColumnMetadataType::SIMPLE_PRIMARY_KEY => {}
         ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX => {}
         ColumnMetadataType::ENUM_AND_SET_DEFAULT_CHARSET => {
-          let enum_and_set_default_charsets = TableMapEventMetadata::parse_default_charset(metadata_bytes)?;
+          let enum_and_set_default_charsets = parse_default_charset(metadata_bytes)?;
           metadata.enum_and_set_default_charsets = Some(enum_and_set_default_charsets)
         }
         ColumnMetadataType::ENUM_AND_SET_COLUMN_CHARSET => {
-          let enum_and_set_column_charsets = TableMapEventMetadata::parse_column_charsets(metadata_bytes)?;
+          let enum_and_set_column_charsets = parse_column_charsets(metadata_bytes)?;
           metadata.enum_and_set_column_charsets = Some(enum_and_set_column_charsets);
         }
         ColumnMetadataType::COLUMN_VISIBILITY => {}
@@ -306,6 +302,7 @@ impl TableMapEvent {
         let column_name = self.metadata.column_names.as_ref().unwrap()[i].clone();
         let column_type = self.column_types[i];
         let column_meta = self.column_metas[i];
+
         // SCAN from LSB to MSB
         let is_nullable = self.null_bitmap[i / 8] & (1 << (i % 8)) != 0;
 
@@ -334,8 +331,9 @@ impl TableMapEvent {
           ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::I64,
 
           ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
-            let precision = 0;
-            let scale = 0;
+            let bytes = column_meta.to_le_bytes();
+            let precision = bytes[0];
+            let scale = bytes[1];
             ColumnTypeDefinition::Decimal { precision, scale }
           }
 
@@ -348,11 +346,6 @@ impl TableMapEvent {
             let pack_length = column_meta.try_into().unwrap();
             assert_eq!(pack_length, 8); // Make sure that the server sizeof(float) == 8
             ColumnTypeDefinition::F64 { pack_length }
-          }
-
-          ColumnType::MYSQL_TYPE_VARCHAR => {
-            let pack_length = if column_meta > 255 { 2 } else { 1 };
-            ColumnTypeDefinition::String { pack_length }
           }
 
           ColumnType::MYSQL_TYPE_BLOB => {
@@ -387,8 +380,22 @@ impl TableMapEvent {
           ColumnType::MYSQL_TYPE_TINY_BLOB | ColumnType::MYSQL_TYPE_MEDIUM_BLOB | ColumnType::MYSQL_TYPE_LONG_BLOB => {
             unreachable!()
           }
-          ColumnType::MYSQL_TYPE_VAR_STRING => todo!(),
-          ColumnType::MYSQL_TYPE_STRING => todo!(),
+          ColumnType::MYSQL_TYPE_VARCHAR => {
+            let pack_length = if column_meta > 255 { 2 } else { 1 };
+            ColumnTypeDefinition::String { pack_length }
+          }
+          ColumnType::MYSQL_TYPE_VAR_STRING => {
+            todo!()
+          }
+          ColumnType::MYSQL_TYPE_STRING => {
+            let bytes = column_meta.to_le_bytes();
+            // Most likely a better way to do this.
+            let upper = ((0xFE - bytes[0]) * 4) as u16;
+            let lower = bytes[1] as u16;
+            let length = upper + lower;
+            let pack_length = if length > 255 { 2 } else { 1 };
+            ColumnTypeDefinition::String { pack_length }
+          }
           ColumnType::MYSQL_TYPE_GEOMETRY => todo!(),
         };
 
@@ -534,7 +541,7 @@ impl RowEvent {
         let value = match column_type_definition {
           ColumnTypeDefinition::U8 => Value::U8(b.get_u8()),
           ColumnTypeDefinition::U16 => Value::U16(b.get_u16_le()),
-          ColumnTypeDefinition::U32 { pack_length } => Value::U32(b.get_uint_le(*pack_length) as u32),
+          ColumnTypeDefinition::U32 { pack_length } => Value::U32(b.get_uint_le(*pack_length).try_into().unwrap()),
           ColumnTypeDefinition::U64 => Value::U64(b.get_u64_le()),
           ColumnTypeDefinition::I8 => Value::I8(b.get_i8()),
           ColumnTypeDefinition::I16 => Value::I16(b.get_i16_le()),

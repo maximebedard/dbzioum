@@ -33,7 +33,7 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
         - [ ] Fixed point (decimal, numeric)
         - [x] Floating point (float, double)
         - [x] Bit
-        - [ ] Strings/Bytes (CHAR, ~VARCHAR~, BINARY, VARBINARY, ~BLOB~, TEXT)
+        - [x] Strings/Bytes (~CHAR~, ~VARCHAR~, ~BINARY~, ~VARBINARY~, ~BLOB~, ~TEXT~)
         - [ ] ENUM
         - [ ] SET
         - [ ] Date and Time
