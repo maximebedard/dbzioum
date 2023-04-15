@@ -29,14 +29,14 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
       - [x] support INSERT/UPDATE/DELETE events
       - [ ] parse row event values based on their column type
         - [x] Integers (integer, int, smallint, tinyint, mediumint, bigint)
-        - [ ] Fixed point (decimal, numeric) (needs custom parser)
+        - [ ] _partial_ Fixed point (decimal, numeric) (needs custom parser)
         - [x] Floating point (float, double)
         - [x] Bit
         - [x] Strings/Bytes (~CHAR~, ~VARCHAR~, ~BINARY~, ~VARBINARY~, ~BLOB~, ~TEXT~)
         - [ ] ENUM
         - [ ] SET
         - [ ] Date and Time
-        - [ ] JSON (needs custom parser)
+        - [ ] _partial_ JSON (needs custom parser)
     - [x] commit cursor position
 - [ ] gcp clients (no longer needed)
   - [x] auth
@@ -75,6 +75,11 @@ cargo test
 
 # Notes
 
+- Only support UTF8
+- MYSQL shenenigans
+  - Custom checksum size
+  - JSONB parser
+  - Decimal parser
 - https://www.postgresql.org/docs/current/libpq-envars.html
 - https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html#Table_table_map_event_optional_metadata
 - https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp

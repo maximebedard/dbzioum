@@ -367,13 +367,19 @@ impl TableMapEvent {
             ColumnTypeDefinition::Blob { pack_length }
           }
 
-          ColumnType::MYSQL_TYPE_DATE => ColumnTypeDefinition::Date,
-          ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => ColumnTypeDefinition::Time,
+          ColumnType::MYSQL_TYPE_DATE => ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U24),
+          ColumnType::MYSQL_TYPE_DATETIME => ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U64),
+          ColumnType::MYSQL_TYPE_DATETIME2 => {
+            ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::Arbitrary(column_meta.try_into().unwrap()))
+          }
+          ColumnType::MYSQL_TYPE_TIME => ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::U24),
+          ColumnType::MYSQL_TYPE_TIME2 => {
+            ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::Arbitrary(column_meta.try_into().unwrap()))
+          }
           ColumnType::MYSQL_TYPE_YEAR => ColumnTypeDefinition::Year,
-          ColumnType::MYSQL_TYPE_TIMESTAMP
-          | ColumnType::MYSQL_TYPE_TIMESTAMP2
-          | ColumnType::MYSQL_TYPE_DATETIME
-          | ColumnType::MYSQL_TYPE_DATETIME2 => ColumnTypeDefinition::Date,
+          ColumnType::MYSQL_TYPE_TIMESTAMP => ColumnTypeDefinition::Timestamp,
+          ColumnType::MYSQL_TYPE_TIMESTAMP2 => todo!(),
+
           ColumnType::MYSQL_TYPE_JSON => {
             let pack_length = column_meta.try_into().unwrap();
             ColumnTypeDefinition::Json { pack_length }
@@ -580,75 +586,56 @@ impl RowEvent {
             let year: u64 = b.get_u8().into();
             Value::U64(1900 + year)
           }
-          ColumnTypeDefinition::Date => {
-            let len = 4;
-            todo!();
-
-            // let mut year = 0u16;
-            // let mut month = 0u8;
-            // let mut day = 0u8;
-            // let mut hour = 0u8;
-            // let mut minute = 0u8;
-            // let mut second = 0u8;
-            // let mut micro_second = 0u32;
-
-            // if len >= 4u8 {
-            //   year = b.get_u16_le();
-            //   month = b.get_u8();
-            //   day = b.get_u8();
-            // }
-
-            // if len >= 7u8 {
-            //   hour = b.get_u8();
-            //   minute = b.get_u8();
-            //   second = b.get_u8();
-            // }
-
-            // if len == 11u8 {
-            //   micro_second = b.get_u32_le();
-            // }
-
-            // Value::Date {
-            //   year,
-            //   month,
-            //   day,
-            //   hour,
-            //   minute,
-            //   second,
-            //   micro_second,
-            // }
+          ColumnTypeDefinition::Timestamp => Value::U64(b.get_u32_le().into()),
+          ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U24) => {
+            let tmp = b.get_uint_le(3);
+            let day = (tmp & 31).try_into().unwrap();
+            let month = ((tmp >> 5) & 15).try_into().unwrap();
+            let year = (tmp >> 9).try_into().unwrap();
+            Value::Date {
+              year,
+              month,
+              day,
+              hour: 0,
+              minute: 0,
+              second: 0,
+              micro_second: 0,
+            }
           }
-          ColumnTypeDefinition::Time => {
-            let len = 8;
-            todo!();
-
-            // let mut is_negative = false;
-            // let mut days = 0u32;
-            // let mut hours = 0u8;
-            // let mut minutes = 0u8;
-            // let mut seconds = 0u8;
-            // let mut micro_seconds = 0u32;
-
-            // if len >= 8u8 {
-            //   is_negative = b.get_u8() == 1u8;
-            //   days = b.get_u32_le();
-            //   hours = b.get_u8();
-            //   minutes = b.get_u8();
-            //   seconds = b.get_u8();
-            // }
-            // if len == 12u8 {
-            //   micro_seconds = b.get_u32_le();
-            // }
-
-            // Value::Time {
-            //   is_negative,
-            //   days,
-            //   hours,
-            //   minutes,
-            //   seconds,
-            //   micro_seconds,
-            // }
+          ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U64) => {
+            let tmp = b.get_u64_le();
+            let date = tmp / 1_000_000;
+            let time = tmp % 1_000_000;
+            let year = (date / 10000).try_into().unwrap();
+            let month = ((date % 10000) / 100).try_into().unwrap();
+            let day = (date % 100).try_into().unwrap();
+            let hour = (time / 10000).try_into().unwrap();
+            let minute = ((time % 10000) / 100).try_into().unwrap();
+            let second = (time % 100).try_into().unwrap();
+            Value::Date {
+              year,
+              month,
+              day,
+              hour,
+              minute,
+              second,
+              micro_second: 0,
+            }
           }
+          ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::Arbitrary(_)) => todo!(),
+          ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::U24) => {
+            let tmp = b.get_uint_le(3);
+            let hours = (tmp / 10000).try_into().unwrap();
+            let minutes = ((tmp % 10000) / 100).try_into().unwrap();
+            let seconds = (tmp % 100).try_into().unwrap();
+            Value::Time {
+              hours,
+              minutes,
+              seconds,
+              micro_seconds: 0,
+            }
+          }
+          ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::Arbitrary(_)) => todo!(),
         }
       })
       .collect();
@@ -680,8 +667,6 @@ pub enum Value {
     micro_second: u32,
   },
   Time {
-    is_negative: bool,
-    days: u32,
     hours: u8,
     minutes: u8,
     seconds: u8,
@@ -697,6 +682,19 @@ pub struct Column {
 }
 
 #[derive(Debug)]
+pub enum ColumnTypeDefinitionDate {
+  U24,
+  U64,
+  Arbitrary(u8),
+}
+
+#[derive(Debug)]
+pub enum ColumnTypeDefinitionTime {
+  U24,
+  Arbitrary(u8),
+}
+
+#[derive(Debug)]
 pub enum ColumnTypeDefinition {
   U64 { pack_length: usize },
   I64 { pack_length: usize },
@@ -705,9 +703,10 @@ pub enum ColumnTypeDefinition {
   Json { pack_length: usize },
   String { pack_length: usize },
   Blob { pack_length: usize },
-  Date,
+  Date(ColumnTypeDefinitionDate),
   Year,
-  Time,
+  Time(ColumnTypeDefinitionTime),
+  Timestamp,
 }
 
 #[cfg(test)]
