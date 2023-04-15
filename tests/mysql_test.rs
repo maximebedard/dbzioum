@@ -95,7 +95,11 @@ async fn test_binlog_inserts() {
         q VARBINARY(3),
 
         r BLOB,
-        s TEXT
+        s TEXT,
+
+        t JSON,
+
+        u YEAR
       );
     "#,
     )
@@ -106,7 +110,7 @@ async fn test_binlog_inserts() {
     .query(
       r#"
     INSERT INTO Users
-    VALUES (1, 'bob', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e');
+    VALUES (1, 'bob', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024');
     "#,
     )
     .await
@@ -115,7 +119,7 @@ async fn test_binlog_inserts() {
     .query(
       r#"
     INSERT INTO Users
-    VALUES (2, 'pat', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e');
+    VALUES (2, 'pat', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024');
     "#,
     )
     .await
@@ -138,7 +142,7 @@ async fn test_binlog_inserts() {
       }
     }
 
-    let packet = stream.recv().await.unwrap();
+    let packet = stream.recv().await.unwrap().unwrap();
 
     // Insert/Update/Delete are always preceded by a TableMap event.
     match packet.event {

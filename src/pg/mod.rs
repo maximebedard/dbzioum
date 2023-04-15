@@ -781,19 +781,21 @@ pub struct ReplicationStream {
 }
 
 impl ReplicationStream {
-  pub async fn recv(&mut self) -> io::Result<ReplicationEvent> {
-    let event = self.conn.read_replication_event().await?;
-
-    match &event {
-      ReplicationEvent::Data { end, .. } => {
-        self.received.lsn = end.clone();
+  pub async fn recv(&mut self) -> Option<io::Result<ReplicationEvent>> {
+    match self.conn.read_replication_event().await {
+      Ok(event) => {
+        match &event {
+          ReplicationEvent::Data { end, .. } => {
+            self.received.lsn = end.clone();
+          }
+          ReplicationEvent::KeepAlive { end, .. } => {
+            self.received.lsn = end.clone();
+          }
+        }
+        Some(Ok(event))
       }
-      ReplicationEvent::KeepAlive { end, .. } => {
-        self.received.lsn = end.clone();
-      }
+      err @ Err(_) => Some(err),
     }
-
-    Ok(event)
   }
 
   pub async fn write_status_update(&mut self) -> io::Result<()> {

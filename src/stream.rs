@@ -1,9 +1,12 @@
-use std::env;
+use std::{env, time::Duration};
 use tokio::task::JoinHandle;
 
-use crate::mysql::{
-  self,
-  protocol_binlog::{BinlogEvent, BinlogEventPacket, TableMapEvent},
+use crate::{
+  mysql::{
+    self,
+    protocol_binlog::{BinlogEvent, BinlogEventPacket, TableMapEvent},
+  },
+  pg::WalCursor,
 };
 
 use super::pg;
@@ -23,9 +26,36 @@ impl PostgresStream {
       .await
       .unwrap();
 
-      tokio::signal::ctrl_c().await.ok();
+      let wal_cursor = "asd/123".parse::<WalCursor>().unwrap();
+      let mut stream = conn_pg.start_replication_stream("foo", wal_cursor).await.unwrap();
 
-      conn_pg.close().await.unwrap();
+      let interrupt = tokio::signal::ctrl_c();
+      tokio::pin!(interrupt);
+
+      // default healthcheck is configured to 10s.
+      let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+      loop {
+        tokio::select! {
+          Ok(_) = &mut interrupt => break,
+          event = stream.recv() => {
+            match event {
+              Some(Ok(event)) => {
+                // TODO: do some processing.
+                println!("{:?}", event);
+                stream.commit().await.unwrap();
+              },
+              Some(Err(err)) => panic!("{}", err),
+              None => break,
+            }
+          },
+          _ = interval.tick() => {
+            stream.write_status_update().await.unwrap();
+          },
+        }
+      }
+
+      stream.close().await.unwrap();
       println!("pg closed");
     });
     (Self, handle)
@@ -65,8 +95,9 @@ impl MysqlStream {
             Ok(_) = &mut interrupt => break,
             evt = stream.recv() => {
                 match evt {
-                    Ok(BinlogEventPacket { event, .. }) => print_binlog_event(&mut table_map_event, event),
-                    Err(err) => eprintln!("binlog stream error: {:?}", err),
+                    Some(Ok(BinlogEventPacket { event, .. })) => print_binlog_event(&mut table_map_event, event),
+                    Some(Err(err)) => eprintln!("binlog stream error: {:?}", err),
+                    None => break,
                 }
             },
         }

@@ -118,12 +118,13 @@ async fn test_connection_replication_inserts() {
     tokio::select! {
       event = stream.recv() => {
         match event {
-          Ok(event) => {
+          Some(Ok(event)) => {
             // TODO: do some processing.
             println!("{:?}", event);
             stream.commit().await.unwrap();
           },
-          Err(err) => panic!("{}", err),
+          Some(Err(err)) => panic!("{}", err),
+          None => break,
         }
       },
       _ = interval.tick() => {

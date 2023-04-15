@@ -839,21 +839,24 @@ impl BinlogStream {
     self.conn.stream.into_inner().shutdown().await
   }
 
-  pub async fn recv(&mut self) -> io::Result<BinlogEventPacket> {
-    let packet = self.conn.read_binlog_event_packet().await?;
+  pub async fn recv(&mut self) -> Option<io::Result<BinlogEventPacket>> {
+    match self.conn.read_binlog_event_packet().await {
+      Ok(packet) => {
+        self.received.log_position = packet.log_position;
 
-    self.received.log_position = packet.log_position;
+        match &packet.event {
+          BinlogEvent::Rotate(v) => {
+            let log_file = v.next_log_file.clone();
+            let log_position = v.next_log_position;
+            self.received = BinlogCursor { log_file, log_position };
+          }
+          _ => {}
+        }
 
-    match &packet.event {
-      BinlogEvent::Rotate(v) => {
-        let log_file = v.next_log_file.clone();
-        let log_position = v.next_log_position;
-        self.received = BinlogCursor { log_file, log_position };
+        Some(Ok(packet))
       }
-      _ => {}
+      err @ Err(_) => Some(err),
     }
-
-    Ok(packet)
   }
 
   pub async fn commit(&mut self) -> io::Result<()> {

@@ -17,7 +17,6 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
     - [x] commit cursor position
     - [ ] parse row event values based on their column type
     - [x] support timelines
-    - [ ] buffering
 - [ ] simple mysql client (> v8)
   - [ ] auth
     - [x] mysql_native_password
@@ -30,18 +29,15 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
       - [x] support INSERT/UPDATE/DELETE events
       - [ ] parse row event values based on their column type
         - [x] Integers (integer, int, smallint, tinyint, mediumint, bigint)
-        - [ ] Fixed point (decimal, numeric)
+        - [ ] Fixed point (decimal, numeric) (needs custom parser)
         - [x] Floating point (float, double)
         - [x] Bit
         - [x] Strings/Bytes (~CHAR~, ~VARCHAR~, ~BINARY~, ~VARBINARY~, ~BLOB~, ~TEXT~)
         - [ ] ENUM
         - [ ] SET
         - [ ] Date and Time
-        - [ ] JSON
-      - [ ] support TRUNCATE events (via QUERY_EVENT)
-      - [ ] combine TableMapEvents + Insert/Update/Delete events in the streamer
-    - [ ] commit cursor position
-    - [ ] buffering
+        - [ ] JSON (needs custom parser)
+    - [x] commit cursor position
 - [ ] gcp clients (no longer needed)
   - [x] auth
     - [x] service account
@@ -57,8 +53,6 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
     - [ ] tests
 - [ ] bridge pg/mysql schema to standardized schema
 - [ ] stream values and write them to sink
-- [ ] standardize environment variables
-  - [] standard enviroment variables for postgres client (https://www.postgresql.org/docs/current/libpq-envars.html)
 
 # testing
 
@@ -78,3 +72,9 @@ cargo test
   - `--binlog-checksum=NONE` (TODO: remove this)
   - `--binlog-row-metadata=FULL`
   - `GRANT REPLICATION SLAVE, SELECT, REPLICATION CLIENT ON *.* TO 'mysql'@'%';`
+
+# Notes
+
+- https://www.postgresql.org/docs/current/libpq-envars.html
+- https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html#Table_table_map_event_optional_metadata
+- https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp

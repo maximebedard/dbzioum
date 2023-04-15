@@ -150,7 +150,8 @@ impl TableMapEvent {
         ColumnType::MYSQL_TYPE_FLOAT
         | ColumnType::MYSQL_TYPE_DOUBLE
         | ColumnType::MYSQL_TYPE_BLOB
-        | ColumnType::MYSQL_TYPE_GEOMETRY => {
+        | ColumnType::MYSQL_TYPE_GEOMETRY
+        | ColumnType::MYSQL_TYPE_JSON => {
           column_metas[i] = column_metas_buffer.get_u8().into();
         }
 
@@ -180,7 +181,6 @@ impl TableMapEvent {
         ColumnType::MYSQL_TYPE_TIMESTAMP2
         | ColumnType::MYSQL_TYPE_DATETIME2
         | ColumnType::MYSQL_TYPE_TIME2
-        | ColumnType::MYSQL_TYPE_JSON
         | ColumnType::MYSQL_TYPE_ENUM
         | ColumnType::MYSQL_TYPE_SET
         | ColumnType::MYSQL_TYPE_TINY_BLOB
@@ -242,40 +242,40 @@ impl TableMapEvent {
     while b.remaining() > 0 {
       let metadata_type: ColumnMetadataType = b.get_u8().try_into().unwrap();
       let metadata_len = b.mysql_get_lenc_uint().unwrap() as usize;
-      let metadata_bytes = b.split_to(metadata_len);
+      let metadata_value = b.split_to(metadata_len);
 
       // https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp#L141
       match metadata_type {
-        ColumnMetadataType::SIGNEDNESS => metadata.is_unsigned_integer_bitmap = Some(metadata_bytes),
+        ColumnMetadataType::SIGNEDNESS => metadata.is_unsigned_integer_bitmap = Some(metadata_value),
         ColumnMetadataType::DEFAULT_CHARSET => {
-          let default_charset = parse_default_charset(metadata_bytes)?;
+          let default_charset = parse_default_charset(metadata_value)?;
           metadata.default_charset = Some(default_charset)
         }
         ColumnMetadataType::COLUMN_CHARSET => {
-          let column_charset = parse_column_charsets(metadata_bytes)?;
+          let column_charset = parse_column_charsets(metadata_value)?;
           metadata.column_charsets = Some(column_charset)
         }
         ColumnMetadataType::COLUMN_NAME => {
-          let column_names = parse_strings(metadata_bytes)?;
+          let column_names = parse_strings(metadata_value)?;
           metadata.column_names = Some(column_names);
         }
         ColumnMetadataType::SET_STR_VALUE => {
-          let set_str_values = parse_str_value(metadata_bytes)?;
+          let set_str_values = parse_str_value(metadata_value)?;
           metadata.set_str_values = Some(set_str_values);
         }
         ColumnMetadataType::ENUM_STR_VALUE => {
-          let enum_str_values = parse_str_value(metadata_bytes)?;
+          let enum_str_values = parse_str_value(metadata_value)?;
           metadata.enum_str_values = Some(enum_str_values);
         }
         ColumnMetadataType::GEOMETRY_TYPE => {}
         ColumnMetadataType::SIMPLE_PRIMARY_KEY => {}
         ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX => {}
         ColumnMetadataType::ENUM_AND_SET_DEFAULT_CHARSET => {
-          let enum_and_set_default_charsets = parse_default_charset(metadata_bytes)?;
+          let enum_and_set_default_charsets = parse_default_charset(metadata_value)?;
           metadata.enum_and_set_default_charsets = Some(enum_and_set_default_charsets)
         }
         ColumnMetadataType::ENUM_AND_SET_COLUMN_CHARSET => {
-          let enum_and_set_column_charsets = parse_column_charsets(metadata_bytes)?;
+          let enum_and_set_column_charsets = parse_column_charsets(metadata_value)?;
           metadata.enum_and_set_column_charsets = Some(enum_and_set_column_charsets);
         }
         ColumnMetadataType::COLUMN_VISIBILITY => {}
@@ -296,6 +296,18 @@ impl TableMapEvent {
   }
 
   pub fn columns(&self) -> Vec<Column> {
+    fn is_numeric(t: ColumnType) -> bool {
+      if let ColumnType::MYSQL_TYPE_TINY
+      | ColumnType::MYSQL_TYPE_SHORT
+      | ColumnType::MYSQL_TYPE_INT24
+      | ColumnType::MYSQL_TYPE_LONG
+      | ColumnType::MYSQL_TYPE_LONGLONG = t
+      {
+        return true;
+      }
+      false
+    }
+
     let mut j = 0;
     (0..self.column_count)
       .map(|i| {
@@ -315,22 +327,23 @@ impl TableMapEvent {
           .is_some();
 
         let column_type_definition = match column_type {
-          ColumnType::MYSQL_TYPE_TINY if is_unsigned => ColumnTypeDefinition::U8,
-          ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::I8,
+          ColumnType::MYSQL_TYPE_TINY if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 1 },
+          ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::I64 { pack_length: 1 },
 
-          ColumnType::MYSQL_TYPE_SHORT if is_unsigned => ColumnTypeDefinition::U16,
-          ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::I16,
+          ColumnType::MYSQL_TYPE_SHORT if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 2 },
+          ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::I64 { pack_length: 2 },
 
-          ColumnType::MYSQL_TYPE_INT24 if is_unsigned => ColumnTypeDefinition::U32 { pack_length: 3 },
-          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::I32 { pack_length: 3 },
+          ColumnType::MYSQL_TYPE_INT24 if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 3 },
+          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::I64 { pack_length: 3 },
 
-          ColumnType::MYSQL_TYPE_LONG if is_unsigned => ColumnTypeDefinition::U32 { pack_length: 4 },
-          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::I32 { pack_length: 4 },
+          ColumnType::MYSQL_TYPE_LONG if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 4 },
+          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::I64 { pack_length: 4 },
 
-          ColumnType::MYSQL_TYPE_LONGLONG if is_unsigned => ColumnTypeDefinition::U64,
-          ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::I64,
+          ColumnType::MYSQL_TYPE_LONGLONG if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 8 },
+          ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::I64 { pack_length: 8 },
 
-          ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+          ColumnType::MYSQL_TYPE_DECIMAL => unreachable!(),
+          ColumnType::MYSQL_TYPE_NEWDECIMAL => {
             let bytes = column_meta.to_le_bytes();
             let precision = bytes[0];
             let scale = bytes[1];
@@ -340,7 +353,7 @@ impl TableMapEvent {
           ColumnType::MYSQL_TYPE_FLOAT => {
             let pack_length = column_meta.try_into().unwrap();
             assert_eq!(pack_length, 4); // Make sure that the server sizeof(float) == 4
-            ColumnTypeDefinition::F32 { pack_length }
+            ColumnTypeDefinition::F64 { pack_length }
           }
           ColumnType::MYSQL_TYPE_DOUBLE => {
             let pack_length = column_meta.try_into().unwrap();
@@ -354,24 +367,17 @@ impl TableMapEvent {
             ColumnTypeDefinition::Blob { pack_length }
           }
 
-          ColumnType::MYSQL_TYPE_TIMESTAMP => todo!(),
-          ColumnType::MYSQL_TYPE_DATE => todo!(),
-          ColumnType::MYSQL_TYPE_TIME => todo!(),
-          ColumnType::MYSQL_TYPE_DATETIME => todo!(),
-          ColumnType::MYSQL_TYPE_YEAR => todo!(),
-          ColumnType::MYSQL_TYPE_BIT => {
-            let bytes = column_meta.to_le_bytes();
-            let useless = bytes[0];
-            assert_eq!(0, useless);
-            let pack_length = bytes[1];
-            assert!(pack_length <= 8);
-            let pack_length = pack_length.try_into().unwrap();
-            ColumnTypeDefinition::Bit { pack_length }
+          ColumnType::MYSQL_TYPE_DATE => ColumnTypeDefinition::Date,
+          ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => ColumnTypeDefinition::Time,
+          ColumnType::MYSQL_TYPE_YEAR => ColumnTypeDefinition::Year,
+          ColumnType::MYSQL_TYPE_TIMESTAMP
+          | ColumnType::MYSQL_TYPE_TIMESTAMP2
+          | ColumnType::MYSQL_TYPE_DATETIME
+          | ColumnType::MYSQL_TYPE_DATETIME2 => ColumnTypeDefinition::Date,
+          ColumnType::MYSQL_TYPE_JSON => {
+            let pack_length = column_meta.try_into().unwrap();
+            ColumnTypeDefinition::Json { pack_length }
           }
-          ColumnType::MYSQL_TYPE_TIMESTAMP2 => todo!(),
-          ColumnType::MYSQL_TYPE_DATETIME2 => todo!(),
-          ColumnType::MYSQL_TYPE_TIME2 => todo!(),
-          ColumnType::MYSQL_TYPE_JSON => todo!(),
           ColumnType::MYSQL_TYPE_ENUM => todo!(),
           ColumnType::MYSQL_TYPE_SET => todo!(),
           ColumnType::MYSQL_TYPE_NULL => {
@@ -379,6 +385,15 @@ impl TableMapEvent {
           }
           ColumnType::MYSQL_TYPE_TINY_BLOB | ColumnType::MYSQL_TYPE_MEDIUM_BLOB | ColumnType::MYSQL_TYPE_LONG_BLOB => {
             unreachable!()
+          }
+          ColumnType::MYSQL_TYPE_BIT => {
+            let bytes = column_meta.to_le_bytes();
+            let useless = bytes[0];
+            assert_eq!(0, useless);
+            let pack_length = bytes[1];
+            assert!(pack_length <= 8);
+            let pack_length = pack_length.try_into().unwrap();
+            ColumnTypeDefinition::U64 { pack_length }
           }
           ColumnType::MYSQL_TYPE_VARCHAR => {
             let pack_length = if column_meta > 255 { 2 } else { 1 };
@@ -399,12 +414,7 @@ impl TableMapEvent {
           ColumnType::MYSQL_TYPE_GEOMETRY => todo!(),
         };
 
-        if let ColumnType::MYSQL_TYPE_TINY
-        | ColumnType::MYSQL_TYPE_SHORT
-        | ColumnType::MYSQL_TYPE_INT24
-        | ColumnType::MYSQL_TYPE_LONG
-        | ColumnType::MYSQL_TYPE_LONGLONG = column_type
-        {
+        if is_numeric(column_type) {
           j += 1;
         }
 
@@ -460,7 +470,7 @@ pub struct RowEvent {
   pub columns_before_image: Option<Bytes>,
   pub columns_after_image: Option<Bytes>,
   pub null_bitmap: Option<Bytes>,
-  pub rows: Vec<u8>,
+  pub rows: Bytes,
 }
 
 impl RowEvent {
@@ -501,7 +511,7 @@ impl RowEvent {
 
     //https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html
     // https://dev.mysql.com/doc/refman/8.0/en/mysqlbinlog-row-events.html
-    let rows = b.to_vec();
+    let rows = b.clone();
 
     Ok(Self {
       table_id,
@@ -515,10 +525,10 @@ impl RowEvent {
     })
   }
 
-  pub fn values(&self, columns: &Vec<Column>) -> Vec<Option<Value>> {
-    let mut b = self.rows.as_slice();
+  pub fn values(&self, columns: &Vec<Column>) -> Vec<Value> {
+    let mut b = self.rows.clone();
 
-    columns
+    let values = columns
       .iter()
       .enumerate()
       .map(|(i, c)| {
@@ -535,21 +545,22 @@ impl RowEvent {
           .is_some();
 
         if *is_nullable && is_null {
-          return None;
+          return Value::Null;
         }
 
-        let value = match column_type_definition {
-          ColumnTypeDefinition::U8 => Value::U8(b.get_u8()),
-          ColumnTypeDefinition::U16 => Value::U16(b.get_u16_le()),
-          ColumnTypeDefinition::U32 { pack_length } => Value::U32(b.get_uint_le(*pack_length).try_into().unwrap()),
-          ColumnTypeDefinition::U64 => Value::U64(b.get_u64_le()),
-          ColumnTypeDefinition::I8 => Value::I8(b.get_i8()),
-          ColumnTypeDefinition::I16 => Value::I16(b.get_i16_le()),
-          ColumnTypeDefinition::I32 { pack_length } => Value::I32(b.get_int_le(*pack_length) as i32),
-          ColumnTypeDefinition::I64 => Value::I64(b.get_i64_le()),
-          ColumnTypeDefinition::F32 { .. } => Value::F32(b.get_f32_le()),
-          ColumnTypeDefinition::F64 { .. } => Value::F64(b.get_f64_le()),
-          ColumnTypeDefinition::Decimal { precision, scale } => todo!(),
+        match column_type_definition {
+          ColumnTypeDefinition::U64 { pack_length } => Value::U64(b.get_uint_le(*pack_length)),
+          ColumnTypeDefinition::I64 { pack_length } => Value::I64(b.get_int_le(*pack_length)),
+          ColumnTypeDefinition::F64 { pack_length } => match pack_length {
+            &4 => Value::F64(b.get_f32_le().into()),
+            &8 => Value::F64(b.get_f64_le()),
+            _ => unreachable!(),
+          },
+          ColumnTypeDefinition::Decimal { precision, scale } => {
+            let len = b.mysql_get_lenc_uint().unwrap().try_into().unwrap();
+            let buffer = b.copy_to_bytes(len);
+            Value::Decimal(buffer)
+          }
           ColumnTypeDefinition::String { pack_length } => {
             let len = b.get_uint_le(*pack_length).try_into().unwrap();
             let buffer = b.copy_to_bytes(len);
@@ -560,29 +571,122 @@ impl RowEvent {
             let buffer = b.copy_to_bytes(len);
             Value::Blob(buffer)
           }
-          ColumnTypeDefinition::Bit { pack_length } => Value::U64(b.get_uint(*pack_length)),
-        };
+          ColumnTypeDefinition::Json { pack_length } => {
+            let len = b.get_uint_le(*pack_length).try_into().unwrap();
+            let buffer = b.copy_to_bytes(len);
+            Value::Json(buffer)
+          }
+          ColumnTypeDefinition::Year => {
+            let year: u64 = b.get_u8().into();
+            Value::U64(1900 + year)
+          }
+          ColumnTypeDefinition::Date => {
+            let len = 4;
+            todo!();
 
-        Some(value)
+            // let mut year = 0u16;
+            // let mut month = 0u8;
+            // let mut day = 0u8;
+            // let mut hour = 0u8;
+            // let mut minute = 0u8;
+            // let mut second = 0u8;
+            // let mut micro_second = 0u32;
+
+            // if len >= 4u8 {
+            //   year = b.get_u16_le();
+            //   month = b.get_u8();
+            //   day = b.get_u8();
+            // }
+
+            // if len >= 7u8 {
+            //   hour = b.get_u8();
+            //   minute = b.get_u8();
+            //   second = b.get_u8();
+            // }
+
+            // if len == 11u8 {
+            //   micro_second = b.get_u32_le();
+            // }
+
+            // Value::Date {
+            //   year,
+            //   month,
+            //   day,
+            //   hour,
+            //   minute,
+            //   second,
+            //   micro_second,
+            // }
+          }
+          ColumnTypeDefinition::Time => {
+            let len = 8;
+            todo!();
+
+            // let mut is_negative = false;
+            // let mut days = 0u32;
+            // let mut hours = 0u8;
+            // let mut minutes = 0u8;
+            // let mut seconds = 0u8;
+            // let mut micro_seconds = 0u32;
+
+            // if len >= 8u8 {
+            //   is_negative = b.get_u8() == 1u8;
+            //   days = b.get_u32_le();
+            //   hours = b.get_u8();
+            //   minutes = b.get_u8();
+            //   seconds = b.get_u8();
+            // }
+            // if len == 12u8 {
+            //   micro_seconds = b.get_u32_le();
+            // }
+
+            // Value::Time {
+            //   is_negative,
+            //   days,
+            //   hours,
+            //   minutes,
+            //   seconds,
+            //   micro_seconds,
+            // }
+          }
+        }
       })
-      .collect()
+      .collect();
+
+    assert_eq!(0, b.remaining());
+    values
   }
 }
 
 #[derive(Debug)]
 pub enum Value {
-  U8(u8),
-  U16(u16),
-  U32(u32),
+  Null,
   U64(u64),
-  I8(i8),
-  I16(i16),
-  I32(i32),
   I64(i64),
-  F32(f32),
   F64(f64),
+  // TODO: Parse decimals instead of keeping raw binary data.
+  Decimal(Bytes),
   String(String),
   Blob(Bytes),
+  // TODO: Parse json values, but MYSQL has a custom JSONB protocol because why not.
+  Json(Bytes),
+  Date {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micro_second: u32,
+  },
+  Time {
+    is_negative: bool,
+    days: u32,
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+    micro_seconds: u32,
+  },
 }
 
 #[derive(Debug)]
@@ -594,20 +698,16 @@ pub struct Column {
 
 #[derive(Debug)]
 pub enum ColumnTypeDefinition {
-  U8,
-  U16,
-  U32 { pack_length: usize },
-  U64,
-  I8,
-  I16,
-  I32 { pack_length: usize },
-  I64,
-  F32 { pack_length: usize },
+  U64 { pack_length: usize },
+  I64 { pack_length: usize },
   F64 { pack_length: usize },
-  Bit { pack_length: usize },
   Decimal { precision: u8, scale: u8 },
+  Json { pack_length: usize },
   String { pack_length: usize },
   Blob { pack_length: usize },
+  Date,
+  Year,
+  Time,
 }
 
 #[cfg(test)]
