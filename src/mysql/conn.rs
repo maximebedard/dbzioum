@@ -572,24 +572,21 @@ pub fn scramble_password(
 pub struct Handshake {
   capabilities: CapabilityFlags,
   protocol_version: u8,
-  scramble_1: Vec<u8>,
-  scramble_2: Option<Vec<u8>>,
+  scramble_1: Bytes,
+  scramble_2: Option<Bytes>,
   auth_plugin_name: Option<String>,
   character_set: CharacterSet,
   status_flags: StatusFlags,
 }
 
 impl Handshake {
-  fn parse(buffer: impl AsRef<[u8]>) -> io::Result<Self> {
+  fn parse(mut b: Bytes) -> io::Result<Self> {
     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
-    let mut b = buffer.as_ref();
     let protocol_version = b.get_u8();
     let server_version = b.mysql_null_terminated_string()?;
     b.advance(1);
     let connection_id = b.get_u32_le();
-    let scramble_1_slice = &b[..8];
-    b = &b[8..];
-    let scramble_1 = scramble_1_slice.to_vec();
+    let scramble_1 = b.split_to(8);
     b.advance(1);
     let capabilities_1 = b.get_u16_le();
     let character_set = b.get_u8().try_into().unwrap();
@@ -602,10 +599,8 @@ impl Handshake {
     b.advance(10);
 
     let scramble_2_len = max(12, scramble_len as i8 - 9) as usize;
-    let scramble_2_slice = &b[..scramble_2_len];
-    b = &b[scramble_2_len..];
+    let scramble_2 = Some(b.split_to(scramble_2_len));
     b.advance(1);
-    let scramble_2 = Some(scramble_2_slice.to_vec());
 
     let mut auth_plugin_name = None;
     if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
@@ -623,14 +618,15 @@ impl Handshake {
     })
   }
 
-  fn nonce(&self) -> Vec<u8> {
-    let mut out = self.scramble_1.clone();
+  fn nonce(&self) -> Bytes {
+    let mut out = BytesMut::new();
+    out.extend_from_slice(&self.scramble_1);
 
-    if let Some(ref scramble_2) = self.scramble_2 {
+    if let Some(scramble_2) = &self.scramble_2 {
       out.extend_from_slice(scramble_2);
     }
 
-    out
+    out.freeze()
   }
 }
 
@@ -646,8 +642,7 @@ struct ServerOk {
 }
 
 impl ServerOk {
-  fn parse(buffer: impl AsRef<[u8]>, capability_flags: CapabilityFlags) -> io::Result<Self> {
-    let mut b = buffer.as_ref();
+  fn parse(mut b: Bytes, capability_flags: CapabilityFlags) -> io::Result<Self> {
     let _header = b.get_u8();
     let affected_rows = b.mysql_get_lenc_uint().unwrap();
     let last_inserted_id = b.mysql_get_lenc_uint().unwrap();
@@ -700,8 +695,7 @@ pub struct ServerError {
 }
 
 impl ServerError {
-  fn parse(buffer: impl AsRef<[u8]>, capability_flags: CapabilityFlags) -> io::Result<Self> {
-    let mut b = buffer.as_ref();
+  fn parse(mut b: Bytes, capability_flags: CapabilityFlags) -> io::Result<Self> {
     let _header = b.get_u8();
     let error_code = b.get_u16_le();
 
@@ -787,8 +781,7 @@ pub struct Column {
 }
 
 impl Column {
-  fn parse(buffer: impl AsRef<[u8]>) -> io::Result<Self> {
-    let mut b = buffer.as_ref();
+  fn parse(mut b: Bytes) -> io::Result<Self> {
     let catalog = b.mysql_get_lenc_string().unwrap();
     assert_eq!("def", catalog.as_str());
     let schema = b.mysql_get_lenc_string().unwrap();
