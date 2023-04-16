@@ -1,7 +1,7 @@
-use crate::mysql::protocol::{CharacterSet, ColumnMetadataType};
+use crate::mysql::constants::{CharacterSet, ColumnMetadataType};
 
-use super::protocol::ColumnType;
-use super::{buf_ext::BufExt, protocol::BinlogEventType};
+use super::constants::ColumnType;
+use super::{buf_ext::BufExt, constants::BinlogEventType};
 use bytes::{Buf, Bytes};
 use std::io;
 
@@ -23,12 +23,12 @@ impl BinlogEventPacket {
     let timestamp = b.get_u32_le();
     let event_type = b.get_u8().try_into().unwrap();
     let server_id = b.get_u32_le();
-    let event_size = (b.get_u32_le() - 19) as usize;
+    b.advance(4); // skip event size
     let log_position = b.get_u32_le();
     let flags = b.get_u16_le();
     let payload_len = b.remaining() - 4; // TODO: checksum is usually 4 bytes, but can be changed...
     let payload = b.split_to(payload_len);
-    let checksum = b;
+    let checksum = b.clone();
 
     let event = match event_type {
       BinlogEventType::TABLE_MAP_EVENT => TableMapEvent::parse(payload).map(BinlogEvent::TableMap),
@@ -120,27 +120,27 @@ impl TableMapEvent {
     let table_id = b.get_uint_le(6); // this is actually a fixed length (either 4 or 6 bytes)
     let flags = b.get_u16_le();
 
-    let schema_len = b.get_u8() as usize;
+    let schema_len = b.get_u8().try_into().unwrap();
     let schema = b.split_to(schema_len);
     let schema = std::str::from_utf8(schema.chunk()).unwrap();
 
     // skip 0x00
     assert_eq!(0x00, b.get_u8());
 
-    let table_len = b.mysql_get_lenc_uint().unwrap() as usize;
+    let table_len = b.mysql_get_lenc_uint().unwrap().try_into().unwrap();
     let table = b.split_to(table_len);
     let table = std::str::from_utf8(table.chunk()).unwrap();
 
     // skip 0x00
     assert_eq!(0x00, b.get_u8());
 
-    let column_count = b.mysql_get_lenc_uint().unwrap() as usize;
+    let column_count = b.mysql_get_lenc_uint().unwrap().try_into().unwrap();
     let mut column_types = Vec::with_capacity(column_count);
     for _ in 0..column_count {
       column_types.push(b.get_u8().try_into().unwrap());
     }
 
-    let column_metas_buffer_len = b.mysql_get_lenc_uint().unwrap() as usize;
+    let column_metas_buffer_len = b.mysql_get_lenc_uint().unwrap().try_into().unwrap();
     let mut column_metas_buffer = b.split_to(column_metas_buffer_len);
     let mut column_metas = vec![0; column_count];
 
@@ -198,15 +198,14 @@ impl TableMapEvent {
     let mut metadata = TableMapEventMetadata::default();
 
     fn parse_default_charset(mut b: Bytes) -> io::Result<(CharacterSet, Vec<(usize, CharacterSet)>)> {
-      let default_charset = b.mysql_get_lenc_uint()?;
+      let default_charset = b.mysql_get_lenc_uint().unwrap();
       let default_charset = (default_charset as u8).try_into().unwrap();
 
       let mut pairs = Vec::new();
       while b.remaining() > 0 {
-        let index = b.mysql_get_lenc_uint()?;
-        let index = index as usize;
+        let index = b.mysql_get_lenc_uint().unwrap().try_into().unwrap();
 
-        let charset = b.mysql_get_lenc_uint()?;
+        let charset = b.mysql_get_lenc_uint().unwrap();
         let charset = (charset as u8).try_into().unwrap();
 
         pairs.push((index, charset))
@@ -217,7 +216,7 @@ impl TableMapEvent {
     fn parse_column_charsets(mut b: Bytes) -> io::Result<Vec<CharacterSet>> {
       let mut column_charsets = Vec::new();
       while b.remaining() > 0 {
-        let column_charset = b.mysql_get_lenc_uint()?;
+        let column_charset = b.mysql_get_lenc_uint().unwrap();
         let column_charset = (column_charset as u8).try_into().unwrap();
         column_charsets.push(column_charset);
       }
@@ -231,7 +230,7 @@ impl TableMapEvent {
     pub fn parse_strings(mut b: Bytes) -> io::Result<Vec<String>> {
       let mut column_names = Vec::new();
       while b.remaining() > 0 {
-        let len = b.mysql_get_lenc_uint()? as usize;
+        let len = b.mysql_get_lenc_uint().unwrap().try_into().unwrap();
         let column_name = b.split_to(len);
         let column_name = std::str::from_utf8(column_name.chunk()).unwrap();
         column_names.push(column_name.into());
@@ -241,7 +240,7 @@ impl TableMapEvent {
 
     while b.remaining() > 0 {
       let metadata_type: ColumnMetadataType = b.get_u8().try_into().unwrap();
-      let metadata_len = b.mysql_get_lenc_uint().unwrap() as usize;
+      let metadata_len = b.mysql_get_lenc_uint().unwrap().try_into().unwrap();
       let metadata_value = b.split_to(metadata_len);
 
       // https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp#L141
@@ -449,8 +448,7 @@ impl FormatDescriptionEvent {
 
     let server_version = b.split_to(50);
 
-    let null_terminated = server_version.iter().position(|x| *x == 0x00).unwrap_or(0);
-    let server_version = std::str::from_utf8(&server_version[..null_terminated]).unwrap();
+    let server_version = b.mysql_null_terminated_string().unwrap();
 
     let create_timestamp = b.get_u32_le();
     let event_header_length = b.get_u8();
@@ -492,13 +490,13 @@ impl RowEvent {
 
     let mut extras = None;
     if use_extras {
-      let extras_len = (b.get_u16_le() - 2) as usize;
+      let extras_len = (b.get_u16_le() - 2).try_into().unwrap();
       extras = Some(b.split_to(extras_len))
     }
 
     let column_count = b.mysql_get_lenc_uint().unwrap();
 
-    let bitmap_len = ((column_count + 7) / 8) as usize;
+    let bitmap_len = ((column_count + 7) / 8).try_into().unwrap();
 
     let mut columns_before_image = None;
     if use_columns_before_image {

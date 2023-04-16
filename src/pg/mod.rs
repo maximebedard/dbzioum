@@ -264,7 +264,7 @@ impl Connection {
         self.stream.read_i32().await?; // skip len
         let format = self.stream.read_i8().await?;
         let num_columns = self.stream.read_i16().await?;
-        let mut column_formats = Vec::with_capacity(num_columns as usize);
+        let mut column_formats = vec![0; num_columns.try_into().unwrap()];
         for i in 0..column_formats.len() {
           column_formats.push(self.stream.read_i16().await?);
         }
@@ -294,13 +294,14 @@ impl Connection {
         }
         b'd' => {
           let len = self.stream.read_i32().await?;
+          let len: usize = len.try_into().unwrap();
 
           match self.stream.read_u8().await? {
             b'w' => {
               let start = self.stream.read_i64().await?;
               let end = self.stream.read_i64().await?;
               let system_clock = self.stream.read_i64().await?;
-              let mut buffer = vec![0; len as usize - 4 - 1 - 8 - 8 - 8];
+              let mut buffer = vec![0; len - 4 - 1 - 8 - 8 - 8];
               self.stream.read_exact(&mut buffer).await?;
 
               // println!("{}", std::str::from_utf8(&buffer).unwrap());
@@ -557,7 +558,7 @@ impl Connection {
             let len = self.stream.read_i32().await?;
 
             if len > 0 {
-              let mut buffer = vec![0; len as usize];
+              let mut buffer = vec![0; len.try_into().unwrap()];
               self.stream.read_exact(&mut buffer).await?;
               values.push(Some(String::from_utf8(buffer).unwrap()));
             } else if len == 0 {

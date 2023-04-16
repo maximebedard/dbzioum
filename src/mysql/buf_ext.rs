@@ -2,15 +2,6 @@ use bytes::{Buf, BufMut};
 use std::io;
 
 pub trait BufExt: Buf {
-  fn mysql_get_lenc_bytes(&mut self) -> io::Result<Vec<u8>> {
-    let len = self.mysql_get_lenc_uint()? as usize;
-    let mut bytes = vec![0; len];
-    if bytes.len() > 0 {
-      self.copy_to_slice(bytes.as_mut_slice());
-    }
-    Ok(bytes)
-  }
-
   fn mysql_get_eof_string(&mut self) -> io::Result<String> {
     self.mysql_get_fixed_length_string(self.remaining())
   }
@@ -39,7 +30,8 @@ pub trait BufExt: Buf {
 
   // Returns a utf-8 encoded string of variable length. See `BufExt::get_lenc_uint`.
   fn mysql_get_lenc_string(&mut self) -> io::Result<String> {
-    let len = self.mysql_get_lenc_uint()? as usize;
+    let len = self.mysql_get_lenc_uint()?;
+    let len = len.try_into().unwrap();
     self.mysql_get_fixed_length_string(len)
   }
 

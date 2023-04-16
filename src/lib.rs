@@ -3,7 +3,6 @@
 
 mod debug;
 pub mod gcp;
-pub mod http;
 pub mod mysql;
 pub mod pg;
 pub mod sink;

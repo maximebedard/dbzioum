@@ -1,7 +1,7 @@
+pub mod binlog;
 mod buf_ext;
 mod conn;
-mod protocol;
-pub mod protocol_binlog;
+mod constants;
 mod scramble;
 
 pub use conn::{BinlogCursor, BinlogStream, Connection, ConnectionOptions};

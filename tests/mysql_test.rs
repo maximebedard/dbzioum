@@ -1,4 +1,4 @@
-use dbzioum::mysql::{protocol_binlog::BinlogEvent, Connection, ConnectionOptions};
+use dbzioum::mysql::{binlog::BinlogEvent, Connection, ConnectionOptions};
 use std::{env, io};
 
 #[tokio::test]

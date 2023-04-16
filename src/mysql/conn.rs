@@ -9,12 +9,12 @@ use tokio::net::TcpStream;
 
 use crate::debug::DebugBytesRef;
 
+use super::binlog::{BinlogEvent, BinlogEventPacket};
 use super::buf_ext::{BufExt, BufMutExt};
-use super::protocol::{
+use super::constants::{
   BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType, Command, StatusFlags,
   CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
-use super::protocol_binlog::{BinlogEvent, BinlogEventPacket};
 
 #[derive(Debug, Clone)]
 pub struct ConnectionOptions {
@@ -243,7 +243,7 @@ impl Connection {
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(0xFB) => todo!("infile not supported"),
       Some(_) => {
-        let column_count = payload.mysql_get_lenc_uint().unwrap() as usize;
+        let column_count = payload.mysql_get_lenc_uint().unwrap().try_into().unwrap();
         let columns = self.read_columns(column_count).await?;
         let values = self.read_row_values(&columns).await?;
         let query_results = QueryResults { columns, values };
@@ -403,10 +403,10 @@ impl Connection {
     self.stream.read_exact(&mut header).await?;
 
     let mut header_buffer = header.as_slice();
-    let payload_len = header_buffer.get_uint_le(3);
+    let payload_len = header_buffer.get_uint_le(3).try_into().unwrap();
     let sequence_id = header_buffer.get_u8();
 
-    let mut payload = vec![0; payload_len as usize];
+    let mut payload = vec![0; payload_len];
     self.stream.read_exact(&mut payload).await?;
 
     return Ok((sequence_id, payload.into()));
@@ -595,10 +595,10 @@ impl Handshake {
 
     let capabilities = CapabilityFlags::from_bits_truncate(capabilities_1 as u32 | ((capabilities_2 as u32) << 16));
 
-    let scramble_len = b.get_u8() as usize;
+    let scramble_len: i16 = b.get_u8().try_into().unwrap();
     b.advance(10);
 
-    let scramble_2_len = max(12, scramble_len as i8 - 9) as usize;
+    let scramble_2_len = max(12, scramble_len - 9).try_into().unwrap();
     let scramble_2 = Some(b.split_to(scramble_2_len));
     b.advance(1);
 
