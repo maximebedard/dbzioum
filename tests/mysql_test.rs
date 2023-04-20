@@ -44,6 +44,7 @@ async fn test_noop_query() {
 async fn test_binlog_inserts() {
   let mut conn = setup_connection().await.unwrap();
   let binlog_cursor = conn.binlog_cursor().await.unwrap();
+  let mut commited = binlog_cursor.clone();
 
   let mut stream = conn
     .duplicate()
@@ -137,10 +138,8 @@ async fn test_binlog_inserts() {
   let mut events = vec![];
   loop {
     // Wait for the stream to have caught up with the master
-    if let Some(commited) = stream.commited() {
-      if commited >= &cursor {
-        break;
-      }
+    if commited >= cursor {
+      break;
     }
 
     let packet = stream.recv().await.unwrap().unwrap();
@@ -150,13 +149,17 @@ async fn test_binlog_inserts() {
       BinlogEvent::TableMap(v) => {
         table_map_evt.replace(v);
       }
+      BinlogEvent::Rotate(v) => {
+        commited.log_file = v.next_log_file.clone();
+        commited.log_position = v.next_log_position;
+      }
       v @ (BinlogEvent::Insert(_) | BinlogEvent::Update(_) | BinlogEvent::Delete(_)) => {
         events.push((table_map_evt.take().unwrap(), v));
       }
       _ => {}
     }
 
-    stream.commit().await.unwrap();
+    commited.log_position = packet.log_position;
   }
 
   if let (z, BinlogEvent::Insert(v)) = &events[0] {
@@ -164,8 +167,6 @@ async fn test_binlog_inserts() {
     println!("{:#?}", &columns);
     println!("{:?}", v.values(&columns));
   }
-  // println!("{:#?}", events);
-
   tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
 

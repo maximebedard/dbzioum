@@ -1,7 +1,5 @@
 use bytes::Bytes;
 
-pub mod stdout;
-
 #[derive(Debug)]
 pub enum RowEvent {
   Insert {

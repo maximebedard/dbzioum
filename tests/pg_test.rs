@@ -1,4 +1,4 @@
-use dbzioum::pg::{Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem};
+use dbzioum::pg::{Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem, ReplicationEvent};
 use std::{env, io, time::Duration};
 
 #[tokio::test]
@@ -75,6 +75,7 @@ async fn test_connection_replication_inserts() {
     consistent_point,
     ..
   } = conn.create_replication_slot("bar").await.unwrap();
+  let mut commited = consistent_point.clone();
 
   let mut stream = conn
     .duplicate()
@@ -109,26 +110,31 @@ async fn test_connection_replication_inserts() {
 
   loop {
     // Wait for the stream to have caught up with the master
-    if let Some(commited) = stream.commited() {
-      if commited >= &wal_cursor {
-        break;
-      }
+    if commited >= wal_cursor {
+      break;
     }
 
     tokio::select! {
       event = stream.recv() => {
         match event {
-          Some(Ok(event)) => {
-            // TODO: do some processing.
+          Some(Ok(ReplicationEvent::Data { end, .. })) => {
+            commited.lsn = end;
+            // TODO: do something here...
             println!("{:?}", event);
-            stream.commit().await.unwrap();
+          },
+          Some(Ok(ReplicationEvent::ChangeTimeline { tid, lsn })) => {
+            commited.tid = tid;
+            commited.lsn = lsn;
+          }
+          Some(Ok(ReplicationEvent::KeepAlive { end, .. })) => {
+            commited.lsn = end;
           },
           Some(Err(err)) => panic!("{}", err),
           None => break,
         }
       },
       _ = interval.tick() => {
-        stream.write_status_update().await.unwrap();
+        stream.write_status_update(commited.lsn).await.unwrap();
       },
     }
   }

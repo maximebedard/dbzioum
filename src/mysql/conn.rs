@@ -1,11 +1,14 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::cmp::max;
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use url::Url;
 
-use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::slice::{ChunksExact, ChunksExactMut};
+use std::{fmt, io};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
-use tokio::net::TcpStream;
+use tokio::net::{self, TcpStream};
 
 use crate::debug::DebugBytesRef;
 
@@ -23,7 +26,6 @@ pub struct ConnectionOptions {
   pub password: Option<String>,
   pub database: Option<String>,
   pub hostname: Option<String>,
-  pub server_id: Option<u32>,
   pub use_compression: bool,
   pub use_ssl: bool,
 }
@@ -36,7 +38,6 @@ impl Default for ConnectionOptions {
       password: None,
       database: None,
       hostname: None,
-      server_id: None,
       use_compression: false,
       use_ssl: false,
     }
@@ -59,6 +60,42 @@ pub struct Connection {
 }
 
 impl Connection {
+  pub async fn connect_from_url(u: &Url) -> io::Result<Self> {
+    assert_eq!("tcp", u.scheme()); // only support tcp for now
+    let user = match u.username() {
+      "" => "root".to_string(),
+      user => user.to_string(),
+    };
+    let password = u.password().map(|v| v.to_string());
+    let port = u.port().unwrap_or(3306);
+    let addr = match u.host() {
+      Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
+        .await
+        .and_then(|mut v| {
+          v.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "unable to find host"))
+        })?,
+      Some(url::Host::Ipv4(ip)) => SocketAddrV4::new(ip, port).into(),
+      Some(url::Host::Ipv6(ip)) => SocketAddrV6::new(ip, port, 0, 0).into(),
+      None => format!("[::]:{port}").parse().unwrap(),
+    };
+
+    let query_pairs = u
+      .query_pairs()
+      .map(|(k, v)| (k.to_string(), v.to_string()))
+      .collect::<BTreeMap<String, String>>();
+    let database = query_pairs.get("database").cloned();
+
+    let opts = ConnectionOptions {
+      addr,
+      user,
+      password,
+      database,
+      ..Default::default()
+    };
+    Self::connect(opts).await
+  }
+
   pub async fn connect(opts: impl Into<ConnectionOptions>) -> io::Result<Self> {
     let capabilities = CapabilityFlags::empty();
     let status_flags = StatusFlags::empty();
@@ -204,7 +241,7 @@ impl Connection {
       b.put_u8(self.sequence_id);
       b.put(chunk);
 
-      println!(">> {:?}", DebugBytesRef(chunk));
+      eprintln!(">> {:?}", DebugBytesRef(chunk));
 
       self.sequence_id = self.sequence_id.wrapping_add(1);
       self.stream.write(&b[..]).await?;
@@ -355,7 +392,7 @@ impl Connection {
   async fn read_payload(&mut self) -> io::Result<Bytes> {
     let (sequence_id, payload) = self.read_packet().await?;
     self.check_sequence_id(sequence_id)?;
-    println!("<< {:?}", DebugBytesRef(payload.chunk()));
+    eprintln!("<< {:?}", DebugBytesRef(payload.chunk()));
     Ok(payload)
   }
 
@@ -432,12 +469,8 @@ impl Connection {
     self.source_configuration_check().await?;
     self.register_as_replica(server_id).await?;
     self.dump_binlog(server_id, &binlog_cursor).await?;
-    Ok(BinlogStream {
-      conn: self,
-      server_id,
-      commited: None,
-      received: binlog_cursor,
-    })
+    let conn = self;
+    Ok(BinlogStream { conn })
   }
 
   async fn read_binlog_event_packet(&mut self) -> io::Result<BinlogEventPacket> {
@@ -818,12 +851,30 @@ pub struct BinlogCursor {
   pub log_position: u32,
 }
 
+impl fmt::Display for BinlogCursor {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}/{}", self.log_file, self.log_position)
+  }
+}
+
+impl FromStr for BinlogCursor {
+  type Err = String;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    let (log_file, log_position) = s
+      .split_once("/")
+      .ok_or_else(|| format!("Failed to parse binlog cursor. Expected format is <prefix>.<file>/<position>"))?;
+    let log_file = log_file.to_string();
+    let log_position = log_position
+      .parse()
+      .map_err(|_| format!("Failed to parse binlog cursor position. Expected format is u32."))?;
+    Ok(Self { log_file, log_position })
+  }
+}
+
 #[derive(Debug)]
 pub struct BinlogStream {
   conn: Connection,
-  server_id: u32,
-  commited: Option<BinlogCursor>,
-  received: BinlogCursor,
 }
 
 impl BinlogStream {
@@ -833,41 +884,7 @@ impl BinlogStream {
   }
 
   pub async fn recv(&mut self) -> Option<io::Result<BinlogEventPacket>> {
-    match self.conn.read_binlog_event_packet().await {
-      Ok(packet) => {
-        self.received.log_position = packet.log_position;
-
-        match &packet.event {
-          BinlogEvent::Rotate(v) => {
-            let log_file = v.next_log_file.clone();
-            let log_position = v.next_log_position;
-            self.received = BinlogCursor { log_file, log_position };
-          }
-          _ => {}
-        }
-
-        Some(Ok(packet))
-      }
-      err @ Err(_) => Some(err),
-    }
-  }
-
-  pub async fn commit(&mut self) -> io::Result<()> {
-    self.commited.replace(self.received.clone());
-    Ok(())
-  }
-
-  pub fn server_id(&self) -> u32 {
-    self.server_id
-  }
-
-  // Reference to the cursor of the most recent event commited
-  pub fn commited(&self) -> &Option<BinlogCursor> {
-    &self.commited
-  }
-
-  // Reference to the cursor of the most recent event received
-  pub fn received(&self) -> &BinlogCursor {
-    &self.received
+    // TODO: handle disconnects and reconnect here...
+    Some(self.conn.read_binlog_event_packet().await)
   }
 }

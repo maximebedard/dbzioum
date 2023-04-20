@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
-use std::fmt::Display;
+use std::fmt;
+use std::net::{SocketAddrV4, SocketAddrV6};
 use std::slice::{ChunksExact, ChunksExactMut};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{io, net::SocketAddr};
 
+use tokio::net;
 use tokio::{
   io::{AsyncReadExt, AsyncWriteExt, BufStream},
   net::TcpStream,
 };
+use url::Url;
 
 #[derive(Debug)]
 pub struct Connection {
@@ -43,6 +46,43 @@ const PROTOCOL_VERSION: i32 = 196608;
 const SSL_HANDSHAKE_CODE: i32 = 80877103;
 
 impl Connection {
+  pub async fn connect_from_url(u: &Url) -> io::Result<Self> {
+    assert_eq!("tcp", u.scheme()); // only support tcp for now
+    let user = match u.username() {
+      "" => "postgres".to_string(),
+      user => user.to_string(),
+    };
+    let password = u.password().map(|v| v.to_string());
+    let host = u
+      .host()
+      .map(|h| h.to_string())
+      .unwrap_or_else(|| "localhost".to_string());
+    let port = u.port().unwrap_or(5432);
+    let addr = match u.host() {
+      Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
+        .await
+        .and_then(|mut v| {
+          v.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "unable to find host"))
+        })?,
+      Some(url::Host::Ipv4(ip)) => SocketAddrV4::new(ip, port).into(),
+      Some(url::Host::Ipv6(ip)) => SocketAddrV6::new(ip, port, 0, 0).into(),
+      None => format!("[::]:{port}").parse().unwrap(),
+    };
+
+    let query_pairs = u.query_pairs().collect::<BTreeMap<_, _>>();
+    let database = query_pairs.get("database").map(|v| v.to_string());
+
+    let opts = ConnectionOptions {
+      addr,
+      user,
+      password,
+      database,
+      ..Default::default()
+    };
+    Self::connect(opts).await
+  }
+
   pub async fn connect(options: impl Into<ConnectionOptions>) -> io::Result<Self> {
     let options = options.into();
     let stream = TcpStream::connect(options.addr).await?;
@@ -215,7 +255,7 @@ impl Connection {
           self.stream.read_i32().await?; // skip len
           let param_name = self.read_c_string().await?;
           let param_value = self.read_c_string().await?;
-          println!("{:?}: {:?}", param_name, param_value);
+          eprintln!("{:?}: {:?}", param_name, param_value);
         }
         b'Z' => {
           self.read_ready_for_query().await?;
@@ -278,11 +318,9 @@ impl Connection {
       }
     }
 
-    Ok(ReplicationStream {
-      conn: self,
-      commited: None,
-      received: wal_cursor,
-    })
+    let conn = self;
+
+    Ok(ReplicationStream { conn })
   }
 
   async fn read_replication_event(&mut self) -> io::Result<ReplicationEvent> {
@@ -304,7 +342,6 @@ impl Connection {
               let mut buffer = vec![0; len - 4 - 1 - 8 - 8 - 8];
               self.stream.read_exact(&mut buffer).await?;
 
-              // println!("{}", std::str::from_utf8(&buffer).unwrap());
               let data_change = serde_json::from_slice::<DataChange>(buffer.as_slice())
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
@@ -777,46 +814,17 @@ pub struct CreateReplicationSlot {
 #[derive(Debug)]
 pub struct ReplicationStream {
   conn: Connection,
-  commited: Option<WalCursor>,
-  received: WalCursor,
 }
 
 impl ReplicationStream {
   pub async fn recv(&mut self) -> Option<io::Result<ReplicationEvent>> {
-    match self.conn.read_replication_event().await {
-      Ok(event) => {
-        match &event {
-          ReplicationEvent::Data { end, .. } => {
-            self.received.lsn = end.clone();
-          }
-          ReplicationEvent::KeepAlive { end, .. } => {
-            self.received.lsn = end.clone();
-          }
-        }
-        Some(Ok(event))
-      }
-      err @ Err(_) => Some(err),
-    }
+    // TODO: handle disconnects and reconnect here...
+    Some(self.conn.read_replication_event().await)
   }
 
-  pub async fn write_status_update(&mut self) -> io::Result<()> {
-    if let Some(WalCursor { lsn, .. }) = self.commited {
-      self.conn.write_status_update(lsn, lsn, lsn).await?;
-    }
-    Ok(())
-  }
-
-  pub fn commited(&self) -> &Option<WalCursor> {
-    &self.commited
-  }
-
-  pub fn received(&self) -> &WalCursor {
-    &self.received
-  }
-
-  pub async fn commit(&mut self) -> io::Result<()> {
-    self.commited.replace(self.received.clone());
-    Ok(())
+  pub async fn write_status_update(&mut self, lsn: i64) -> io::Result<()> {
+    // TODO: maybe support splitting the receiver from the sender...
+    self.conn.write_status_update(lsn, lsn, lsn).await
   }
 
   pub async fn close(self) -> io::Result<()> {
@@ -836,6 +844,10 @@ pub enum ReplicationEvent {
     end: i64,
     system_clock: i64,
     must_reply: bool,
+  },
+  ChangeTimeline {
+    tid: i8,
+    lsn: i64,
   },
 }
 
@@ -891,23 +903,28 @@ pub struct ColumnChange {
 
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
 pub struct WalCursor {
-  tid: i8,
-  lsn: i64,
+  pub tid: i8,
+  pub lsn: i64,
 }
 
-impl Display for WalCursor {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for WalCursor {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{}/{:X}", self.tid, self.lsn)
   }
 }
 
 impl FromStr for WalCursor {
-  type Err = ();
+  type Err = String;
 
   fn from_str(s: &str) -> Result<Self, Self::Err> {
-    let (tid, lsn) = s.split_once("/").ok_or(())?;
-    let tid = tid.parse().map_err(|_| ())?;
-    let lsn = i64::from_str_radix(lsn, 16).map_err(|_| ())?;
+    let (tid, lsn) = s
+      .split_once("/")
+      .ok_or_else(|| format!("Failed to parse wal cursor. Expected format is <tid>/<lsn>"))?;
+    let tid = tid
+      .parse()
+      .map_err(|_| format!("Failed to parse wal cursor tid. Expected format is i8."))?;
+    let lsn = i64::from_str_radix(lsn, 16)
+      .map_err(|_| format!("Failed to parse wal cursor lsn. Expected format is i64 hex encoded"))?;
     Ok(Self { tid, lsn })
   }
 }

@@ -35,7 +35,7 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
         - [x] Strings/Bytes (~CHAR~, ~VARCHAR~, ~BINARY~, ~VARBINARY~, ~BLOB~, ~TEXT~)
         - [ ] ENUM
         - [ ] SET
-        - [ ] Date and Time
+        - [x] _partial_ Date and Time
         - [ ] _partial_ JSON (needs custom parser)
     - [x] commit cursor position
 - [ ] gcp clients (no longer needed)
@@ -51,8 +51,9 @@ Work in progress project that aims to be similar to [debezium](https://debezium.
     - [ ] load job
     - [ ] ...
     - [ ] tests
-- [ ] bridge pg/mysql schema to standardized schema
-- [ ] stream values and write them to sink
+- [x] bridge pg/mysql schema to standardized schema
+- [x] stream values and write them to sink
+- [ ] figure out ergonomic way to manage cursors and how events are flushed out
 
 # testing
 

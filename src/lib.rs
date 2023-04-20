@@ -6,4 +6,3 @@ pub mod gcp;
 pub mod mysql;
 pub mod pg;
 pub mod sink;
-pub mod stream;
