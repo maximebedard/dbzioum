@@ -1,21 +1,14 @@
-use std::{
-  io,
-  path::{Path, PathBuf},
-};
+use std::io;
 
 use clap::{value_parser, Arg, Command};
-use tokio::{
-  fs::{self, File},
-  io::{AsyncReadExt, AsyncWriteExt},
-  sync::mpsc,
-};
+use tokio::sync::mpsc;
 use url::Url;
 
 use dbzioum::{
-  mysql,
   mysql::{
+    self,
     binlog::{self, TableMapEvent},
-    BinlogCursor, BinlogStream, Connection,
+    BinlogCursor,
   },
   sink::RowEvent,
 };
@@ -27,24 +20,26 @@ async fn main() {
     .author("Maxime Bedard <maxime@bedard.dev>")
     .arg(Arg::new("url").required(true).short('u').value_parser(Url::parse))
     .arg(
-      Arg::new("cursor")
-        .short('c')
-        .default_value("./cursor")
-        .value_parser(value_parser!(PathBuf)),
-    );
+      Arg::new("server-id")
+        .default_value("1")
+        .value_parser(value_parser!(u32)),
+    )
+    .arg(Arg::new("binlog-cursor").value_parser(str::parse::<BinlogCursor>));
 
   let matches = cmd.get_matches_mut();
 
-  let url = matches.get_one::<Url>("url").unwrap();
-  let cursor = matches.get_one::<PathBuf>("cursor").unwrap();
+  let url = matches.get_one::<Url>("url").cloned().unwrap();
+  let server_id = matches.get_one::<u32>("server-id").cloned().unwrap();
+  let binlog_cursor = matches.get_one::<BinlogCursor>("binlog-cursor").cloned();
 
   let mut conn_mysql = mysql::Connection::connect_from_url(&url).await.unwrap();
 
-  let (server_id, binlog_cursor) = binlog_stream_options_or_defaults(&mut conn_mysql, &cursor)
-    .await
-    .unwrap();
+  let binlog_cursor = match binlog_cursor {
+    Some(binlog_cursor) => binlog_cursor,
+    None => conn_mysql.binlog_cursor().await.unwrap(),
+  };
 
-  let stream = conn_mysql
+  let mut stream = conn_mysql
     .binlog_stream(server_id, binlog_cursor.clone())
     .await
     .unwrap();
@@ -56,46 +51,38 @@ async fn main() {
     }
   });
 
-  let event_processor = EventProcessor {
-    stream,
-    sink: sender,
-    binlog_cursor,
+  let interrupt = tokio::signal::ctrl_c();
+  tokio::pin!(interrupt);
+
+  let mut processor = EventProcessor {
     table_map_event: None,
+    binlog_cursor,
+    sink: sender,
   };
 
-  event_processor.process_stream().await.unwrap();
+  loop {
+    tokio::select! {
+        Ok(_) = &mut interrupt => break,
+        event = stream.recv() => {
+            match event {
+                Some(Ok(event)) => processor.process_event(event).await.unwrap(),
+                Some(Err(err)) => eprintln!("binlog stream error: {:?}", err),
+                None => break,
+            }
+        },
+    }
+  }
+
+  stream.close().await.unwrap();
 }
 
 struct EventProcessor {
   binlog_cursor: BinlogCursor,
-  stream: BinlogStream,
   sink: mpsc::Sender<RowEvent>,
   table_map_event: Option<TableMapEvent>,
 }
 
 impl EventProcessor {
-  async fn process_stream(mut self) -> io::Result<()> {
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
-
-    loop {
-      tokio::select! {
-          Ok(_) = &mut interrupt => break,
-          event = self.stream.recv() => {
-              match event {
-                  Some(Ok(event)) => self.process_event(event).await.unwrap(),
-                  Some(Err(err)) => eprintln!("binlog stream error: {:?}", err),
-                  None => break,
-              }
-          },
-      }
-    }
-
-    self.stream.close().await.unwrap();
-
-    Ok(())
-  }
-
   async fn process_event(&mut self, event: binlog::BinlogEventPacket) -> io::Result<()> {
     match event.event {
       binlog::BinlogEvent::TableMap(v) => {
@@ -160,35 +147,5 @@ impl EventProcessor {
     }
 
     Ok(())
-  }
-}
-
-async fn binlog_stream_options_or_defaults(
-  conn_mysql: &mut Connection,
-  cursor: impl AsRef<Path>,
-) -> io::Result<(u32, BinlogCursor)> {
-  match File::open(&cursor).await {
-    Ok(mut f) => {
-      let mut buffer = String::new();
-      f.read_to_string(&mut buffer).await?;
-
-      let mut chunks = buffer.splitn(2, "/");
-      let driver = chunks.next().unwrap();
-      assert_eq!("mysql", driver);
-
-      let server_id = chunks.next().unwrap().parse().unwrap();
-      let binlog_cursor = chunks.next().unwrap().parse().unwrap();
-
-      Ok((server_id, binlog_cursor))
-    }
-    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-      let binlog_cursor = conn_mysql.binlog_cursor().await?;
-      let server_id = 1;
-      let mut f = File::create(&cursor).await?;
-      let buffer = format!("mysql/{}/{}", server_id, binlog_cursor);
-      f.write_all(buffer.as_bytes()).await?;
-      Ok((server_id, binlog_cursor))
-    }
-    Err(err) => Err(err),
   }
 }

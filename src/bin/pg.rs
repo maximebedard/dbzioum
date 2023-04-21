@@ -1,19 +1,11 @@
-use std::{
-  io,
-  path::{Path, PathBuf},
-  time::Duration,
-};
+use std::{io, time::Duration};
 
-use clap::{value_parser, Arg, Command};
-use tokio::{
-  fs::File,
-  io::{AsyncReadExt, AsyncWriteExt},
-  sync::mpsc,
-};
+use clap::{Arg, Command};
+use tokio::sync::mpsc;
 use url::Url;
 
 use dbzioum::{
-  pg::{self, Connection, IdentifySystem, ReplicationEvent, ReplicationStream, WalCursor},
+  pg::{self, ReplicationEvent, WalCursor},
   sink::RowEvent,
 };
 
@@ -23,25 +15,23 @@ async fn main() {
     .version("1.0")
     .author("Maxime Bedard <maxime@bedard.dev>")
     .arg(Arg::new("url").required(true).short('u').value_parser(Url::parse))
-    .arg(
-      Arg::new("cursor")
-        .short('c')
-        .default_value("./cursor")
-        .value_parser(value_parser!(PathBuf)),
-    );
+    .arg(Arg::new("slot").required(true))
+    .arg(Arg::new("wal-cursor").value_parser(str::parse::<WalCursor>));
 
   let matches = cmd.get_matches_mut();
 
   let url = matches.get_one::<Url>("url").unwrap();
-  let cursor = matches.get_one::<PathBuf>("cursor").unwrap();
+  let slot = matches.get_one::<String>("slot").unwrap();
+  let wal_cursor = matches.get_one::<WalCursor>("wal-cursor").cloned();
 
   let mut conn_pg = pg::Connection::connect_from_url(&url).await.unwrap();
 
-  let (slot, wal_cursor) = replication_stream_options_or_defaults(&mut conn_pg, cursor)
-    .await
-    .unwrap();
+  let wal_cursor = match wal_cursor {
+    Some(wal_cursor) => wal_cursor,
+    None => conn_pg.identify_system().await.unwrap().wal_cursor,
+  };
 
-  let stream = conn_pg
+  let mut stream = conn_pg
     .start_replication_stream(slot, wal_cursor.clone())
     .await
     .unwrap();
@@ -53,49 +43,42 @@ async fn main() {
     }
   });
 
-  let event_processor = EventProcessor {
-    stream,
-    sink: sender,
+  let mut processor = EventProcessor {
     wal_cursor,
+    sink: sender,
   };
-  event_processor.process_stream().await.unwrap();
+
+  let interrupt = tokio::signal::ctrl_c();
+  tokio::pin!(interrupt);
+
+  // default healthcheck is configured to 10s.
+  let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+  loop {
+    tokio::select! {
+      Ok(_) = &mut interrupt => break,
+      event = stream.recv() => {
+        match event {
+          Some(Ok(event)) => processor.process_event(event).await.unwrap(),
+          Some(Err(err)) => panic!("{}", err),
+          None => break,
+        }
+      },
+      _ = interval.tick() => {
+        stream.write_status_update(1).await.unwrap();
+      },
+    }
+  }
+
+  stream.close().await.unwrap();
 }
 
 struct EventProcessor {
-  stream: ReplicationStream,
   wal_cursor: WalCursor,
   sink: mpsc::Sender<RowEvent>,
 }
 
 impl EventProcessor {
-  async fn process_stream(mut self) -> io::Result<()> {
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
-
-    // default healthcheck is configured to 10s.
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-
-    loop {
-      tokio::select! {
-        Ok(_) = &mut interrupt => break,
-        event = self.stream.recv() => {
-          match event {
-            Some(Ok(event)) => self.process_event(event).await.unwrap(),
-            Some(Err(err)) => panic!("{}", err),
-            None => break,
-          }
-        },
-        _ = interval.tick() => {
-          self.stream.write_status_update(1).await.unwrap();
-        },
-      }
-    }
-
-    self.stream.close().await.unwrap();
-
-    Ok(())
-  }
-
   async fn process_event(&mut self, event: ReplicationEvent) -> io::Result<()> {
     match event {
       ReplicationEvent::Data { end, data_change, .. } => {
@@ -115,36 +98,6 @@ impl EventProcessor {
     }
 
     Ok(())
-  }
-}
-
-async fn replication_stream_options_or_defaults(
-  conn_pg: &mut Connection,
-  cursor: impl AsRef<Path>,
-) -> io::Result<(String, WalCursor)> {
-  match File::open(&cursor).await {
-    Ok(mut f) => {
-      let mut buffer = String::new();
-      f.read_to_string(&mut buffer).await?;
-
-      let mut chunks = buffer.splitn(2, "/");
-      let driver = chunks.next().unwrap();
-      assert_eq!("pg", driver);
-
-      let slot = chunks.next().unwrap().to_string();
-      let wal_cursor = chunks.next().unwrap().parse().unwrap();
-
-      Ok((slot, wal_cursor))
-    }
-    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-      let IdentifySystem { wal_cursor, .. } = conn_pg.identify_system().await?;
-      let slot = "foo".to_string();
-      let mut f = File::create(&cursor).await?;
-      let buffer = format!("pg/{}/{}", slot, wal_cursor);
-      f.write_all(buffer.as_bytes()).await?;
-      Ok((slot, wal_cursor))
-    }
-    Err(err) => Err(err),
   }
 }
 
