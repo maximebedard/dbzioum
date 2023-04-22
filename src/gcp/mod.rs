@@ -89,7 +89,7 @@ impl Signer {
     Ok(Self(signer))
   }
 
-  fn sign(&self, scopes: &Vec<String>, key: &ServiceAccountKey) -> io::Result<String> {
+  fn sign(&self, scopes: &[String], key: &ServiceAccountKey) -> io::Result<String> {
     #[derive(Debug, serde::Serialize)]
     struct Claims<'a> {
       iss: &'a str,
@@ -221,7 +221,7 @@ impl AccessTokenStrategy {
     }
   }
 
-  async fn refresh_access_token(&self, scopes: &Vec<String>) -> io::Result<AccessToken> {
+  async fn refresh_access_token(&self, scopes: &[String]) -> io::Result<AccessToken> {
     match self {
       AccessTokenStrategy::User { key } => {
         let client = hyper::Client::new();

@@ -149,7 +149,7 @@ impl Connection {
     // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html
     let payload = self.read_payload().await?;
 
-    match payload.get(0) {
+    match payload.first() {
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(_) => {
         let handshake = Handshake::parse(payload)?;
@@ -217,7 +217,7 @@ impl Connection {
     self.write_command(Command::COM_PING, &[]).await?;
 
     let payload = self.read_payload().await?;
-    match payload.get(0) {
+    match payload.first() {
       Some(0x00) => self.parse_and_handle_server_ok(payload),
       _ => Err(io::Error::new(io::ErrorKind::Other, "Unexpected response from mysql")),
     }
@@ -244,7 +244,7 @@ impl Connection {
       eprintln!(">> {:?}", DebugBytesRef(chunk));
 
       self.sequence_id = self.sequence_id.wrapping_add(1);
-      self.stream.write(&b[..]).await?;
+      self.stream.write_all(&b[..]).await?;
       self.stream.flush().await?;
     }
 
@@ -254,7 +254,7 @@ impl Connection {
   async fn read_generic_reponse(&mut self) -> io::Result<()> {
     let payload = self.read_payload().await?;
 
-    match payload.get(0) {
+    match payload.first() {
       Some(0x00) => self.parse_and_handle_server_ok(payload),
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(_) => Err(io::Error::new(
@@ -272,7 +272,7 @@ impl Connection {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html
     let mut payload = self.read_payload().await?;
 
-    match payload.get(0) {
+    match payload.first() {
       Some(0x00) => {
         self.parse_and_handle_server_ok(payload)?;
         Ok(QueryResults::default())
@@ -298,7 +298,7 @@ impl Connection {
     let mut columns = Vec::with_capacity(column_count);
     for i in 0..column_count {
       let payload = self.read_payload().await?;
-      match payload.get(0) {
+      match payload.first() {
         Some(0x00) => {
           self.parse_and_handle_server_ok(payload)?;
           break;
@@ -324,14 +324,14 @@ impl Connection {
     loop {
       let mut payload = self.read_payload().await?;
 
-      match payload.get(0) {
+      match payload.first() {
         Some(0x00) | Some(0xFE) => {
           self.parse_and_handle_server_ok(payload)?;
           break;
         }
         Some(_) => {
           for i in 0..columns.len() {
-            match payload.get(0) {
+            match payload.first() {
               Some(0xFB) => {
                 payload.advance(1);
                 row_values.push(None);
@@ -366,17 +366,17 @@ impl Connection {
     // 0x00 = Ok, 0xFF = Err, 0xFE = AuthSwitch, 0x01 = AuthMoreData
     match auth_plugin_name {
       MYSQL_NATIVE_PASSWORD_PLUGIN_NAME | CACHING_SHA2_PASSWORD_PLUGIN_NAME => {
-        if let Some(&0x00) = payload.get(0) {
+        if let Some(&0x00) = payload.first() {
           return self.parse_and_handle_server_ok(payload);
         }
 
         // TODO: figure out what is this actually used for???
-        if payload.chunk() == &[0x01, 0x03] {
+        if payload.chunk() == [0x01, 0x03] {
           let payload = self.read_payload().await?;
           return self.parse_and_handle_server_ok(payload);
         }
 
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "todo"));
+        Err(io::Error::new(io::ErrorKind::InvalidData, "todo"))
       }
       other => unimplemented!(),
     }
@@ -446,7 +446,7 @@ impl Connection {
     let mut payload = vec![0; payload_len];
     self.stream.read_exact(&mut payload).await?;
 
-    return Ok((sequence_id, payload.into()));
+    Ok((sequence_id, payload.into()))
   }
 
   pub async fn binlog_cursor(&mut self) -> io::Result<BinlogCursor> {
@@ -476,8 +476,8 @@ impl Connection {
   async fn read_binlog_event_packet(&mut self) -> io::Result<BinlogEventPacket> {
     let payload = self.read_payload().await?;
 
-    match payload.get(0) {
-      Some(0x00) => BinlogEventPacket::parse(payload.into()),
+    match payload.first() {
+      Some(0x00) => BinlogEventPacket::parse(payload),
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(_) => Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -510,7 +510,7 @@ impl Connection {
     // })?;
 
     self.query("SELECT @@GLOBAL.binlog_row_metadata;").await.map(|v| {
-      assert_eq!(v.values[0].as_ref().map(String::as_str), Some("FULL"));
+      assert_eq!(v.values[0].as_deref(), Some("FULL"));
     })?;
 
     Ok(())
@@ -771,7 +771,7 @@ impl QueryResults {
   }
 
   pub fn rows_len(&self) -> usize {
-    if self.columns.len() > 0 {
+    if !self.columns.is_empty() {
       self.values.len() / self.columns.len()
     } else {
       0
@@ -779,7 +779,7 @@ impl QueryResults {
   }
 
   pub fn rows(&self) -> Option<ChunksExact<'_, RowValue>> {
-    if self.columns.len() > 0 {
+    if !self.columns.is_empty() {
       Some(self.values.chunks_exact(self.columns.len()))
     } else {
       None
@@ -787,7 +787,7 @@ impl QueryResults {
   }
 
   pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, RowValue>> {
-    if self.columns.len() > 0 {
+    if !self.columns.is_empty() {
       Some(self.values.chunks_exact_mut(self.columns.len()))
     } else {
       None
@@ -862,12 +862,12 @@ impl FromStr for BinlogCursor {
 
   fn from_str(s: &str) -> Result<Self, Self::Err> {
     let (log_file, log_position) = s
-      .split_once("/")
-      .ok_or_else(|| format!("Failed to parse binlog cursor. Expected format is <prefix>.<file>/<position>"))?;
+      .split_once('/')
+      .ok_or_else(|| "Failed to parse binlog cursor. Expected format is <prefix>.<file>/<position>".to_string())?;
     let log_file = log_file.to_string();
     let log_position = log_position
       .parse()
-      .map_err(|_| format!("Failed to parse binlog cursor position. Expected format is u32."))?;
+      .map_err(|_| "Failed to parse binlog cursor position. Expected format is u32.".to_string())?;
     Ok(Self { log_file, log_position })
   }
 }

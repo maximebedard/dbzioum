@@ -24,7 +24,7 @@ async fn main() {
   let slot = matches.get_one::<String>("slot").unwrap();
   let wal_cursor = matches.get_one::<WalCursor>("wal-cursor").cloned();
 
-  let mut conn_pg = pg::Connection::connect_from_url(&url).await.unwrap();
+  let mut conn_pg = pg::Connection::connect_from_url(url).await.unwrap();
 
   let wal_cursor = match wal_cursor {
     Some(wal_cursor) => wal_cursor,
@@ -65,7 +65,7 @@ async fn main() {
         }
       },
       _ = interval.tick() => {
-        stream.write_status_update(processor.wal_cursor.lsn.clone()).await.unwrap();
+        stream.write_status_update(processor.wal_cursor.lsn).await.unwrap();
       },
     }
   }

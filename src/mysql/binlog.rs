@@ -289,7 +289,7 @@ impl TableMapEvent {
       column_count,
       column_types,
       column_metas,
-      null_bitmap: null_bitmap.into(),
+      null_bitmap,
       metadata,
     })
   }
@@ -457,7 +457,7 @@ impl FormatDescriptionEvent {
 
     Ok(Self {
       version,
-      server_version: server_version.into(),
+      server_version,
       create_timestamp,
       event_header_length,
       event_type_header_lengths,
@@ -529,7 +529,7 @@ impl RowEvent {
     })
   }
 
-  pub fn values(&self, columns: &Vec<Column>) -> Vec<Value> {
+  pub fn values(&self, columns: &[Column]) -> Vec<Value> {
     let mut b = self.rows.clone();
 
     let values = columns
@@ -545,7 +545,7 @@ impl RowEvent {
         let is_null = self
           .null_bitmap
           .as_ref()
-          .filter(|v| v[i / 8] & (1 << i % 8) != 0)
+          .filter(|v| v[i / 8] & (1 << (i % 8)) != 0)
           .is_some();
 
         if *is_nullable && is_null {
@@ -555,9 +555,9 @@ impl RowEvent {
         match column_type_definition {
           ColumnTypeDefinition::U64 { pack_length } => Value::U64(b.get_uint_le(*pack_length)),
           ColumnTypeDefinition::I64 { pack_length } => Value::I64(b.get_int_le(*pack_length)),
-          ColumnTypeDefinition::F64 { pack_length } => match pack_length {
-            &4 => Value::F64(b.get_f32_le().into()),
-            &8 => Value::F64(b.get_f64_le()),
+          ColumnTypeDefinition::F64 { pack_length } => match *pack_length {
+            4 => Value::F64(b.get_f32_le().into()),
+            8 => Value::F64(b.get_f64_le()),
             _ => unreachable!(),
           },
           ColumnTypeDefinition::Decimal { precision, scale } => {

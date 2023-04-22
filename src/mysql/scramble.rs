@@ -25,7 +25,7 @@ where
 
 fn to_u8_32(bytes: impl AsRef<[u8]>) -> [u8; 32] {
   let mut out = [0; 32];
-  (&mut out[..]).copy_from_slice(bytes.as_ref());
+  out[..].copy_from_slice(bytes.as_ref());
   out
 }
 
@@ -46,7 +46,7 @@ pub fn scramble_native(nonce: &[u8], password: &[u8]) -> Option<[u8; 20]> {
     hasher.finalize().try_into().unwrap()
   }
 
-  if password.len() == 0 {
+  if password.is_empty() {
     return None;
   }
 
@@ -70,7 +70,7 @@ pub fn scramble_sha256(nonce: &[u8], password: &[u8]) -> Option<[u8; 32]> {
     to_u8_32(hasher.finalize())
   }
 
-  if password.len() == 0 {
+  if password.is_empty() {
     return None;
   }
 

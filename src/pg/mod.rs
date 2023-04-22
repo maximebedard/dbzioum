@@ -430,7 +430,7 @@ impl Connection {
         slot.as_ref()
       ))
       .await
-      .map(|result| result.values.len() > 0)
+      .map(|result| !result.values.is_empty())
   }
 
   pub async fn identify_system(&mut self) -> io::Result<IdentifySystem> {
@@ -693,10 +693,10 @@ impl Connection {
           return io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server");
         }
 
-        return io::Error::new(
+        io::Error::new(
           io::ErrorKind::Other,
           format!("Server error {}: {}", fields[&'C'], fields[&'M']),
-        );
+        )
       }
       Err(err) => err,
     }
@@ -771,7 +771,7 @@ impl SimpleQueryResult {
   }
 
   pub fn rows_len(&self) -> usize {
-    if self.columns.len() > 0 {
+    if !self.columns.is_empty() {
       self.values.len() / self.columns.len()
     } else {
       0
@@ -779,7 +779,7 @@ impl SimpleQueryResult {
   }
 
   pub fn rows(&self) -> Option<ChunksExact<'_, SimpleRowValue>> {
-    if self.columns.len() > 0 {
+    if !self.columns.is_empty() {
       Some(self.values.chunks_exact(self.columns.len()))
     } else {
       None
@@ -787,7 +787,7 @@ impl SimpleQueryResult {
   }
 
   pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, SimpleRowValue>> {
-    if self.columns.len() > 0 {
+    if !self.columns.is_empty() {
       Some(self.values.chunks_exact_mut(self.columns.len()))
     } else {
       None
@@ -918,7 +918,7 @@ impl FromStr for WalCursor {
 
   fn from_str(s: &str) -> Result<Self, Self::Err> {
     let (tid, lsn) = s
-      .split_once("/")
+      .split_once('/')
       .ok_or_else(|| "Failed to parse wal cursor. Expected format is <tid>/<lsn>".to_string())?;
     let tid = tid
       .parse()
