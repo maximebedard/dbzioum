@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use dbzioum::{
-  pg::{self, ReplicationEvent, WalCursor},
-  sink::RowEvent,
+  pg::{self, ColumnChange, ReplicationEvent, WalCursor},
+  sink::{Column, ColumnType, RowEvent},
 };
 
 #[tokio::main]
@@ -65,7 +65,7 @@ async fn main() {
         }
       },
       _ = interval.tick() => {
-        stream.write_status_update(1).await.unwrap();
+        stream.write_status_update(processor.wal_cursor.lsn.clone()).await.unwrap();
       },
     }
   }
@@ -103,34 +103,55 @@ impl EventProcessor {
 
 fn map_data_change(data_change: pg::DataChange) -> Option<RowEvent> {
   match data_change {
-    pg::DataChange::Insert { schema, table, columns } => Some(RowEvent::Insert {
-      schema,
-      table,
-      columns: vec![],
-    }),
+    pg::DataChange::Insert { schema, table, columns } => {
+      let columns = map_column_change(columns);
+      Some(RowEvent::Insert { schema, table, columns })
+    }
     pg::DataChange::Update {
       schema,
       table,
       columns,
       identity,
-    } => Some(RowEvent::Update {
-      schema,
-      table,
-      columns: vec![],
-      identity: vec![],
-    }),
+    } => {
+      let columns = map_column_change(columns);
+      let identity = map_column_change(identity);
+      Some(RowEvent::Update {
+        schema,
+        table,
+        columns,
+        identity,
+      })
+    }
     pg::DataChange::Delete {
       schema,
       table,
       identity,
-    } => Some(RowEvent::Delete {
-      schema,
-      table,
-      identity: vec![],
-    }),
+    } => {
+      let identity = map_column_change(identity);
+      Some(RowEvent::Delete {
+        schema,
+        table,
+        identity,
+      })
+    }
     pg::DataChange::Message { .. } => None,
     pg::DataChange::Truncate { .. } => None,
     pg::DataChange::Begin => None,
     pg::DataChange::Commit => None,
   }
+}
+
+fn map_column_change(column_changes: Vec<ColumnChange>) -> Vec<Column> {
+  column_changes
+    .into_iter()
+    .map(|ColumnChange { name, .. }| {
+      let column_type = ColumnType::U64;
+      let nullable = false;
+      Column {
+        name,
+        column_type,
+        nullable,
+      }
+    })
+    .collect()
 }

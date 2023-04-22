@@ -895,10 +895,10 @@ pub enum DataChange {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ColumnChange {
-  name: String,
+  pub name: String,
   #[serde(rename = "type")]
-  column_type: String,
-  value: serde_json::Value,
+  pub column_type: String,
+  pub value: serde_json::Value,
 }
 
 #[derive(Debug, PartialEq, PartialOrd, Clone)]

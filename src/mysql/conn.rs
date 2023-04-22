@@ -12,7 +12,7 @@ use tokio::net::{self, TcpStream};
 
 use crate::debug::DebugBytesRef;
 
-use super::binlog::{BinlogEvent, BinlogEventPacket};
+use super::binlog::BinlogEventPacket;
 use super::buf_ext::{BufExt, BufMutExt};
 use super::constants::{
   BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType, Command, StatusFlags,

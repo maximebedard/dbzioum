@@ -24,9 +24,9 @@ pub enum RowEvent {
 
 #[derive(Debug)]
 pub struct Column {
-  name: String,
-  nullable: bool,
-  column_type: ColumnType,
+  pub name: String,
+  pub nullable: bool,
+  pub column_type: ColumnType,
 }
 
 #[derive(Debug)]
