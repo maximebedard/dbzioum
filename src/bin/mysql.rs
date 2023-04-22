@@ -10,7 +10,7 @@ use dbzioum::{
     binlog::{self, TableMapEvent},
     BinlogCursor,
   },
-  sink::RowEvent,
+  sink::{Column, ColumnType, ColumnValue, RowEvent},
 };
 
 #[tokio::main]
@@ -121,11 +121,55 @@ impl EventProcessor {
         self.binlog_cursor.log_position = event.log_position;
       }
 
-      binlog::BinlogEvent::Delete(_v) => {
-        let _table_map_event = self.table_map_event.take().unwrap();
-        let schema = "".to_string();
-        let table = "".to_string();
-        let identity = vec![];
+      binlog::BinlogEvent::Delete(v) => {
+        let table_map_event = self.table_map_event.take().unwrap();
+
+        let columns = table_map_event.columns();
+        let values = v.values(&columns);
+
+        let schema = table_map_event.schema;
+        let table = table_map_event.table;
+
+        let identity = columns
+          .iter()
+          .zip(&values)
+          .map(|(c, v)| {
+            let name = c.name.clone();
+            let is_nullable = c.is_nullable;
+            let column_type = match c.column_type {
+              binlog::ColumnTypeDefinition::U64 { .. } => ColumnType::U64,
+              binlog::ColumnTypeDefinition::I64 { .. } => ColumnType::I64,
+              binlog::ColumnTypeDefinition::F64 { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Decimal { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Json { .. } => todo!(),
+              binlog::ColumnTypeDefinition::String { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Blob { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Date(_) => todo!(),
+              binlog::ColumnTypeDefinition::Year => todo!(),
+              binlog::ColumnTypeDefinition::Time(_) => todo!(),
+              binlog::ColumnTypeDefinition::Timestamp => todo!(),
+            };
+            let value = match v {
+              binlog::Value::Null => ColumnValue::Null,
+              binlog::Value::U64(v) => ColumnValue::U64(*v),
+              binlog::Value::I64(v) => ColumnValue::I64(*v),
+              binlog::Value::F64(_) => todo!(),
+              binlog::Value::Decimal(_) => todo!(),
+              binlog::Value::String(v) => ColumnValue::String(v.clone()),
+              binlog::Value::Blob(v) => ColumnValue::Bytes(v.clone()),
+              binlog::Value::Json(_) => todo!(),
+              binlog::Value::Date { .. } => todo!(),
+              binlog::Value::Time { .. } => todo!(),
+            };
+            Column {
+              name,
+              is_nullable,
+              column_type,
+              value,
+            }
+          })
+          .collect::<Vec<_>>();
+
         self
           .sink
           .send(RowEvent::Delete {

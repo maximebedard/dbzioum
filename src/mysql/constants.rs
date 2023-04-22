@@ -88,7 +88,7 @@ bitflags! {
 }
 
 // https://dev.mysql.com/doc/internals/en/character-set.html
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum CharacterSet {
@@ -136,7 +136,7 @@ pub enum CharacterSet {
 }
 
 // https://dev.mysql.com/doc/internals/en/character-set.html
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum Collation {
@@ -381,7 +381,7 @@ impl From<Collation> for CharacterSet {
   }
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Clone, Eq, PartialEq, Copy, Debug)]
 #[repr(u8)]
 pub enum Command {
@@ -420,7 +420,7 @@ pub enum Command {
 }
 
 /// Type of MySql column field
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u8)]
 pub enum ColumnType {
@@ -496,7 +496,7 @@ impl TryFrom<u8> for ColumnType {
   }
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u8)]
 pub enum BinlogEventType {
@@ -583,7 +583,7 @@ impl TryFrom<u8> for BinlogEventType {
   }
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u8)]
 pub enum ColumnMetadataType {

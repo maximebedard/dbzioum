@@ -919,12 +919,12 @@ impl FromStr for WalCursor {
   fn from_str(s: &str) -> Result<Self, Self::Err> {
     let (tid, lsn) = s
       .split_once("/")
-      .ok_or_else(|| format!("Failed to parse wal cursor. Expected format is <tid>/<lsn>"))?;
+      .ok_or_else(|| "Failed to parse wal cursor. Expected format is <tid>/<lsn>".to_string())?;
     let tid = tid
       .parse()
-      .map_err(|_| format!("Failed to parse wal cursor tid. Expected format is i8."))?;
+      .map_err(|_| "Failed to parse wal cursor tid. Expected format is i8.".to_string())?;
     let lsn = i64::from_str_radix(lsn, 16)
-      .map_err(|_| format!("Failed to parse wal cursor lsn. Expected format is i64 hex encoded"))?;
+      .map_err(|_| "Failed to parse wal cursor lsn. Expected format is i64 hex encoded".to_string())?;
     Ok(Self { tid, lsn })
   }
 }

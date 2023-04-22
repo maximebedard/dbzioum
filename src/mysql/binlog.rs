@@ -424,9 +424,9 @@ impl TableMapEvent {
         }
 
         Column {
-          column_name,
+          name: column_name,
           is_nullable,
-          column_type_definition,
+          column_type: column_type_definition,
         }
       })
       .collect()
@@ -538,7 +538,7 @@ impl RowEvent {
       .map(|(i, c)| {
         let Column {
           is_nullable,
-          column_type_definition,
+          column_type: column_type_definition,
           ..
         } = c;
 
@@ -674,9 +674,9 @@ pub enum Value {
 
 #[derive(Debug)]
 pub struct Column {
-  column_name: String,
-  is_nullable: bool,
-  column_type_definition: ColumnTypeDefinition,
+  pub name: String,
+  pub is_nullable: bool,
+  pub column_type: ColumnTypeDefinition,
 }
 
 #[derive(Debug)]

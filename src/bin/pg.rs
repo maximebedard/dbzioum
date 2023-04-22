@@ -6,7 +6,7 @@ use url::Url;
 
 use dbzioum::{
   pg::{self, ColumnChange, ReplicationEvent, WalCursor},
-  sink::{Column, ColumnType, RowEvent},
+  sink::{Column, ColumnType, ColumnValue, RowEvent},
 };
 
 #[tokio::main]
@@ -147,10 +147,12 @@ fn map_column_change(column_changes: Vec<ColumnChange>) -> Vec<Column> {
     .map(|ColumnChange { name, .. }| {
       let column_type = ColumnType::U64;
       let nullable = false;
+      let value = ColumnValue::Null;
       Column {
         name,
         column_type,
-        nullable,
+        is_nullable: nullable,
+        value,
       }
     })
     .collect()
