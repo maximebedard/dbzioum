@@ -1,7 +1,6 @@
-use std::{io, time::Duration};
+use std::time::Duration;
 
 use clap::{Arg, Command};
-use tokio::sync::mpsc;
 use url::Url;
 
 use dbzioum::{
@@ -36,17 +35,7 @@ async fn main() {
     .await
     .unwrap();
 
-  let (sender, mut receiver) = mpsc::channel(32);
-  tokio::task::spawn(async move {
-    while let Some(evt) = receiver.recv().await {
-      println!("{:?}", evt);
-    }
-  });
-
-  let mut processor = EventProcessor {
-    wal_cursor,
-    sink: sender,
-  };
+  let mut processor = EventProcessor { wal_cursor };
 
   let interrupt = tokio::signal::ctrl_c();
   tokio::pin!(interrupt);
@@ -59,7 +48,11 @@ async fn main() {
       Ok(_) = &mut interrupt => break,
       event = stream.recv() => {
         match event {
-          Some(Ok(event)) => processor.process_event(event).await.unwrap(),
+          Some(Ok(event)) => {
+            if let Some(event) = processor.process_event(event) {
+              println!("{:?}", event);
+            }
+          },
           Some(Err(err)) => panic!("{}", err),
           None => break,
         }
@@ -75,85 +68,77 @@ async fn main() {
 
 struct EventProcessor {
   wal_cursor: WalCursor,
-  sink: mpsc::Sender<RowEvent>,
 }
 
 impl EventProcessor {
-  async fn process_event(&mut self, event: ReplicationEvent) -> io::Result<()> {
+  fn process_event(&mut self, event: ReplicationEvent) -> Option<RowEvent> {
+    fn map_column_change(column_changes: Vec<ColumnChange>) -> Vec<Column> {
+      column_changes
+        .into_iter()
+        .map(|ColumnChange { name, .. }| {
+          let column_type = ColumnType::U64;
+          let nullable = false;
+          let value = ColumnValue::Null;
+          Column {
+            name,
+            column_type,
+            is_nullable: nullable,
+            value,
+          }
+        })
+        .collect()
+    }
+
     match event {
       ReplicationEvent::Data { end, data_change, .. } => {
-        if let Some(event) = map_data_change(data_change) {
-          self.sink.send(event).await.unwrap();
-        }
-
         self.wal_cursor.lsn = end;
+        match data_change {
+          pg::DataChange::Insert { schema, table, columns } => {
+            let columns = map_column_change(columns);
+            Some(RowEvent::Insert { schema, table, columns })
+          }
+          pg::DataChange::Update {
+            schema,
+            table,
+            columns,
+            identity,
+          } => {
+            let columns = map_column_change(columns);
+            let identity = map_column_change(identity);
+            Some(RowEvent::Update {
+              schema,
+              table,
+              columns,
+              identity,
+            })
+          }
+          pg::DataChange::Delete {
+            schema,
+            table,
+            identity,
+          } => {
+            let identity = map_column_change(identity);
+            Some(RowEvent::Delete {
+              schema,
+              table,
+              identity,
+            })
+          }
+          pg::DataChange::Message { .. } => None,
+          pg::DataChange::Truncate { .. } => None,
+          pg::DataChange::Begin => None,
+          pg::DataChange::Commit => None,
+        }
       }
       ReplicationEvent::KeepAlive { end, .. } => {
         self.wal_cursor.lsn = end;
+        None
       }
       ReplicationEvent::ChangeTimeline { tid, lsn } => {
         self.wal_cursor.tid = tid;
         self.wal_cursor.lsn = lsn;
+        None
       }
     }
-
-    Ok(())
   }
-}
-
-fn map_data_change(data_change: pg::DataChange) -> Option<RowEvent> {
-  match data_change {
-    pg::DataChange::Insert { schema, table, columns } => {
-      let columns = map_column_change(columns);
-      Some(RowEvent::Insert { schema, table, columns })
-    }
-    pg::DataChange::Update {
-      schema,
-      table,
-      columns,
-      identity,
-    } => {
-      let columns = map_column_change(columns);
-      let identity = map_column_change(identity);
-      Some(RowEvent::Update {
-        schema,
-        table,
-        columns,
-        identity,
-      })
-    }
-    pg::DataChange::Delete {
-      schema,
-      table,
-      identity,
-    } => {
-      let identity = map_column_change(identity);
-      Some(RowEvent::Delete {
-        schema,
-        table,
-        identity,
-      })
-    }
-    pg::DataChange::Message { .. } => None,
-    pg::DataChange::Truncate { .. } => None,
-    pg::DataChange::Begin => None,
-    pg::DataChange::Commit => None,
-  }
-}
-
-fn map_column_change(column_changes: Vec<ColumnChange>) -> Vec<Column> {
-  column_changes
-    .into_iter()
-    .map(|ColumnChange { name, .. }| {
-      let column_type = ColumnType::U64;
-      let nullable = false;
-      let value = ColumnValue::Null;
-      Column {
-        name,
-        column_type,
-        is_nullable: nullable,
-        value,
-      }
-    })
-    .collect()
 }

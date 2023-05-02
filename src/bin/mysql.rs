@@ -1,7 +1,4 @@
-use std::io;
-
 use clap::{value_parser, Arg, Command};
-use tokio::sync::mpsc;
 use url::Url;
 
 use dbzioum::{
@@ -44,20 +41,12 @@ async fn main() {
     .await
     .unwrap();
 
-  let (sender, mut receiver) = mpsc::channel(32);
-  tokio::task::spawn(async move {
-    while let Some(evt) = receiver.recv().await {
-      println!("{:?}", evt);
-    }
-  });
-
   let interrupt = tokio::signal::ctrl_c();
   tokio::pin!(interrupt);
 
   let mut processor = EventProcessor {
     table_map_event: None,
     binlog_cursor,
-    sink: sender,
   };
 
   loop {
@@ -65,7 +54,11 @@ async fn main() {
         Ok(_) = &mut interrupt => break,
         event = stream.recv() => {
             match event {
-                Some(Ok(event)) => processor.process_event(event).await.unwrap(),
+                Some(Ok(event)) => {
+                  if let Some(event) = processor.process_event(event) {
+                    println!("{:?}", event);
+                  }
+                },
                 Some(Err(err)) => eprintln!("binlog stream error: {:?}", err),
                 None => break,
             }
@@ -78,50 +71,18 @@ async fn main() {
 
 struct EventProcessor {
   binlog_cursor: BinlogCursor,
-  sink: mpsc::Sender<RowEvent>,
   table_map_event: Option<TableMapEvent>,
 }
 
 impl EventProcessor {
-  async fn process_event(&mut self, event: binlog::BinlogEventPacket) -> io::Result<()> {
+  fn process_event(&mut self, event: binlog::BinlogEventPacket) -> Option<RowEvent> {
     match event.event {
       binlog::BinlogEvent::TableMap(v) => {
         self.table_map_event.replace(v);
+        None
       }
 
-      binlog::BinlogEvent::Insert(_v) => {
-        let _table_map_event = self.table_map_event.take().unwrap();
-        let schema = "".to_string();
-        let table = "".to_string();
-        let columns = vec![];
-        self
-          .sink
-          .send(RowEvent::Insert { schema, table, columns })
-          .await
-          .unwrap();
-        self.binlog_cursor.log_position = event.log_position;
-      }
-
-      binlog::BinlogEvent::Update(_v) => {
-        let _table_map_event = self.table_map_event.take().unwrap();
-        let schema = "".to_string();
-        let table = "".to_string();
-        let columns = vec![];
-        let identity = vec![];
-        self
-          .sink
-          .send(RowEvent::Update {
-            schema,
-            table,
-            columns,
-            identity,
-          })
-          .await
-          .unwrap();
-        self.binlog_cursor.log_position = event.log_position;
-      }
-
-      binlog::BinlogEvent::Delete(v) => {
+      binlog::BinlogEvent::Insert(v) => {
         let table_map_event = self.table_map_event.take().unwrap();
 
         let columns = table_map_event.columns();
@@ -130,11 +91,11 @@ impl EventProcessor {
         let schema = table_map_event.schema;
         let table = table_map_event.table;
 
-        let identity = columns
-          .iter()
-          .zip(&values)
+        let columns = columns
+          .into_iter()
+          .zip(values)
           .map(|(c, v)| {
-            let name = c.name.clone();
+            let name = c.name;
             let is_nullable = c.is_nullable;
             let column_type = match c.column_type {
               binlog::ColumnTypeDefinition::U64 { .. } => ColumnType::U64,
@@ -151,12 +112,12 @@ impl EventProcessor {
             };
             let value = match v {
               binlog::Value::Null => ColumnValue::Null,
-              binlog::Value::U64(v) => ColumnValue::U64(*v),
-              binlog::Value::I64(v) => ColumnValue::I64(*v),
+              binlog::Value::U64(v) => ColumnValue::U64(v),
+              binlog::Value::I64(v) => ColumnValue::I64(v),
               binlog::Value::F64(_) => todo!(),
               binlog::Value::Decimal(_) => todo!(),
-              binlog::Value::String(v) => ColumnValue::String(v.clone()),
-              binlog::Value::Blob(v) => ColumnValue::Bytes(v.clone()),
+              binlog::Value::String(v) => ColumnValue::String(v),
+              binlog::Value::Blob(v) => ColumnValue::Bytes(v),
               binlog::Value::Json(_) => todo!(),
               binlog::Value::Date { .. } => todo!(),
               binlog::Value::Time { .. } => todo!(),
@@ -170,26 +131,90 @@ impl EventProcessor {
           })
           .collect::<Vec<_>>();
 
-        self
-          .sink
-          .send(RowEvent::Delete {
-            schema,
-            table,
-            identity,
-          })
-          .await
-          .unwrap();
         self.binlog_cursor.log_position = event.log_position;
+        Some(RowEvent::Insert { schema, table, columns })
+      }
+
+      binlog::BinlogEvent::Update(_v) => {
+        let _table_map_event = self.table_map_event.take().unwrap();
+        let schema = "".to_string();
+        let table = "".to_string();
+        let columns = vec![];
+        let identity = vec![];
+        self.binlog_cursor.log_position = event.log_position;
+        Some(RowEvent::Update {
+          schema,
+          table,
+          columns,
+          identity,
+        })
+      }
+
+      binlog::BinlogEvent::Delete(v) => {
+        let table_map_event = self.table_map_event.take().unwrap();
+
+        let columns = table_map_event.columns();
+        let values = v.values(&columns);
+
+        let schema = table_map_event.schema;
+        let table = table_map_event.table;
+
+        let identity = columns
+          .into_iter()
+          .zip(values)
+          .map(|(c, v)| {
+            let name = c.name;
+            let is_nullable = c.is_nullable;
+            let column_type = match c.column_type {
+              binlog::ColumnTypeDefinition::U64 { .. } => ColumnType::U64,
+              binlog::ColumnTypeDefinition::I64 { .. } => ColumnType::I64,
+              binlog::ColumnTypeDefinition::F64 { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Decimal { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Json { .. } => todo!(),
+              binlog::ColumnTypeDefinition::String { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Blob { .. } => todo!(),
+              binlog::ColumnTypeDefinition::Date(_) => todo!(),
+              binlog::ColumnTypeDefinition::Year => todo!(),
+              binlog::ColumnTypeDefinition::Time(_) => todo!(),
+              binlog::ColumnTypeDefinition::Timestamp => todo!(),
+            };
+            let value = match v {
+              binlog::Value::Null => ColumnValue::Null,
+              binlog::Value::U64(v) => ColumnValue::U64(v),
+              binlog::Value::I64(v) => ColumnValue::I64(v),
+              binlog::Value::F64(_) => todo!(),
+              binlog::Value::Decimal(_) => todo!(),
+              binlog::Value::String(v) => ColumnValue::String(v),
+              binlog::Value::Blob(v) => ColumnValue::Bytes(v),
+              binlog::Value::Json(_) => todo!(),
+              binlog::Value::Date { .. } => todo!(),
+              binlog::Value::Time { .. } => todo!(),
+            };
+            Column {
+              name,
+              is_nullable,
+              column_type,
+              value,
+            }
+          })
+          .collect::<Vec<_>>();
+
+        self.binlog_cursor.log_position = event.log_position;
+        Some(RowEvent::Delete {
+          schema,
+          table,
+          identity,
+        })
       }
       binlog::BinlogEvent::Rotate(evt) => {
         self.binlog_cursor.log_file = evt.next_log_file.clone();
         self.binlog_cursor.log_position = evt.next_log_position;
+        None
       }
       _ => {
         self.binlog_cursor.log_position = event.log_position;
+        None
       }
     }
-
-    Ok(())
   }
 }
