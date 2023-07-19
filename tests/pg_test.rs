@@ -17,7 +17,7 @@ async fn test_connection_server_info() {
 
   let result = conn.simple_query("SHOW SERVER_VERSION").await.unwrap();
   assert_eq!(
-    result.values.first().unwrap().as_ref().map(String::as_str),
+    result.row(0).first().unwrap().as_ref().map(String::as_str),
     Some("14.7 (Debian 14.7-1.pgdg110+1)")
   );
 
@@ -28,8 +28,7 @@ async fn test_connection_server_info() {
 async fn test_query() {
   let mut conn = setup_connection().await.unwrap();
   let results = conn.simple_query("SELECT 1,2,3 UNION ALL SELECT 4,5,6").await.unwrap();
-  assert_eq!(results.columns.len(), 3);
-  assert_eq!(results.values.len(), 6);
+  assert_eq!(results.columns_len(), 3);
   assert_eq!(results.rows_len(), 2);
   conn.close().await.unwrap();
 }
@@ -38,8 +37,7 @@ async fn test_query() {
 async fn test_noop_query() {
   let mut conn = setup_connection().await.unwrap();
   let results = conn.simple_query(";").await.unwrap();
-  assert_eq!(results.columns.len(), 0);
-  assert_eq!(results.values.len(), 0);
+  assert_eq!(results.columns_len(), 0);
   assert_eq!(results.rows_len(), 0);
   conn.close().await.unwrap();
 }

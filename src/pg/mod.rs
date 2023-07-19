@@ -53,10 +53,7 @@ impl Connection {
       user => user.to_string(),
     };
     let password = u.password().map(|v| v.to_string());
-    let host = u
-      .host()
-      .map(|h| h.to_string())
-      .unwrap_or_else(|| "localhost".to_string());
+
     let port = u.port().unwrap_or(5432);
     let addr = match u.host() {
       Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
@@ -753,20 +750,26 @@ pub type SimpleRowValue = Option<String>;
 
 #[derive(Debug)]
 pub struct SimpleQueryResult {
-  pub columns: Vec<SimpleColumn>,
-  pub values: Vec<SimpleRowValue>,
+  columns: Vec<SimpleColumn>,
+  values: Vec<SimpleRowValue>,
 }
 
 impl SimpleQueryResult {
+  pub fn columns_len(&self) -> usize {
+    self.columns.len()
+  }
+
   pub fn row(&self, i: usize) -> &[SimpleRowValue] {
-    let start = i * self.columns.len();
-    let end = start + self.columns.len();
+    let len = self.columns.len();
+    let start = i * len;
+    let end = start + len;
     &self.values[start..end]
   }
 
   pub fn row_mut(&mut self, i: usize) -> &mut [SimpleRowValue] {
-    let start = i * self.columns.len();
-    let end = start + self.columns.len();
+    let len = self.columns.len();
+    let start = i * len;
+    let end = start + len;
     &mut self.values[start..end]
   }
 

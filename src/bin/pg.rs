@@ -17,13 +17,13 @@ async fn main() {
     .arg(Arg::new("slot").required(true))
     .arg(Arg::new("wal-cursor").value_parser(str::parse::<WalCursor>));
 
-  let matches = cmd.get_matches_mut();
+  let mut matches = cmd.get_matches_mut();
 
-  let url = matches.get_one::<Url>("url").unwrap();
-  let slot = matches.get_one::<String>("slot").unwrap();
-  let wal_cursor = matches.get_one::<WalCursor>("wal-cursor").cloned();
+  let url = matches.remove_one::<Url>("url").unwrap();
+  let slot = matches.remove_one::<String>("slot").unwrap();
+  let wal_cursor = matches.remove_one::<WalCursor>("wal-cursor");
 
-  let mut conn_pg = pg::Connection::connect_from_url(url).await.unwrap();
+  let mut conn_pg = pg::Connection::connect_from_url(&url).await.unwrap();
 
   let wal_cursor = match wal_cursor {
     Some(wal_cursor) => wal_cursor,

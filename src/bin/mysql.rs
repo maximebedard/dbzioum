@@ -23,11 +23,11 @@ async fn main() {
     )
     .arg(Arg::new("binlog-cursor").value_parser(str::parse::<BinlogCursor>));
 
-  let matches = cmd.get_matches_mut();
+  let mut matches = cmd.get_matches_mut();
 
-  let url = matches.get_one::<Url>("url").cloned().unwrap();
-  let server_id = matches.get_one::<u32>("server-id").cloned().unwrap();
-  let binlog_cursor = matches.get_one::<BinlogCursor>("binlog-cursor").cloned();
+  let url = matches.remove_one::<Url>("url").unwrap();
+  let server_id = matches.remove_one::<u32>("server-id").unwrap();
+  let binlog_cursor = matches.remove_one::<BinlogCursor>("binlog-cursor");
 
   let mut conn_mysql = mysql::Connection::connect_from_url(&url).await.unwrap();
 

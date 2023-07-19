@@ -1,12 +1,6 @@
 use std::fmt::{self, Debug};
 pub struct DebugBytesRef<'a>(pub &'a [u8]);
 
-/// Alternative implementation of `std::fmt::Debug` for byte slice.
-///
-/// Standard `Debug` implementation for `[u8]` is comma separated
-/// list of numbers. Since large amount of byte strings are in fact
-/// ASCII strings or contain a lot of ASCII strings (e. g. HTTP),
-/// it is convenient to print strings as ASCII when possible.
 impl Debug for DebugBytesRef<'_> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "b\"")?;
