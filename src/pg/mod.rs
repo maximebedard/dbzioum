@@ -6,9 +6,12 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{io, net::SocketAddr};
 
+use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
+use sha2::digest::FixedOutput;
+use sha2::Sha256;
 use tokio::net;
 use tokio::{
   io::{AsyncReadExt, AsyncWriteExt, BufStream},
@@ -254,13 +257,7 @@ impl Connection {
               ));
             }
             10 => {
-              let password = self
-                .options
-                .password
-                .as_ref()
-                .map(String::as_bytes)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "password is required"))?;
-
+              // https://datatracker.ietf.org/doc/html/rfc5802#section-3
               let mut mechanisms = Vec::new();
               loop {
                 match self.read_c_string().await? {
@@ -278,26 +275,26 @@ impl Connection {
                 ));
               }
 
-              let nonce = thread_rng()
+              let client_nonce = thread_rng()
                 .sample_iter(&Alphanumeric)
                 .take(24)
                 .map(char::from)
                 .collect::<String>();
 
               // Write SASLInitialResponse
-              let gs2_header = "n,,"; // TODO: update this when supporting SCRAM-SHA-256-PLUS
+              let gs2_header = "n,,"; //"n,,"; // TODO: update this when supporting SCRAM-SHA-256-PLUS
               let cbind_data = "";
-              let message = format!("{}n=,r={}", gs2_header, nonce);
-              let len = 4 + mechanism.len() + 1 + 4 + message.len();
+              let client_first_message = format!("{}n=,r={}", gs2_header, client_nonce);
+              let len = 4 + mechanism.len() + 1 + 4 + client_first_message.len();
               self.stream.write_u8(b'p').await?;
               self.stream.write_i32(len as i32).await?;
               self.stream.write_all(mechanism.as_bytes()).await?;
               self.stream.write_u8(0).await?;
-              self.stream.write_i32(message.len() as i32).await?;
-              self.stream.write_all(message.as_bytes()).await?;
+              self.stream.write_i32(client_first_message.len() as i32).await?;
+              self.stream.write_all(client_first_message.as_bytes()).await?;
               self.stream.flush().await?;
 
-              let body = match self.stream.read_u8().await? {
+              let server_first_message = match self.stream.read_u8().await? {
                 b'R' => {
                   // AuthenticationSASLContinue (B)
                   //   Byte1('R')
@@ -308,10 +305,11 @@ impl Connection {
                   //       Specifies that this message contains a SASL challenge.
                   //   Byten
                   //       SASL data, specific to the SASL mechanism being used.
-                  self.stream.read_i32().await?; // skip len
+                  let len = self.stream.read_i32().await?; // skip len
                   self.stream.read_i32().await?; // skip 11
-                  let mut body = vec![0; 84];
+                  let mut body = vec![0; (len - 8) as usize];
                   self.stream.read_exact(&mut body).await?;
+                  let body = String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
                   body
                 }
                 b'E' => {
@@ -322,27 +320,95 @@ impl Connection {
                 }
               };
 
-              let mut chunks = body.splitn(3, |v| *v == b',');
-              let nonce = chunks
+              let mut chunks = server_first_message.splitn(3, |v| v == ',');
+              let server_nonce = chunks
                 .next()
-                .and_then(|v| v.strip_prefix(b"r="))
+                .and_then(|v| v.strip_prefix("r="))
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid nonce"))?;
 
               let salt = chunks
                 .next()
-                .and_then(|v| v.strip_prefix(b"s="))
+                .and_then(|v| v.strip_prefix("s="))
+                .and_then(|v| base64::decode(v).ok())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid salt"))?;
 
               let iteration_count = chunks
                 .next()
-                .and_then(|v| v.strip_prefix(b"i="))
+                .and_then(|v| v.strip_prefix("i="))
+                .and_then(|v| v.parse::<usize>().ok())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid iteration count"))?;
 
+              fn sasl_hi(str: &[u8], salt: &[u8], i: usize) -> [u8; 32] {
+                let mut prev = Hmac::<Sha256>::new_from_slice(str)
+                  .unwrap()
+                  .chain_update(salt)
+                  .chain_update(&[0, 0, 0, 1])
+                  .finalize()
+                  .into_bytes();
+                let mut hi = prev;
+
+                for _ in 1..i {
+                  prev = Hmac::<Sha256>::new_from_slice(str)
+                    .unwrap()
+                    .chain_update(&prev)
+                    .finalize()
+                    .into_bytes();
+
+                  for (hi, prev) in hi.iter_mut().zip(prev) {
+                    *hi ^= prev;
+                  }
+                }
+
+                hi.into()
+              }
+
+              let password = self
+                .options
+                .password
+                .as_ref()
+                .map(String::as_bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "password is required"))?;
+
+              let salted_password = sasl_hi(&password, &salt, iteration_count);
+
+              let client_key = Hmac::<Sha256>::new_from_slice(&salted_password)
+                .unwrap()
+                .chain_update(b"Client Key")
+                .finalize()
+                .into_bytes();
+
+              let stored_key = Sha256::default().chain_update(client_key.as_slice()).finalize_fixed();
+
+              let encoded_channel_binding = base64::encode(&[gs2_header, cbind_data].concat());
+
+              let auth_message = format!(
+                "n=,r={},{},c={},r={}",
+                client_nonce, server_first_message, encoded_channel_binding, server_nonce
+              );
+
+              let client_signature = Hmac::<Sha256>::new_from_slice(&stored_key)
+                .unwrap()
+                .chain_update(auth_message.as_bytes())
+                .finalize()
+                .into_bytes();
+
+              let mut client_proof = client_key;
+              for (proof, signature) in client_proof.iter_mut().zip(client_signature) {
+                *proof ^= signature;
+              }
+
+              let client_final_message = format!(
+                "c={},r={},p={}",
+                encoded_channel_binding,
+                server_nonce,
+                base64::encode(client_proof)
+              );
+
               // SASLResponse
-              let len = 0;
+              let len = 4 + client_final_message.len();
               self.stream.write_u8(b'p').await?;
               self.stream.write_i32(len as i32).await?;
-              self.stream.write_all(message.as_bytes()).await?;
+              self.stream.write_all(client_final_message.as_bytes()).await?;
               self.stream.flush().await?;
 
               let body = match self.stream.read_u8().await? {
@@ -356,10 +422,11 @@ impl Connection {
                   //       Specifies that SASL authentication has completed.
                   //   Byten
                   //       SASL outcome "additional data", specific to the SASL mechanism being used.
-                  self.stream.read_i32().await?; // skip len
+                  let len = self.stream.read_i32().await?;
                   self.stream.read_i32().await?; // skip 12
-                  let mut body = vec![0; 84];
+                  let mut body = vec![0; (len - 8) as usize];
                   self.stream.read_exact(&mut body).await?;
+                  let body = String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
                   body
                 }
                 b'E' => {
@@ -370,10 +437,29 @@ impl Connection {
                 }
               };
 
-              return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "AuthenticationSASL is not supported",
-              ));
+              if let Some(err) = body.strip_prefix("e=") {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
+              } else if let Some(verifier) = body.strip_prefix("v=") {
+                let verifier = base64::decode(verifier)
+                  .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, "Failed to decode base64 sasl verifier"))?;
+
+                let server_key = Hmac::<Sha256>::new_from_slice(&salted_password)
+                  .unwrap()
+                  .chain_update(b"Server Key")
+                  .finalize()
+                  .into_bytes();
+
+                Hmac::<Sha256>::new_from_slice(&server_key)
+                  .unwrap()
+                  .chain_update(auth_message.as_bytes())
+                  .verify_slice(&verifier)
+                  .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to verify sasl auth_message"))?;
+              } else {
+                return Err(io::Error::new(
+                  io::ErrorKind::InvalidData,
+                  "AuthenticationSASL unexpected payload",
+                ));
+              }
             }
             code => panic!("Unexpected backend authentication code {:?}", code),
           }

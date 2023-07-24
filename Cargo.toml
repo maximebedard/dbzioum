@@ -21,3 +21,4 @@ sha2 = { version = "0.10" }
 clap = { version = "4.2" }
 rand = { version = "0.8" }
 url = { version = "2.3" }
+hmac = { version = "0.12" }

@@ -12,7 +12,7 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
   - [ ] auth
     - [x] password
     - [x] deprecated md5
-    - [ ] (WIP) scram-sha-256
+    - [x] scram-sha-256
     - [ ] (WIP) ssl
   - [x] simple query support
   - [x] query cancellation support

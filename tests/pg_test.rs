@@ -2,14 +2,14 @@ use dbzioum::pg::{Connection, ConnectionOptions, CreateReplicationSlot, Identify
 use std::time::Duration;
 
 #[tokio::test]
-async fn test_ping_postgres_user() {
+async fn test_ping_user_postgres() {
   let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   assert!(conn.ping().await.is_ok());
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn test_ping_md5_user() {
+async fn test_ping_user_md5() {
   let mut conn = Connection::connect(ConnectionOptions {
     user: "md5_user".to_string(),
     ..default_connection_options()
@@ -21,7 +21,23 @@ async fn test_ping_md5_user() {
 }
 
 #[tokio::test]
-async fn test_ping_scram_user() {
+async fn test_ping_user_md5_invalid_password() {
+  let err = Connection::connect(ConnectionOptions {
+    user: "md5_user".to_string(),
+    password: Some("invalid".to_string()),
+    ..default_connection_options()
+  })
+  .await
+  .unwrap_err();
+
+  assert_eq!(
+    "Server error 28P01: password authentication failed for user \"md5_user\"",
+    err.to_string()
+  );
+}
+
+#[tokio::test]
+async fn test_ping_user_scram() {
   let mut conn = Connection::connect(ConnectionOptions {
     user: "scram_user".to_string(),
     ..default_connection_options()
@@ -33,7 +49,23 @@ async fn test_ping_scram_user() {
 }
 
 #[tokio::test]
-async fn test_ping_pass_user() {
+async fn test_ping_user_scram_invalid_password() {
+  let err = Connection::connect(ConnectionOptions {
+    user: "scram_user".to_string(),
+    password: Some("invalid".to_string()),
+    ..default_connection_options()
+  })
+  .await
+  .unwrap_err();
+
+  assert_eq!(
+    "Server error 28P01: password authentication failed for user \"scram_user\"",
+    err.to_string()
+  );
+}
+
+#[tokio::test]
+async fn test_ping_user_pass() {
   let mut conn = Connection::connect(ConnectionOptions {
     user: "pass_user".to_string(),
     ..default_connection_options()
@@ -42,6 +74,22 @@ async fn test_ping_pass_user() {
   .unwrap();
   assert!(conn.ping().await.is_ok());
   conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ping_user_pass_invalid_password() {
+  let err = Connection::connect(ConnectionOptions {
+    user: "pass_user".to_string(),
+    password: Some("invalid".to_string()),
+    ..default_connection_options()
+  })
+  .await
+  .unwrap_err();
+
+  assert_eq!(
+    "Server error 28P01: password authentication failed for user \"pass_user\"",
+    err.to_string()
+  );
 }
 
 #[tokio::test]
