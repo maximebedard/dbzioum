@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::{SocketAddrV4, SocketAddrV6};
 use std::slice::{ChunksExact, ChunksExactMut};
@@ -6,6 +6,9 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{io, net::SocketAddr};
 
+use md5::{Digest, Md5};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 use tokio::net;
 use tokio::{
   io::{AsyncReadExt, AsyncWriteExt, BufStream},
@@ -17,6 +20,9 @@ use url::Url;
 pub struct Connection {
   stream: BufStream<TcpStream>,
   options: ConnectionOptions,
+  pid: Option<i32>,
+  secret_key: Option<i32>,
+  metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +32,6 @@ pub struct ConnectionOptions {
   pub use_ssl: bool,
   pub password: Option<String>,
   pub database: Option<String>,
-  pub handle_notices_as_errors: bool,
 }
 
 impl Default for ConnectionOptions {
@@ -37,7 +42,6 @@ impl Default for ConnectionOptions {
       use_ssl: false,
       password: None,
       database: None,
-      handle_notices_as_errors: true,
     }
   }
 }
@@ -82,10 +86,15 @@ impl Connection {
 
   pub async fn connect(options: impl Into<ConnectionOptions>) -> io::Result<Self> {
     let options = options.into();
-    let stream = TcpStream::connect(options.addr).await?;
-    let stream = BufStream::new(stream);
     let use_ssl = options.use_ssl;
-    let mut connection = Self { stream, options };
+    let stream = TcpStream::connect(options.addr).await.map(BufStream::new)?;
+    let mut connection = Self {
+      stream,
+      options,
+      pid: None,
+      secret_key: None,
+      metadata: BTreeMap::new(),
+    };
     if use_ssl {
       connection.ssl_handshake().await?;
     }
@@ -97,6 +106,23 @@ impl Connection {
     Self::connect(self.options.clone()).await
   }
 
+  pub async fn cancel_handle(&self) -> io::Result<CancelHandle> {
+    match (self.pid, self.secret_key) {
+      (Some(pid), Some(secret_key)) => {
+        let stream = TcpStream::connect(self.options.addr).await.map(BufStream::new)?;
+        Ok(CancelHandle {
+          stream,
+          secret_key,
+          pid,
+        })
+      }
+      (_, _) => Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "unable to create cancel handle",
+      )),
+    }
+  }
+
   async fn ssl_handshake(&mut self) -> io::Result<()> {
     self.stream.write_i32(8).await?;
     self.stream.write_i32(SSL_HANDSHAKE_CODE).await?;
@@ -104,7 +130,7 @@ impl Connection {
     match self.stream.read_u8().await? {
       b'S' => {
         // https://www.postgresql.org/docs/11/protocol-flow.html#id-1.10.5.7.11
-        unimplemented!()
+        todo!()
       }
       b'N' => {
         // noop
@@ -168,22 +194,46 @@ impl Connection {
             }
             3 => {
               // AuthenticationCleartextPassword
-              if let Some(ref password) = self.options.password {
-                let len = password.as_bytes().len() + 4 + 1;
-                self.stream.write_u8(b'p').await?;
-                self.stream.write_i32(len as i32).await?;
-                self.stream.write_all(password.as_bytes()).await?;
-                self.stream.write_u8(0).await?;
-                self.stream.flush().await?;
-              } else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "password is required"));
-              }
+              let password = self
+                .options
+                .password
+                .as_ref()
+                .map(String::as_bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "password is required"))?;
+
+              let len = password.len() + 4 + 1;
+              self.stream.write_u8(b'p').await?;
+              self.stream.write_i32(len as i32).await?;
+              self.stream.write_all(password).await?;
+              self.stream.write_u8(0).await?;
+              self.stream.flush().await?
             }
             5 => {
-              return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "AuthenticationMD5Password is not supported",
-              ));
+              // AuthenticationMD5Password
+              let password = self
+                .options
+                .password
+                .as_ref()
+                .map(String::as_bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "password is required"))?;
+
+              let mut salt = vec![0; 4];
+              self.stream.read_exact(&mut salt).await?;
+
+              let mut md5 = Md5::new();
+              md5.update(password);
+              md5.update(self.options.user.as_bytes());
+              let output = md5.finalize_reset();
+              md5.update(format!("{:x}", output));
+              md5.update(salt);
+              let password = format!("md5{:x}", md5.finalize());
+
+              let len = password.len() + 4 + 1;
+              self.stream.write_u8(b'p').await?;
+              self.stream.write_i32(len as i32).await?;
+              self.stream.write_all(password.as_bytes()).await?;
+              self.stream.write_u8(0).await?;
+              self.stream.flush().await?
             }
             6 => {
               return Err(io::Error::new(
@@ -204,6 +254,122 @@ impl Connection {
               ));
             }
             10 => {
+              let password = self
+                .options
+                .password
+                .as_ref()
+                .map(String::as_bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "password is required"))?;
+
+              let mut mechanisms = Vec::new();
+              loop {
+                match self.read_c_string().await? {
+                  m if m.is_empty() => break,
+                  m => mechanisms.push(m),
+                }
+              }
+
+              let mechanism = "SCRAM-SHA-256".to_string();
+
+              if !mechanisms.contains(&mechanism) {
+                return Err(io::Error::new(
+                  io::ErrorKind::Unsupported,
+                  "AuthenticationSASL SCRAM-SHA-256 is not supported upstream",
+                ));
+              }
+
+              let nonce = thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(24)
+                .map(char::from)
+                .collect::<String>();
+
+              // Write SASLInitialResponse
+              let gs2_header = "n,,"; // TODO: update this when supporting SCRAM-SHA-256-PLUS
+              let cbind_data = "";
+              let message = format!("{}n=,r={}", gs2_header, nonce);
+              let len = 4 + mechanism.len() + 1 + 4 + message.len();
+              self.stream.write_u8(b'p').await?;
+              self.stream.write_i32(len as i32).await?;
+              self.stream.write_all(mechanism.as_bytes()).await?;
+              self.stream.write_u8(0).await?;
+              self.stream.write_i32(message.len() as i32).await?;
+              self.stream.write_all(message.as_bytes()).await?;
+              self.stream.flush().await?;
+
+              let body = match self.stream.read_u8().await? {
+                b'R' => {
+                  // AuthenticationSASLContinue (B)
+                  //   Byte1('R')
+                  //       Identifies the message as an authentication request.
+                  //   Int32
+                  //       Length of message contents in bytes, including self.
+                  //   Int32(11)
+                  //       Specifies that this message contains a SASL challenge.
+                  //   Byten
+                  //       SASL data, specific to the SASL mechanism being used.
+                  self.stream.read_i32().await?; // skip len
+                  self.stream.read_i32().await?; // skip 11
+                  let mut body = vec![0; 84];
+                  self.stream.read_exact(&mut body).await?;
+                  body
+                }
+                b'E' => {
+                  return Err(self.read_backend_error().await);
+                }
+                code => {
+                  panic!("Unexpected backend message: {:?}", char::from(code))
+                }
+              };
+
+              let mut chunks = body.splitn(3, |v| *v == b',');
+              let nonce = chunks
+                .next()
+                .and_then(|v| v.strip_prefix(b"r="))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid nonce"))?;
+
+              let salt = chunks
+                .next()
+                .and_then(|v| v.strip_prefix(b"s="))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid salt"))?;
+
+              let iteration_count = chunks
+                .next()
+                .and_then(|v| v.strip_prefix(b"i="))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid iteration count"))?;
+
+              // SASLResponse
+              let len = 0;
+              self.stream.write_u8(b'p').await?;
+              self.stream.write_i32(len as i32).await?;
+              self.stream.write_all(message.as_bytes()).await?;
+              self.stream.flush().await?;
+
+              let body = match self.stream.read_u8().await? {
+                b'R' => {
+                  // AuthenticationSASLFinal (B)
+                  //   Byte1('R')
+                  //       Identifies the message as an authentication request.
+                  //   Int32
+                  //       Length of message contents in bytes, including self.
+                  //   Int32(12)
+                  //       Specifies that SASL authentication has completed.
+                  //   Byten
+                  //       SASL outcome "additional data", specific to the SASL mechanism being used.
+                  self.stream.read_i32().await?; // skip len
+                  self.stream.read_i32().await?; // skip 12
+                  let mut body = vec![0; 84];
+                  self.stream.read_exact(&mut body).await?;
+                  body
+                }
+                b'E' => {
+                  return Err(self.read_backend_error().await);
+                }
+                code => {
+                  panic!("Unexpected backend message: {:?}", char::from(code))
+                }
+              };
+
               return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "AuthenticationSASL is not supported",
@@ -212,14 +378,14 @@ impl Connection {
             code => panic!("Unexpected backend authentication code {:?}", code),
           }
         }
-        b'E' => {
-          return Err(self.read_backend_error().await);
-        }
+        b'E' => return Err(self.read_backend_error().await),
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
         }
       }
     }
+
+    self.metadata.clear();
 
     loop {
       match self.stream.read_u8().await? {
@@ -235,8 +401,8 @@ impl Connection {
           //         The secret key of this backend.
 
           self.stream.read_i32().await?; // skip len
-          let id = self.stream.read_i32().await?;
-          let secret_key = self.stream.read_i32().await?;
+          self.pid.replace(self.stream.read_i32().await?);
+          self.secret_key.replace(self.stream.read_i32().await?);
         }
         b'S' => {
           // ParameterStatus (B)
@@ -250,9 +416,9 @@ impl Connection {
           //         The current value of the parameter.
 
           self.stream.read_i32().await?; // skip len
-          let param_name = self.read_c_string().await?;
-          let param_value = self.read_c_string().await?;
-          eprintln!("{:?}: {:?}", param_name, param_value);
+          let key = self.read_c_string().await?;
+          let value = self.read_c_string().await?;
+          self.metadata.insert(key, value);
         }
         b'Z' => {
           self.read_ready_for_query().await?;
@@ -262,7 +428,7 @@ impl Connection {
           return Err(self.read_backend_error().await);
         }
         b'N' => {
-          self.read_backend_notice().await?;
+          self.read_backend_notice().await;
         }
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
@@ -273,7 +439,7 @@ impl Connection {
   }
 
   pub async fn ping(&mut self) -> io::Result<()> {
-    self.simple_query("SELECT 1").await.map(|_| ())
+    self.query_first("SELECT 1").await.map(|_| ())
   }
 
   pub async fn start_replication_stream(
@@ -323,9 +489,11 @@ impl Connection {
   async fn read_replication_event(&mut self) -> io::Result<ReplicationEvent> {
     loop {
       match self.stream.read_u8().await? {
-        b'E' => return Err(self.read_backend_error().await),
+        b'E' => {
+          return Err(self.read_backend_error().await);
+        }
         b'N' => {
-          self.read_backend_notice().await?;
+          self.read_backend_notice().await;
         }
         b'd' => {
           let len = self.stream.read_i32().await?;
@@ -392,13 +560,12 @@ impl Connection {
   }
 
   pub async fn create_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<CreateReplicationSlot> {
-    let mut values = self
-      .simple_query(format!("CREATE_REPLICATION_SLOT {} LOGICAL wal2json", slot.as_ref()))
-      .await
-      .map(|mut v| {
-        v.values.reverse();
-        v.values
-      })?;
+    let result = self
+      .query_first(format!("CREATE_REPLICATION_SLOT {} LOGICAL wal2json", slot.as_ref()))
+      .await?;
+
+    let mut values = result.as_selected_query_result().unwrap().values;
+    values.reverse();
 
     let slot_name = values.pop().unwrap().unwrap();
     let consistent_point = values.pop().unwrap().unwrap().parse().unwrap();
@@ -414,27 +581,25 @@ impl Connection {
   }
 
   pub async fn delete_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<()> {
-    self
-      .simple_query(format!("DROP_REPLICATION_SLOT {}", slot.as_ref()))
-      .await
-      .map(|_| ())
+    let result = self.query(format!("DROP_REPLICATION_SLOT {}", slot.as_ref())).await?;
+    Ok(())
   }
 
   pub async fn replication_slot_exists(&mut self, slot: impl AsRef<str>) -> io::Result<bool> {
-    self
-      .simple_query(format!(
+    let result = self
+      .query_first(format!(
         "select * from pg_replication_slots where slot_name = '{}';",
         slot.as_ref()
       ))
-      .await
-      .map(|result| !result.values.is_empty())
+      .await?;
+    Ok(!result.as_selected_query_result().unwrap().values.is_empty())
   }
 
   pub async fn identify_system(&mut self) -> io::Result<IdentifySystem> {
-    let mut values = self.simple_query("IDENTIFY_SYSTEM").await.map(|mut v| {
-      v.values.reverse();
-      v.values
-    })?;
+    let result = self.query_first("IDENTIFY_SYSTEM").await?;
+
+    let mut values = result.as_selected_query_result().unwrap().values;
+    values.reverse();
 
     let systemid = values.pop().unwrap().unwrap();
     let timeline = values.pop().unwrap().unwrap().parse().unwrap();
@@ -449,25 +614,37 @@ impl Connection {
     })
   }
 
-  pub async fn timeline_history(&mut self, tid: i32) -> io::Result<SimpleQueryResult> {
-    self.simple_query(format!("TIMELINE_HISTORY {}", tid)).await
+  pub async fn timeline_history(&mut self, tid: i32) -> io::Result<SelectQueryResult> {
+    let result = self.query_first(format!("TIMELINE_HISTORY {}", tid)).await?;
+    Ok(result.as_selected_query_result().unwrap())
   }
 
-  async fn write_query_command(&mut self, command: impl AsRef<str>) -> io::Result<()> {
-    let len = command.as_ref().as_bytes().len() + 1 + 4;
+  async fn write_query_command(&mut self, query: impl AsRef<str>) -> io::Result<()> {
+    let len = query.as_ref().as_bytes().len() + 1 + 4;
     self.stream.write_u8(b'Q').await?;
     self.stream.write_i32(len as i32).await?;
-    self.stream.write_all(command.as_ref().as_bytes()).await?;
+    self.stream.write_all(query.as_ref().as_bytes()).await?;
     self.stream.write_u8(0).await?;
     self.stream.flush().await?;
     Ok(())
   }
 
-  pub async fn simple_query(&mut self, command: impl AsRef<str>) -> io::Result<SimpleQueryResult> {
-    self.write_query_command(command).await?;
+  pub async fn query_first(&mut self, query: impl AsRef<str>) -> io::Result<QueryResult> {
+    let mut results = self.query(query.as_ref()).await?;
+    results
+      .results
+      .pop_front()
+      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing query result"))
+  }
 
-    let mut columns: Vec<SimpleColumn> = Vec::new();
-    let mut values: Vec<SimpleRowValue> = Vec::new();
+  pub async fn query(&mut self, query: impl AsRef<str>) -> io::Result<QueryResults> {
+    self.write_query_command(query).await?;
+
+    // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.6.7.4
+
+    let mut notices: VecDeque<io::Error> = VecDeque::new();
+    let mut results: VecDeque<QueryResult> = VecDeque::new();
+    let mut current: Option<SelectQueryResult> = None;
 
     loop {
       match self.stream.read_u8().await? {
@@ -487,7 +664,11 @@ impl Connection {
           //         For a FETCH command, the tag is FETCH rows where rows is the number of rows that have been retrieved from the cursor.
           //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
           self.stream.read_i32().await?; // skip len
-          let command_tag = self.read_c_string().await?;
+          let op = self.read_c_string().await?;
+          match current.take() {
+            Some(select_query_result) => results.push_back(QueryResult::Selected(select_query_result)),
+            None => results.push_back(QueryResult::Success),
+          }
         }
         b'G' => {
           // CopyInResponse (B)
@@ -501,12 +682,7 @@ impl Connection {
           //         The number of columns in the data to be copied (denoted N below).
           //     Int16[N]
           //         The format codes to be used for each column. Each must presently be zero (text) or one (binary). All must be zero if the overall copy format is textual.
-          self.stream.read_i32().await?; // skip len
-          let format = self.stream.read_i8().await?;
-          let num_columns = self.stream.read_i16().await?;
-          for i in 0..num_columns {
-            self.stream.read_i16().await?;
-          }
+          todo!("copy in not supported")
         }
         b'H' => {
           // CopyOutResponse (B)
@@ -520,12 +696,7 @@ impl Connection {
           //         The number of columns in the data to be copied (denoted N below).
           //     Int16[N]
           //         The format codes to be used for each column. Each must presently be zero (text) or one (binary). All must be zero if the overall copy format is textual.
-          self.stream.read_i32().await?; // skip len
-          let format = self.stream.read_i8().await?;
-          let num_columns = self.stream.read_i16().await?;
-          for i in 0..num_columns {
-            self.stream.read_i16().await?;
-          }
+          todo!("copy out not supported")
         }
         b'T' => {
           // RowDescription (B)
@@ -551,6 +722,7 @@ impl Connection {
           //     Int16
           //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
           self.stream.read_i32().await?; // skip len
+          let mut columns = Vec::new();
           let num_columns = self.stream.read_i16().await?;
           for i in 0..num_columns {
             let name = self.read_c_string().await?;
@@ -561,7 +733,7 @@ impl Connection {
             let type_modifier = self.stream.read_i32().await?;
             let format = self.stream.read_i16().await?;
 
-            columns.push(SimpleColumn {
+            columns.push(Column {
               name,
               oid,
               attr_number,
@@ -571,6 +743,10 @@ impl Connection {
               format,
             });
           }
+          current = Some(SelectQueryResult {
+            columns,
+            values: Vec::new(),
+          });
         }
         b'D' => {
           // DataRow (B)
@@ -585,8 +761,9 @@ impl Connection {
           //         The length of the column value, in bytes (this count does not include itself). Can be zero. As a special case, -1 indicates a NULL column value. No value bytes follow in the NULL case.
           //     Byten
           //         The value of the column, in the format indicated by the associated format code. n is the above length.
-
           self.stream.read_i32().await?; // skip len
+
+          let values = &mut current.as_mut().unwrap().values;
           let num_values = self.stream.read_i16().await?;
           for i in 0..num_values {
             let len = self.stream.read_i32().await?;
@@ -609,25 +786,27 @@ impl Connection {
           //     Int32(4)
           //         Length of message contents in bytes, including self.
           self.stream.read_i32().await?;
-          break;
+          results.push_back(QueryResult::Success);
         }
         b'Z' => {
           self.read_ready_for_query().await?;
           break;
         }
-        b'E' => {
-          return Err(self.read_backend_error().await);
-        }
-        b'N' => {
-          self.read_backend_notice().await?;
-        }
+        b'E' => match self.read_backend_error().await {
+          err if err.kind() == io::ErrorKind::Other => results.push_back(QueryResult::BackendError(err)),
+          err => return Err(err),
+        },
+        b'N' => match self.read_backend_notice().await {
+          notice if notice.kind() == io::ErrorKind::Other => notices.push_back(notice),
+          notice => return Err(notice),
+        },
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
         }
       }
     }
 
-    Ok(SimpleQueryResult { columns, values })
+    Ok(QueryResults { notices, results })
   }
 
   async fn read_ready_for_query(&mut self) -> io::Result<()> {
@@ -640,35 +819,6 @@ impl Connection {
     //         Current backend transaction status indicator. Possible values are 'I' if idle (not in a transaction block); 'T' if in a transaction block; or 'E' if in a failed transaction block (queries will be rejected until block is ended).
     self.stream.read_i32().await?; // skip len
     let status = self.stream.read_u8().await?;
-    Ok(())
-  }
-
-  async fn read_backend_notice(&mut self) -> io::Result<()> {
-    // https://www.postgresql.org/docs/11/protocol-error-fields.html
-    // NoticeResponse (B)
-    //     Byte1('N')
-    //         Identifies the message as a notice.
-    //     Int32
-    //         Length of message contents in bytes, including self.
-    //     The message body consists of one or more identified fields, followed by a zero byte as a terminator. Fields can appear in any order. For each field there is the following:
-    //     Byte1
-    //         A code identifying the field type; if zero, this is the message terminator and no string follows. The presently defined field types are listed in Section 53.8. Since more field types might be added in future, frontends should silently ignore fields of unrecognized type.
-    //     String
-    //         The field value.
-
-    let fields = self.read_fields().await?;
-    if self.options.handle_notices_as_errors {
-      if fields.is_empty() {
-        return Err(io::Error::new(
-          io::ErrorKind::InvalidData,
-          "missing notice fields from server",
-        ));
-      }
-      return Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!("Server notice {}: {}", fields[&'C'], fields[&'M']),
-      ));
-    }
     Ok(())
   }
 
@@ -685,16 +835,33 @@ impl Connection {
     //     String
     //         The field value.
     match self.read_fields().await {
-      Ok(fields) => {
-        if fields.is_empty() {
-          return io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server");
-        }
+      Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
+      Ok(fields) => io::Error::new(
+        io::ErrorKind::Other,
+        format!("Server error {}: {}", fields[&'C'], fields[&'M']),
+      ),
+      Err(err) => err,
+    }
+  }
 
-        io::Error::new(
-          io::ErrorKind::Other,
-          format!("Server error {}: {}", fields[&'C'], fields[&'M']),
-        )
-      }
+  async fn read_backend_notice(&mut self) -> io::Error {
+    // https://www.postgresql.org/docs/11/protocol-error-fields.html
+    // NoticeResponse (B)
+    //     Byte1('N')
+    //         Identifies the message as a notice.
+    //     Int32
+    //         Length of message contents in bytes, including self.
+    //     The message body consists of one or more identified fields, followed by a zero byte as a terminator. Fields can appear in any order. For each field there is the following:
+    //     Byte1
+    //         A code identifying the field type; if zero, this is the message terminator and no string follows. The presently defined field types are listed in Section 53.8. Since more field types might be added in future, frontends should silently ignore fields of unrecognized type.
+    //     String
+    //         The field value.
+    match self.read_fields().await {
+      Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
+      Ok(fields) => io::Error::new(
+        io::ErrorKind::Other,
+        format!("Server notice {}: {}", fields[&'C'], fields[&'M']),
+      ),
       Err(err) => err,
     }
   }
@@ -736,7 +903,24 @@ impl Connection {
 }
 
 #[derive(Debug)]
-pub struct SimpleColumn {
+pub struct CancelHandle {
+  stream: BufStream<TcpStream>,
+  pid: i32,
+  secret_key: i32,
+}
+
+impl CancelHandle {
+  pub async fn cancel(mut self) -> io::Result<()> {
+    self.stream.write_i32(16).await?;
+    self.stream.write_i32(80877102).await?;
+    self.stream.write_i32(self.pid).await?;
+    self.stream.write_i32(self.secret_key).await?;
+    self.stream.flush().await
+  }
+}
+
+#[derive(Debug)]
+pub struct Column {
   name: String,
   oid: i32,
   attr_number: i16,
@@ -746,27 +930,75 @@ pub struct SimpleColumn {
   format: i16,
 }
 
-pub type SimpleRowValue = Option<String>;
+pub type RowValue = Option<String>;
 
 #[derive(Debug)]
-pub struct SimpleQueryResult {
-  columns: Vec<SimpleColumn>,
-  values: Vec<SimpleRowValue>,
+pub struct QueryResults {
+  pub notices: VecDeque<io::Error>,
+  pub results: VecDeque<QueryResult>,
 }
 
-impl SimpleQueryResult {
+#[derive(Debug)]
+pub enum QueryResult {
+  Success,
+  RowsAffected(usize),
+  Selected(SelectQueryResult),
+  BackendError(io::Error),
+}
+
+impl QueryResult {
+  pub fn is_successful(self) -> bool {
+    match self {
+      Self::Success => true,
+      _ => false,
+    }
+  }
+
+  pub fn rows_affected(self) -> Option<usize> {
+    match self {
+      Self::RowsAffected(n) => Some(n),
+      _ => None,
+    }
+  }
+
+  pub fn as_selected_query_result(self) -> Option<SelectQueryResult> {
+    match self {
+      Self::Selected(v) => Some(v),
+      _ => None,
+    }
+  }
+
+  pub fn as_backend_error(self) -> Option<io::Error> {
+    match self {
+      Self::BackendError(v) => Some(v),
+      _ => None,
+    }
+  }
+}
+
+#[derive(Debug, Default)]
+pub struct SelectQueryResult {
+  columns: Vec<Column>,
+  values: Vec<RowValue>,
+}
+
+impl SelectQueryResult {
+  pub fn columns(&self) -> &[Column] {
+    &self.columns
+  }
+
   pub fn columns_len(&self) -> usize {
     self.columns.len()
   }
 
-  pub fn row(&self, i: usize) -> &[SimpleRowValue] {
+  pub fn row(&self, i: usize) -> &[RowValue] {
     let len = self.columns.len();
     let start = i * len;
     let end = start + len;
     &self.values[start..end]
   }
 
-  pub fn row_mut(&mut self, i: usize) -> &mut [SimpleRowValue] {
+  pub fn row_mut(&mut self, i: usize) -> &mut [RowValue] {
     let len = self.columns.len();
     let start = i * len;
     let end = start + len;
@@ -781,7 +1013,7 @@ impl SimpleQueryResult {
     }
   }
 
-  pub fn rows(&self) -> Option<ChunksExact<'_, SimpleRowValue>> {
+  pub fn rows(&self) -> Option<ChunksExact<'_, RowValue>> {
     if !self.columns.is_empty() {
       Some(self.values.chunks_exact(self.columns.len()))
     } else {
@@ -789,7 +1021,7 @@ impl SimpleQueryResult {
     }
   }
 
-  pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, SimpleRowValue>> {
+  pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, RowValue>> {
     if !self.columns.is_empty() {
       Some(self.values.chunks_exact_mut(self.columns.len()))
     } else {

@@ -753,20 +753,26 @@ impl ServerError {
 /// Owned results for 0..N rows.
 #[derive(Debug, Default)]
 pub struct QueryResults {
-  pub columns: Vec<Column>,
-  pub values: Vec<RowValue>,
+  columns: Vec<Column>,
+  values: Vec<RowValue>,
 }
 
 impl QueryResults {
+  pub fn columns_len(&self) -> usize {
+    self.columns.len()
+  }
+
   pub fn row(&self, i: usize) -> &[RowValue] {
-    let start = i * self.columns.len();
-    let end = start + self.columns.len();
+    let len = self.columns.len();
+    let start = i * len;
+    let end = start + len;
     &self.values[start..end]
   }
 
   pub fn row_mut(&mut self, i: usize) -> &mut [RowValue] {
-    let start = i * self.columns.len();
-    let end = start + self.columns.len();
+    let len = self.columns.len();
+    let start = i * len;
+    let end = start + len;
     &mut self.values[start..end]
   }
 

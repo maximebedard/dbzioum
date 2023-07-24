@@ -1,21 +1,80 @@
 use dbzioum::pg::{Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem, ReplicationEvent};
-use std::{env, io, time::Duration};
+use std::time::Duration;
 
 #[tokio::test]
-async fn test_ping() {
-  let mut conn = setup_connection().await.unwrap();
+async fn test_ping_postgres_user() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   assert!(conn.ping().await.is_ok());
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
+async fn test_ping_md5_user() {
+  let mut conn = Connection::connect(ConnectionOptions {
+    user: "md5_user".to_string(),
+    ..default_connection_options()
+  })
+  .await
+  .unwrap();
+  assert!(conn.ping().await.is_ok());
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ping_scram_user() {
+  let mut conn = Connection::connect(ConnectionOptions {
+    user: "scram_user".to_string(),
+    ..default_connection_options()
+  })
+  .await
+  .unwrap();
+  assert!(conn.ping().await.is_ok());
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ping_pass_user() {
+  let mut conn = Connection::connect(ConnectionOptions {
+    user: "pass_user".to_string(),
+    ..default_connection_options()
+  })
+  .await
+  .unwrap();
+  assert!(conn.ping().await.is_ok());
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_password_encryption_sanity_check() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let result = conn
+    .query_first("SHOW PASSWORD_ENCRYPTION;")
+    .await
+    .unwrap()
+    .as_selected_query_result()
+    .unwrap();
+
+  assert_eq!(
+    result.row(0).first().unwrap().as_ref().map(String::as_str),
+    Some("scram-sha-256")
+  );
+  conn.close().await.unwrap()
+}
+
+#[tokio::test]
 async fn test_connection_server_info() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
 
   let IdentifySystem { dbname, .. } = conn.identify_system().await.unwrap();
-  assert_eq!(dbname, env::var("POSTGRES_DATABASE").ok());
+  assert_eq!(dbname, Some("test".to_string()));
 
-  let result = conn.simple_query("SHOW SERVER_VERSION").await.unwrap();
+  let result = conn
+    .query_first("SHOW SERVER_VERSION;")
+    .await
+    .unwrap()
+    .as_selected_query_result()
+    .unwrap();
+
   assert_eq!(
     result.row(0).first().unwrap().as_ref().map(String::as_str),
     Some("14.7 (Debian 14.7-1.pgdg110+1)")
@@ -26,25 +85,130 @@ async fn test_connection_server_info() {
 
 #[tokio::test]
 async fn test_query() {
-  let mut conn = setup_connection().await.unwrap();
-  let results = conn.simple_query("SELECT 1,2,3 UNION ALL SELECT 4,5,6").await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let results = conn
+    .query_first("SELECT 1,2,3 UNION ALL SELECT 4,5,6;")
+    .await
+    .unwrap()
+    .as_selected_query_result()
+    .unwrap();
+
   assert_eq!(results.columns_len(), 3);
   assert_eq!(results.rows_len(), 2);
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn test_noop_query() {
-  let mut conn = setup_connection().await.unwrap();
-  let results = conn.simple_query(";").await.unwrap();
-  assert_eq!(results.columns_len(), 0);
-  assert_eq!(results.rows_len(), 0);
+async fn test_empty_query() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut results = conn.query(";").await.unwrap();
+
+  assert!(results.results.pop_front().unwrap().is_successful());
+  assert!(conn.query_first(";").await.unwrap().is_successful());
+
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_error_query() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  assert_eq!(
+    "Server error 22012: division by zero",
+    conn
+      .query("SELECT 1/0;")
+      .await
+      .unwrap()
+      .results
+      .pop_front()
+      .unwrap()
+      .as_backend_error()
+      .unwrap()
+      .to_string(),
+  );
+  assert_eq!(
+    "Server error 22012: division by zero",
+    conn
+      .query_first("SELECT 1/0;")
+      .await
+      .unwrap()
+      .as_backend_error()
+      .unwrap()
+      .to_string()
+  );
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multiple_queries() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut results = conn.query("SELECT 1; SELECT 2, 3;").await.unwrap();
+
+  let result = results.results.pop_front().unwrap().as_selected_query_result().unwrap();
+  assert_eq!(1, result.columns_len());
+  assert_eq!(1, result.rows_len());
+
+  let result = results.results.pop_front().unwrap().as_selected_query_result().unwrap();
+  assert_eq!(2, result.columns_len());
+  assert_eq!(1, result.rows_len());
+
+  assert!(results.results.is_empty());
+
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multiple_queries_interleaved_with_errors() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut results = conn.query("SELECT 1; SELECT 1/0; SELECT 2;").await.unwrap();
+
+  let result = results.results.pop_front().unwrap().as_selected_query_result().unwrap();
+  assert_eq!(1, result.columns_len());
+  assert_eq!(1, result.rows_len());
+
+  let result = results.results.pop_front().unwrap().as_backend_error().unwrap();
+  assert_eq!("Server error 22012: division by zero", result.to_string());
+
+  assert!(results.results.is_empty());
+
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multiple_transactions() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  conn
+    .query_first("CREATE TABLE IF NOT EXISTS Test (i int);")
+    .await
+    .unwrap();
+
+  let mut results = conn
+    .query(
+      r#"
+  BEGIN;
+  INSERT INTO Test VALUES(1);
+  COMMIT;
+  INSERT INTO Test VALUES(2);
+  SELECT 1/0;
+"#,
+    )
+    .await
+    .unwrap();
+
+  println!("{:?}", results);
+
+  let result = results.results.pop_front().unwrap().as_selected_query_result().unwrap();
+  assert_eq!(result.columns_len(), 1);
+  assert_eq!(result.rows_len(), 1);
+
+  let result = results.results.pop_front().unwrap().as_backend_error().unwrap();
+  assert_eq!("", result.to_string());
+
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn test_connection_replication() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   if conn.replication_slot_exists("foo").await.unwrap() {
     conn.delete_replication_slot("foo").await.unwrap();
     assert!(!conn.replication_slot_exists("foo").await.unwrap());
@@ -60,8 +224,29 @@ async fn test_connection_replication() {
 }
 
 #[tokio::test]
+async fn test_query_cancellation() {
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let cancel_handle = conn.cancel_handle().await.unwrap();
+  tokio::task::spawn(async move {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel_handle.cancel().await.unwrap();
+  });
+
+  assert_eq!(
+    "Server error 57014: canceling statement due to user request",
+    conn
+      .query_first("SELECT pg_sleep(1000);")
+      .await
+      .unwrap()
+      .as_backend_error()
+      .unwrap()
+      .to_string()
+  );
+}
+
+#[tokio::test]
 async fn test_connection_replication_inserts() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
 
   if conn.replication_slot_exists("bar").await.unwrap() {
     conn.delete_replication_slot("bar").await.unwrap();
@@ -83,21 +268,21 @@ async fn test_connection_replication_inserts() {
     .await
     .unwrap();
 
-  match conn.simple_query("DROP TABLE Users;").await {
+  match conn.query("DROP TABLE Users;").await {
     Err(err) if err.to_string().contains("table \"users\" does not exist") => {}
     Err(err) => panic!("{}", err),
     Ok(_) => {}
   }
   conn
-    .simple_query("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+    .query_first("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
     .await
     .unwrap();
-  conn.simple_query("TRUNCATE Users;").await.unwrap();
-  conn.simple_query("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
-  conn.simple_query("INSERT INTO Users VALUES (2, 'yan');").await.unwrap();
-  conn.simple_query("DELETE FROM Users WHERE id = 2;").await.unwrap();
+  conn.query_first("TRUNCATE Users;").await.unwrap();
+  conn.query_first("INSERT INTO Users VALUES (1, 'bob');").await.unwrap();
+  conn.query_first("INSERT INTO Users VALUES (2, 'yan');").await.unwrap();
+  conn.query_first("DELETE FROM Users WHERE id = 2;").await.unwrap();
   conn
-    .simple_query("UPDATE Users SET name = 'chad' WHERE id = 1;")
+    .query_first("UPDATE Users SET name = 'chad' WHERE id = 1;")
     .await
     .unwrap();
 
@@ -140,16 +325,10 @@ async fn test_connection_replication_inserts() {
   tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
 
-async fn setup_connection() -> io::Result<Connection> {
-  Connection::connect(ConnectionOptions {
-    addr: env::var("POSTGRES_ADDR")
-      .unwrap_or_else(|_| "[::]:5432".to_string())
-      .parse()
-      .unwrap(),
-    user: env::var("POSTGRES_USER").unwrap_or_else(|_| "postgres".to_string()),
-    password: env::var("POSTGRES_PASSWORD").ok(),
-    database: env::var("POSTGRES_DATABASE").ok(),
+fn default_connection_options() -> ConnectionOptions {
+  ConnectionOptions {
+    password: Some("password".to_string()),
+    database: Some("test".to_string()),
     ..Default::default()
-  })
-  .await
+  }
 }

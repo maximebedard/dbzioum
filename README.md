@@ -11,9 +11,11 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
 - [ ] simple postgresql client (> v11)
   - [ ] auth
     - [x] password
-    - [ ] scram-sha-256
-    - [ ] ssl
+    - [x] deprecated md5
+    - [ ] (WIP) scram-sha-256
+    - [ ] (WIP) ssl
   - [x] simple query support
+  - [x] query cancellation support
   - [x] create/exists/delete replication slot
   - [ ] create replication stream using replication slot
     - [x] read wal2json v2 events

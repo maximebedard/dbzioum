@@ -8,15 +8,11 @@ services:
     restart: "always"
     ports:
       - "5432:5432"
+    volumes:
+      - ./scripts/pg/pg_setup.sh:/docker-entrypoint-initdb.d/pg_setup.sh
     environment:
-      POSTGRES_USER: "postgres"
-      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_PASSWORD: "password"
       POSTGRES_DB: "test"
-      POSTGRES_HOST_AUTH_METHOD: "password"
-    command:
-      - "postgres"
-      - "-c"
-      - "wal_level=logical"
 
   mysql:
     image: "mysql:8"

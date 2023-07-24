@@ -1,19 +1,20 @@
-use dbzioum::mysql::{binlog::BinlogEvent, Connection, ConnectionOptions};
 use std::{env, io};
+
+use dbzioum::mysql::{binlog::BinlogEvent, Connection, ConnectionOptions};
 
 #[tokio::test]
 async fn test_ping() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   assert!(conn.ping().await.is_ok());
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn test_connection_server_info() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   let results = conn.query("SELECT version()").await.unwrap();
   assert_eq!(
-    results.values.last().unwrap().as_ref().map(String::as_str),
+    results.row(0).last().unwrap().as_ref().map(String::as_str),
     Some("8.0.32")
   );
   conn.close().await.unwrap();
@@ -21,28 +22,25 @@ async fn test_connection_server_info() {
 
 #[tokio::test]
 async fn test_query() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   let results = conn.query("SELECT 1,2,NULL UNION ALL SELECT 4,5,6").await.unwrap();
-  assert_eq!(results.columns.len(), 3);
-  assert_eq!(results.values.len(), 6);
+  assert_eq!(results.columns_len(), 3);
   assert_eq!(results.rows_len(), 2);
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn test_noop_query() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   let results = conn.query("DO NULL").await.unwrap();
-  assert_eq!(results.columns.len(), 0);
-  assert_eq!(results.values.len(), 0);
+  assert_eq!(results.columns_len(), 0);
   assert_eq!(results.rows_len(), 0);
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
-
 async fn test_binlog_inserts() {
-  let mut conn = setup_connection().await.unwrap();
+  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
   let binlog_cursor = conn.binlog_cursor().await.unwrap();
   let mut commited = binlog_cursor.clone();
 
@@ -170,8 +168,8 @@ async fn test_binlog_inserts() {
   tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
 
-async fn setup_connection() -> io::Result<Connection> {
-  Connection::connect(ConnectionOptions {
+fn default_connection_options() -> ConnectionOptions {
+  ConnectionOptions {
     addr: env::var("MYSQL_ADDR")
       .unwrap_or_else(|_| "[::]:3306".to_string())
       .parse()
@@ -180,6 +178,5 @@ async fn setup_connection() -> io::Result<Connection> {
     password: env::var("MYSQL_PASSWORD").ok(),
     database: env::var("MYSQL_DATABASE").ok(),
     ..Default::default()
-  })
-  .await
+  }
 }
