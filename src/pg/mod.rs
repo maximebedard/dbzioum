@@ -184,9 +184,11 @@ impl Connection {
 
   async fn authenticate(&mut self) -> io::Result<()> {
     loop {
-      match self.stream.read_u8().await? {
+      let op = self.stream.read_u8().await?;
+      let _len = self.stream.read_i32().await?;
+
+      match op {
         b'R' => {
-          self.stream.read_i32().await?; // skip len
           match self.stream.read_i32().await? {
             0 => break,
             2 => {
@@ -294,7 +296,10 @@ impl Connection {
               self.stream.write_all(client_first_message.as_bytes()).await?;
               self.stream.flush().await?;
 
-              let server_first_message = match self.stream.read_u8().await? {
+              let op = self.stream.read_u8().await?;
+              let len = self.stream.read_i32().await?;
+
+              let server_first_message = match op {
                 b'R' => {
                   // AuthenticationSASLContinue (B)
                   //   Byte1('R')
@@ -305,7 +310,6 @@ impl Connection {
                   //       Specifies that this message contains a SASL challenge.
                   //   Byten
                   //       SASL data, specific to the SASL mechanism being used.
-                  let len = self.stream.read_i32().await?; // skip len
                   self.stream.read_i32().await?; // skip 11
                   let mut body = vec![0; (len - 8) as usize];
                   self.stream.read_exact(&mut body).await?;
@@ -411,7 +415,9 @@ impl Connection {
               self.stream.write_all(client_final_message.as_bytes()).await?;
               self.stream.flush().await?;
 
-              let body = match self.stream.read_u8().await? {
+              let op = self.stream.read_u8().await?;
+              let len = self.stream.read_i32().await?;
+              let body = match op {
                 b'R' => {
                   // AuthenticationSASLFinal (B)
                   //   Byte1('R')
@@ -422,7 +428,6 @@ impl Connection {
                   //       Specifies that SASL authentication has completed.
                   //   Byten
                   //       SASL outcome "additional data", specific to the SASL mechanism being used.
-                  let len = self.stream.read_i32().await?;
                   self.stream.read_i32().await?; // skip 12
                   let mut body = vec![0; (len - 8) as usize];
                   self.stream.read_exact(&mut body).await?;
@@ -474,7 +479,9 @@ impl Connection {
     self.metadata.clear();
 
     loop {
-      match self.stream.read_u8().await? {
+      let op = self.stream.read_u8().await?;
+      let _len = self.stream.read_i32().await?;
+      match op {
         b'K' => {
           // BackendKeyData (B)
           //     Byte1('K')
@@ -485,8 +492,6 @@ impl Connection {
           //         The process ID of this backend.
           //     Int32
           //         The secret key of this backend.
-
-          self.stream.read_i32().await?; // skip len
           self.pid.replace(self.stream.read_i32().await?);
           self.secret_key.replace(self.stream.read_i32().await?);
         }
@@ -500,8 +505,6 @@ impl Connection {
           //         The name of the run-time parameter being reported.
           //     String
           //         The current value of the parameter.
-
-          self.stream.read_i32().await?; // skip len
           let key = self.read_c_string().await?;
           let value = self.read_c_string().await?;
           self.metadata.insert(key, value);
@@ -545,12 +548,13 @@ impl Connection {
     // After streaming all the WAL on a timeline that is not the latest one, the server will end streaming by exiting the COPY mode. When the client acknowledges this by also exiting COPY mode, the server sends a result set with one row and two columns, indicating the next timeline in this server's history. The first column is the next timeline's ID (type int8), and the second column is the WAL location where the switch happened (type text). Usually, the switch position is the end of the WAL that was streamed, but there are corner cases where the server can send some WAL from the old timeline that it has not itself replayed before promoting. Finally, the server sends two CommandComplete messages (one that ends the CopyData and the other ends the START_REPLICATION itself), and is ready to accept a new command.
     // WAL data is sent as a series of CopyData messages. (This allows other information to be intermixed; in particular the server can send an ErrorResponse message if it encounters a failure after beginning to stream.) The payload of each CopyData message from server to the client contains a message of one of the following formats:
 
-    match self.stream.read_u8().await? {
+    let op = self.stream.read_u8().await?;
+    let _len = self.stream.read_i32().await?;
+    match op {
       b'E' => {
         return Err(self.read_backend_error().await);
       }
       b'W' => {
-        self.stream.read_i32().await?; // skip len
         let format = self.stream.read_i8().await?;
         let num_columns = self.stream.read_i16().await?;
         let mut column_formats = vec![0; num_columns.try_into().unwrap()];
@@ -574,7 +578,9 @@ impl Connection {
 
   async fn read_replication_event(&mut self) -> io::Result<ReplicationEvent> {
     loop {
-      match self.stream.read_u8().await? {
+      let op = self.stream.read_u8().await?;
+      let len = self.stream.read_i32().await?;
+      match op {
         b'E' => {
           return Err(self.read_backend_error().await);
         }
@@ -582,7 +588,6 @@ impl Connection {
           self.read_backend_notice().await;
         }
         b'd' => {
-          let len = self.stream.read_i32().await?;
           let len: usize = len.try_into().unwrap();
 
           match self.stream.read_u8().await? {
@@ -733,7 +738,9 @@ impl Connection {
     let mut current: Option<SelectQueryResult> = None;
 
     loop {
-      match self.stream.read_u8().await? {
+      let op = self.stream.read_u8().await?;
+      let _len = self.stream.read_i32().await?;
+      match op {
         b'C' => {
           // CommandComplete (B)
           //     Byte1('C')
@@ -749,7 +756,6 @@ impl Connection {
           //         For a MOVE command, the tag is MOVE rows where rows is the number of rows the cursor's position has been changed by.
           //         For a FETCH command, the tag is FETCH rows where rows is the number of rows that have been retrieved from the cursor.
           //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
-          self.stream.read_i32().await?; // skip len
           let op = self.read_c_string().await?;
           match current.take() {
             Some(select_query_result) => results.push_back(QueryResult::Selected(select_query_result)),
@@ -807,7 +813,6 @@ impl Connection {
           //         The type modifier (see pg_attribute.atttypmod). The meaning of the modifier is type-specific.
           //     Int16
           //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
-          self.stream.read_i32().await?; // skip len
           let mut columns = Vec::new();
           let num_columns = self.stream.read_i16().await?;
           for i in 0..num_columns {
@@ -847,8 +852,6 @@ impl Connection {
           //         The length of the column value, in bytes (this count does not include itself). Can be zero. As a special case, -1 indicates a NULL column value. No value bytes follow in the NULL case.
           //     Byten
           //         The value of the column, in the format indicated by the associated format code. n is the above length.
-          self.stream.read_i32().await?; // skip len
-
           let values = &mut current.as_mut().unwrap().values;
           let num_values = self.stream.read_i16().await?;
           for i in 0..num_values {
@@ -871,7 +874,6 @@ impl Connection {
           //         Identifies the message as a response to an empty query string. (This substitutes for CommandComplete.)
           //     Int32(4)
           //         Length of message contents in bytes, including self.
-          self.stream.read_i32().await?;
           results.push_back(QueryResult::Success);
         }
         b'Z' => {
@@ -903,7 +905,6 @@ impl Connection {
     //         Length of message contents in bytes, including self.
     //     Byte1
     //         Current backend transaction status indicator. Possible values are 'I' if idle (not in a transaction block); 'T' if in a transaction block; or 'E' if in a failed transaction block (queries will be rejected until block is ended).
-    self.stream.read_i32().await?; // skip len
     let status = self.stream.read_u8().await?;
     Ok(())
   }
@@ -953,8 +954,6 @@ impl Connection {
   }
 
   async fn read_fields(&mut self) -> io::Result<BTreeMap<char, String>> {
-    self.stream.read_i32().await?; // skip len
-
     let mut fields = BTreeMap::new();
     loop {
       match self.stream.read_u8().await? {
