@@ -242,14 +242,10 @@ async fn test_multiple_transactions() {
     .await
     .unwrap();
 
-  println!("{:?}", results);
+  assert_eq!(5, results.results.len());
 
-  let result = results.results.pop_front().unwrap().as_selected_query_result().unwrap();
-  assert_eq!(result.columns_len(), 1);
-  assert_eq!(result.rows_len(), 1);
-
-  let result = results.results.pop_front().unwrap().as_backend_error().unwrap();
-  assert_eq!("", result.to_string());
+  let result = results.results.pop_back().unwrap().as_backend_error().unwrap();
+  assert_eq!("Server error 22012: division by zero", result.to_string());
 
   conn.close().await.unwrap();
 }

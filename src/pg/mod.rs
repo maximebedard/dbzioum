@@ -282,7 +282,7 @@ impl Connection {
                 .collect::<String>();
 
               // Write SASLInitialResponse
-              let gs2_header = "n,,"; //"n,,"; // TODO: update this when supporting SCRAM-SHA-256-PLUS
+              let gs2_header = "n,,"; // TODO: update this when supporting SCRAM-SHA-256-PLUS
               let cbind_data = "";
               let client_first_message = format!("{}n=,r={}", gs2_header, client_nonce);
               let len = 4 + mechanism.len() + 1 + 4 + client_first_message.len();
@@ -326,7 +326,7 @@ impl Connection {
                 .and_then(|v| v.strip_prefix("r="))
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid nonce"))?;
 
-              let salt = chunks
+              let salt: Vec<u8> = chunks
                 .next()
                 .and_then(|v| v.strip_prefix("s="))
                 .and_then(|v| base64::decode(v).ok())
@@ -369,7 +369,7 @@ impl Connection {
                 .map(String::as_bytes)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "password is required"))?;
 
-              let salted_password = sasl_hi(&password, &salt, iteration_count);
+              let salted_password = sasl_hi(password, &salt, iteration_count);
 
               let client_key = Hmac::<Sha256>::new_from_slice(&salted_password)
                 .unwrap()
