@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::net::{SocketAddrV4, SocketAddrV6};
+use std::io;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::path::PathBuf;
 use std::slice::{ChunksExact, ChunksExactMut};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
-use std::{io, net::SocketAddr};
 
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
@@ -12,27 +13,21 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use sha2::digest::FixedOutput;
 use sha2::Sha256;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net;
-use tokio::{
-  io::{AsyncReadExt, AsyncWriteExt, BufStream},
-  net::TcpStream,
-};
 use url::Url;
 
-#[derive(Debug)]
-pub struct Connection {
-  stream: BufStream<TcpStream>,
-  options: ConnectionOptions,
-  pid: Option<i32>,
-  secret_key: Option<i32>,
-  metadata: BTreeMap<String, String>,
-}
+#[cfg(feature = "ssl")]
+pub use openssl;
+
+use self::stream::Stream;
+
+mod stream;
 
 #[derive(Debug, Clone)]
 pub struct ConnectionOptions {
-  pub addr: SocketAddr,
   pub user: String,
-  pub use_ssl: bool,
   pub password: Option<String>,
   pub database: Option<String>,
 }
@@ -40,57 +35,94 @@ pub struct ConnectionOptions {
 impl Default for ConnectionOptions {
   fn default() -> Self {
     Self {
-      addr: "[::]:5432".parse().unwrap(),
       user: "postgres".to_string(),
-      use_ssl: false,
       password: None,
       database: None,
     }
   }
 }
 
+async fn socket_addrs_from_url(url: &Url) -> io::Result<Vec<SocketAddr>> {
+  let port = url.port().unwrap_or(5432);
+  match url.host() {
+    Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
+      .await
+      .map(|v| v.collect::<Vec<_>>()),
+    Some(url::Host::Ipv4(ip)) => Ok(vec![SocketAddrV4::new(ip, port).into()]),
+    Some(url::Host::Ipv6(ip)) => Ok(vec![SocketAddrV6::new(ip, port, 0, 0).into()]),
+    None => Ok(vec![format!("[::]:{port}").parse().unwrap()]),
+  }
+}
+
 const PROTOCOL_VERSION: i32 = 196608;
-const SSL_HANDSHAKE_CODE: i32 = 80877103;
+
+#[derive(Debug)]
+pub struct Connection {
+  stream: Stream,
+  options: ConnectionOptions,
+  pid: Option<i32>,
+  secret_key: Option<i32>,
+  metadata: BTreeMap<String, String>,
+}
 
 impl Connection {
-  pub async fn connect_from_url(u: &Url) -> io::Result<Self> {
-    assert_eq!("tcp", u.scheme()); // only support tcp for now
-    let user = match u.username() {
+  pub async fn connect_from_url(url: &Url) -> io::Result<Self> {
+    let user = match url.username() {
       "" => "postgres".to_string(),
       user => user.to_string(),
     };
-    let password = u.password().map(|v| v.to_string());
+    let password = url.password().map(ToString::to_string);
 
-    let port = u.port().unwrap_or(5432);
-    let addr = match u.host() {
-      Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
-        .await
-        .and_then(|mut v| {
-          v.next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "unable to find host"))
-        })?,
-      Some(url::Host::Ipv4(ip)) => SocketAddrV4::new(ip, port).into(),
-      Some(url::Host::Ipv6(ip)) => SocketAddrV6::new(ip, port, 0, 0).into(),
-      None => format!("[::]:{port}").parse().unwrap(),
-    };
-
-    let query_pairs = u.query_pairs().collect::<BTreeMap<_, _>>();
+    let query_pairs = url.query_pairs().collect::<BTreeMap<_, _>>();
     let database = query_pairs.get("database").map(|v| v.to_string());
 
-    let opts = ConnectionOptions {
-      addr,
+    let options = ConnectionOptions {
       user,
       password,
       database,
       ..Default::default()
     };
-    Self::connect(opts).await
+
+    match url.scheme() {
+      "tcp" => {
+        let addrs = socket_addrs_from_url(url).await?;
+        Self::connect_tcp(addrs, options).await
+      }
+      "unix" => Self::connect_unix(url.path(), options).await,
+      scheme => Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not supported", scheme),
+      )),
+    }
   }
 
-  pub async fn connect(options: impl Into<ConnectionOptions>) -> io::Result<Self> {
-    let options = options.into();
-    let use_ssl = options.use_ssl;
-    let stream = TcpStream::connect(options.addr).await.map(BufStream::new)?;
+  pub async fn connect_tcp(addrs: impl Into<Vec<SocketAddr>>, options: ConnectionOptions) -> io::Result<Self> {
+    let stream = Stream::connect_tcp(addrs).await?;
+    Self::connect(stream, options).await
+  }
+
+  pub async fn connect_unix(path: impl Into<PathBuf>, options: ConnectionOptions) -> io::Result<Self> {
+    let stream = Stream::connect_unix(path).await?;
+    Self::connect(stream, options).await
+  }
+
+  #[cfg(feature = "ssl")]
+  pub async fn connect_ssl_from_url(url: &Url, ssl_connector: openssl::ssl::SslConnector) -> io::Result<Self> {
+    todo!()
+  }
+
+  #[cfg(feature = "ssl")]
+  pub async fn connect_ssl(
+    addrs: impl Into<Vec<SocketAddr>>,
+    domain: impl Into<String>,
+    options: ConnectionOptions,
+    ssl_connector: openssl::ssl::SslConnector,
+  ) -> io::Result<Self> {
+    let stream = Stream::connect_ssl(addrs, domain, ssl_connector).await?;
+    Self::connect(stream, options).await
+  }
+
+  async fn connect(stream: Stream, options: ConnectionOptions) -> io::Result<Self> {
     let mut connection = Self {
       stream,
       options,
@@ -98,21 +130,20 @@ impl Connection {
       secret_key: None,
       metadata: BTreeMap::new(),
     };
-    if use_ssl {
-      connection.ssl_handshake().await?;
-    }
     connection.startup().await?;
     Ok(connection)
   }
 
   pub async fn duplicate(&self) -> io::Result<Self> {
-    Self::connect(self.options.clone()).await
+    let stream = self.stream.duplicate().await?;
+    Self::connect(stream, self.options.clone()).await
   }
 
   pub async fn cancel_handle(&self) -> io::Result<CancelHandle> {
     match (self.pid, self.secret_key) {
       (Some(pid), Some(secret_key)) => {
-        let stream = TcpStream::connect(self.options.addr).await.map(BufStream::new)?;
+        let stream = self.stream.duplicate().await?;
+
         Ok(CancelHandle {
           stream,
           secret_key,
@@ -126,32 +157,12 @@ impl Connection {
     }
   }
 
-  async fn ssl_handshake(&mut self) -> io::Result<()> {
-    self.stream.write_i32(8).await?;
-    self.stream.write_i32(SSL_HANDSHAKE_CODE).await?;
-
-    match self.stream.read_u8().await? {
-      b'S' => {
-        // https://www.postgresql.org/docs/11/protocol-flow.html#id-1.10.5.7.11
-        todo!()
-      }
-      b'N' => {
-        // noop
-      }
-      code => {
-        panic!("Unexpected backend message: {:?}", char::from(code))
-      }
-    }
-
-    Ok(())
-  }
-
   // https://www.postgresql.org/docs/11/protocol.html
   async fn startup(&mut self) -> io::Result<()> {
     let mut params = Vec::new();
     params.push("user");
     params.push(self.options.user.as_str());
-    if let Some(ref database) = self.options.database {
+    if let Some(database) = self.options.database.as_ref() {
       params.push("database");
       params.push(database.as_str());
     }
@@ -989,7 +1000,7 @@ impl Connection {
 
 #[derive(Debug)]
 pub struct CancelHandle {
-  stream: BufStream<TcpStream>,
+  stream: Stream,
   pid: i32,
   secret_key: i32,
 }

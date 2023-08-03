@@ -1,4 +1,4 @@
-use std::{env, io};
+use std::env;
 
 use dbzioum::mysql::{binlog::BinlogEvent, Connection, ConnectionOptions};
 

@@ -1,19 +1,46 @@
-use dbzioum::pg::{Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem, ReplicationEvent};
-use std::time::Duration;
+use dbzioum::pg::{openssl, Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem, ReplicationEvent};
+use std::{net::SocketAddr, time::Duration};
 
 #[tokio::test]
 async fn test_ping_user_postgres() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
+  assert!(conn.ping().await.is_ok());
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "ssl")]
+async fn test_ping_user_ssl() {
+  let connector = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+    .unwrap()
+    .build();
+
+  let mut conn = Connection::connect_ssl(
+    default_addrs(),
+    "localhost",
+    ConnectionOptions {
+      user: "ssl_user".to_string(),
+      ..default_connection_options()
+    },
+    connector,
+  )
+  .await
+  .unwrap();
   assert!(conn.ping().await.is_ok());
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn test_ping_user_md5() {
-  let mut conn = Connection::connect(ConnectionOptions {
-    user: "md5_user".to_string(),
-    ..default_connection_options()
-  })
+  let mut conn = Connection::connect_tcp(
+    default_addrs(),
+    ConnectionOptions {
+      user: "md5_user".to_string(),
+      ..default_connection_options()
+    },
+  )
   .await
   .unwrap();
   assert!(conn.ping().await.is_ok());
@@ -22,11 +49,14 @@ async fn test_ping_user_md5() {
 
 #[tokio::test]
 async fn test_ping_user_md5_invalid_password() {
-  let err = Connection::connect(ConnectionOptions {
-    user: "md5_user".to_string(),
-    password: Some("invalid".to_string()),
-    ..default_connection_options()
-  })
+  let err = Connection::connect_tcp(
+    default_addrs(),
+    ConnectionOptions {
+      user: "md5_user".to_string(),
+      password: Some("invalid".to_string()),
+      ..default_connection_options()
+    },
+  )
   .await
   .unwrap_err();
 
@@ -38,10 +68,13 @@ async fn test_ping_user_md5_invalid_password() {
 
 #[tokio::test]
 async fn test_ping_user_scram() {
-  let mut conn = Connection::connect(ConnectionOptions {
-    user: "scram_user".to_string(),
-    ..default_connection_options()
-  })
+  let mut conn = Connection::connect_tcp(
+    default_addrs(),
+    ConnectionOptions {
+      user: "scram_user".to_string(),
+      ..default_connection_options()
+    },
+  )
   .await
   .unwrap();
   assert!(conn.ping().await.is_ok());
@@ -50,11 +83,14 @@ async fn test_ping_user_scram() {
 
 #[tokio::test]
 async fn test_ping_user_scram_invalid_password() {
-  let err = Connection::connect(ConnectionOptions {
-    user: "scram_user".to_string(),
-    password: Some("invalid".to_string()),
-    ..default_connection_options()
-  })
+  let err = Connection::connect_tcp(
+    default_addrs(),
+    ConnectionOptions {
+      user: "scram_user".to_string(),
+      password: Some("invalid".to_string()),
+      ..default_connection_options()
+    },
+  )
   .await
   .unwrap_err();
 
@@ -66,10 +102,13 @@ async fn test_ping_user_scram_invalid_password() {
 
 #[tokio::test]
 async fn test_ping_user_pass() {
-  let mut conn = Connection::connect(ConnectionOptions {
-    user: "pass_user".to_string(),
-    ..default_connection_options()
-  })
+  let mut conn = Connection::connect_tcp(
+    default_addrs(),
+    ConnectionOptions {
+      user: "pass_user".to_string(),
+      ..default_connection_options()
+    },
+  )
   .await
   .unwrap();
   assert!(conn.ping().await.is_ok());
@@ -78,11 +117,14 @@ async fn test_ping_user_pass() {
 
 #[tokio::test]
 async fn test_ping_user_pass_invalid_password() {
-  let err = Connection::connect(ConnectionOptions {
-    user: "pass_user".to_string(),
-    password: Some("invalid".to_string()),
-    ..default_connection_options()
-  })
+  let err = Connection::connect_tcp(
+    default_addrs(),
+    ConnectionOptions {
+      user: "pass_user".to_string(),
+      password: Some("invalid".to_string()),
+      ..default_connection_options()
+    },
+  )
   .await
   .unwrap_err();
 
@@ -94,7 +136,9 @@ async fn test_ping_user_pass_invalid_password() {
 
 #[tokio::test]
 async fn test_password_encryption_sanity_check() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let result = conn
     .query_first("SHOW PASSWORD_ENCRYPTION;")
     .await
@@ -111,7 +155,9 @@ async fn test_password_encryption_sanity_check() {
 
 #[tokio::test]
 async fn test_connection_server_info() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
 
   let IdentifySystem { dbname, .. } = conn.identify_system().await.unwrap();
   assert_eq!(dbname, Some("test".to_string()));
@@ -133,7 +179,9 @@ async fn test_connection_server_info() {
 
 #[tokio::test]
 async fn test_query() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let results = conn
     .query_first("SELECT 1,2,3 UNION ALL SELECT 4,5,6;")
     .await
@@ -148,7 +196,9 @@ async fn test_query() {
 
 #[tokio::test]
 async fn test_empty_query() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let mut results = conn.query(";").await.unwrap();
 
   assert!(results.results.pop_front().unwrap().is_successful());
@@ -159,7 +209,9 @@ async fn test_empty_query() {
 
 #[tokio::test]
 async fn test_error_query() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   assert_eq!(
     "Server error 22012: division by zero",
     conn
@@ -188,7 +240,9 @@ async fn test_error_query() {
 
 #[tokio::test]
 async fn test_multiple_queries() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let mut results = conn.query("SELECT 1; SELECT 2, 3;").await.unwrap();
 
   let result = results.results.pop_front().unwrap().as_selected_query_result().unwrap();
@@ -206,7 +260,9 @@ async fn test_multiple_queries() {
 
 #[tokio::test]
 async fn test_multiple_queries_interleaved_with_errors() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let mut results = conn.query("SELECT 1; SELECT 1/0; SELECT 2;").await.unwrap();
 
   let result = results.results.pop_front().unwrap().as_selected_query_result().unwrap();
@@ -223,7 +279,9 @@ async fn test_multiple_queries_interleaved_with_errors() {
 
 #[tokio::test]
 async fn test_multiple_transactions() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   conn
     .query_first("CREATE TABLE IF NOT EXISTS Test (i int);")
     .await
@@ -252,7 +310,9 @@ async fn test_multiple_transactions() {
 
 #[tokio::test]
 async fn test_connection_replication() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   if conn.replication_slot_exists("foo").await.unwrap() {
     conn.delete_replication_slot("foo").await.unwrap();
     assert!(!conn.replication_slot_exists("foo").await.unwrap());
@@ -269,7 +329,9 @@ async fn test_connection_replication() {
 
 #[tokio::test]
 async fn test_query_cancellation() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let cancel_handle = conn.cancel_handle().await.unwrap();
   tokio::task::spawn(async move {
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -290,7 +352,9 @@ async fn test_query_cancellation() {
 
 #[tokio::test]
 async fn test_connection_replication_inserts() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
 
   if conn.replication_slot_exists("bar").await.unwrap() {
     conn.delete_replication_slot("bar").await.unwrap();
@@ -367,6 +431,10 @@ async fn test_connection_replication_inserts() {
   }
 
   tokio::try_join!(stream.close(), conn.close()).unwrap();
+}
+
+fn default_addrs() -> Vec<SocketAddr> {
+  vec!["[::]:5432".parse::<SocketAddr>().unwrap()]
 }
 
 fn default_connection_options() -> ConnectionOptions {
