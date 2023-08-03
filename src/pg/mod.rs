@@ -80,7 +80,6 @@ impl Connection {
       user,
       password,
       database,
-      ..Default::default()
     };
 
     match url.scheme() {
@@ -324,8 +323,8 @@ impl Connection {
                   self.stream.read_i32().await?; // skip 11
                   let mut body = vec![0; (len - 8) as usize];
                   self.stream.read_exact(&mut body).await?;
-                  let body = String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                  body
+
+                  String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
                 }
                 b'E' => {
                   return Err(self.read_backend_error().await);
@@ -357,7 +356,7 @@ impl Connection {
                 let mut prev = Hmac::<Sha256>::new_from_slice(str)
                   .unwrap()
                   .chain_update(salt)
-                  .chain_update(&[0, 0, 0, 1])
+                  .chain_update([0, 0, 0, 1])
                   .finalize()
                   .into_bytes();
                 let mut hi = prev;
@@ -365,7 +364,7 @@ impl Connection {
                 for _ in 1..i {
                   prev = Hmac::<Sha256>::new_from_slice(str)
                     .unwrap()
-                    .chain_update(&prev)
+                    .chain_update(prev)
                     .finalize()
                     .into_bytes();
 
@@ -442,8 +441,8 @@ impl Connection {
                   self.stream.read_i32().await?; // skip 12
                   let mut body = vec![0; (len - 8) as usize];
                   self.stream.read_exact(&mut body).await?;
-                  let body = String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                  body
+
+                  String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
                 }
                 b'E' => {
                   return Err(self.read_backend_error().await);
@@ -1044,10 +1043,7 @@ pub enum QueryResult {
 
 impl QueryResult {
   pub fn is_successful(self) -> bool {
-    match self {
-      Self::Success => true,
-      _ => false,
-    }
+    matches!(self, Self::Success)
   }
 
   pub fn rows_affected(self) -> Option<usize> {

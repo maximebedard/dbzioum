@@ -94,7 +94,7 @@ impl Stream {
         // https://www.postgresql.org/docs/11/protocol-flow.html#id-1.10.5.7.11
         todo!()
       }
-      b'N' => return Err(io::Error::new(io::ErrorKind::ConnectionReset, "ssl not available")),
+      b'N' => Err(io::Error::new(io::ErrorKind::ConnectionReset, "ssl not available")),
       code => {
         panic!("Unexpected backend message: {:?}", char::from(code))
       }
