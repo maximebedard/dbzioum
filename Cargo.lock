@@ -258,6 +258,7 @@ dependencies = [
  "hyper",
  "md-5",
  "openssl",
+ "openssl-sys",
  "rand",
  "serde",
  "serde_json",

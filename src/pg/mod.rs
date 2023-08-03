@@ -42,15 +42,24 @@ impl Default for ConnectionOptions {
   }
 }
 
-async fn socket_addrs_from_url(url: &Url) -> io::Result<Vec<SocketAddr>> {
-  let port = url.port().unwrap_or(5432);
-  match url.host() {
-    Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
-      .await
-      .map(|v| v.collect::<Vec<_>>()),
-    Some(url::Host::Ipv4(ip)) => Ok(vec![SocketAddrV4::new(ip, port).into()]),
-    Some(url::Host::Ipv6(ip)) => Ok(vec![SocketAddrV6::new(ip, port, 0, 0).into()]),
-    None => Ok(vec![format!("[::]:{port}").parse().unwrap()]),
+impl TryFrom<&Url> for ConnectionOptions {
+  type Error = io::Error;
+
+  fn try_from(url: &Url) -> Result<Self, Self::Error> {
+    let user = match url.username() {
+      "" => "postgres".to_string(),
+      user => user.to_string(),
+    };
+    let password = url.password().map(ToString::to_string);
+
+    let query_pairs = url.query_pairs().collect::<BTreeMap<_, _>>();
+    let database = query_pairs.get("database").map(|v| v.to_string());
+
+    Ok(Self {
+      user,
+      password,
+      database,
+    })
   }
 }
 
@@ -67,27 +76,24 @@ pub struct Connection {
 
 impl Connection {
   pub async fn connect_from_url(url: &Url) -> io::Result<Self> {
-    let user = match url.username() {
-      "" => "postgres".to_string(),
-      user => user.to_string(),
-    };
-    let password = url.password().map(ToString::to_string);
-
-    let query_pairs = url.query_pairs().collect::<BTreeMap<_, _>>();
-    let database = query_pairs.get("database").map(|v| v.to_string());
-
-    let options = ConnectionOptions {
-      user,
-      password,
-      database,
-    };
-
     match url.scheme() {
       "tcp" => {
-        let addrs = socket_addrs_from_url(url).await?;
+        let port = url.port().unwrap_or(5432);
+        let addrs = match url.host() {
+          Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
+            .await
+            .map(|v| v.collect::<Vec<_>>())?,
+          Some(url::Host::Ipv4(ip)) => vec![SocketAddrV4::new(ip, port).into()],
+          Some(url::Host::Ipv6(ip)) => vec![SocketAddrV6::new(ip, port, 0, 0).into()],
+          None => vec![format!("[::]:{port}").parse().unwrap()],
+        };
+        let options = url.try_into()?;
         Self::connect_tcp(addrs, options).await
       }
-      "unix" => Self::connect_unix(url.path(), options).await,
+      "unix" => {
+        let options = url.try_into()?;
+        Self::connect_unix(url.path(), options).await
+      }
       scheme => Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("{} is not supported", scheme),
@@ -107,7 +113,27 @@ impl Connection {
 
   #[cfg(feature = "ssl")]
   pub async fn connect_ssl_from_url(url: &Url, ssl_connector: openssl::ssl::SslConnector) -> io::Result<Self> {
-    todo!()
+    match url.scheme() {
+      "tcp" => {
+        let options = url.try_into()?;
+        let port = url.port().unwrap_or(5432);
+        let (domain, addrs) = match url.host() {
+          Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
+            .await
+            .map(|v| (domain.to_string(), v.collect::<Vec<_>>()))?,
+          Some(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "")),
+          None => (
+            "localhost".to_string(),
+            vec![format!("[::]:{}", port).parse::<SocketAddr>().unwrap()],
+          ),
+        };
+        Self::connect_ssl(addrs, domain, options, ssl_connector).await
+      }
+      scheme => Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not supported", scheme),
+      )),
+    }
   }
 
   #[cfg(feature = "ssl")]

@@ -9,11 +9,12 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
 # TODOS:
 
 - [ ] simple postgresql client (> v11)
-  - [ ] auth
+  - [x] auth
     - [x] password
     - [x] deprecated md5
     - [x] scram-sha-256
-    - [ ] (WIP) ssl
+    - [x] ssl (partial)
+  - [ ] read/write/connect timeouts
   - [x] simple query support
   - [x] query cancellation support
   - [x] create/exists/delete replication slot

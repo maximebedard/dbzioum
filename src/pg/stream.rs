@@ -19,6 +19,8 @@ use tokio_openssl::SslStream;
 #[cfg(feature = "ssl")]
 use openssl::ssl::SslConnector;
 
+const SSL_HANDSHAKE_CODE: i32 = 80877103;
+
 #[derive(Debug)]
 pub enum Stream {
   Tcp((BufStream<TcpStream>, Vec<SocketAddr>)),
@@ -50,25 +52,38 @@ impl Stream {
   ) -> io::Result<Self> {
     let addrs = addrs.into();
     let domain = domain.into();
-    let s = TcpStream::connect(addrs.as_slice()).await.map(BufStream::new)?;
+    let mut s = TcpStream::connect(addrs.as_slice()).await.map(BufStream::new)?;
 
-    // TODO: do ssl handshake with PG.
+    s.write_i32(8).await?;
+    s.write_i32(SSL_HANDSHAKE_CODE).await?;
+    s.flush().await?;
 
-    let connect_configuration = ssl_connector
-      .configure()
-      .map_err(|_err| io::Error::new(io::ErrorKind::Other, ""))?;
+    match s.read_u8().await? {
+      b'S' => {
+        // https://www.postgresql.org/docs/11/protocol-flow.html#id-1.10.5.7.11
+        let connect_configuration = ssl_connector
+          .configure()
+          .map_err(|err| io::Error::new(io::ErrorKind::Other, "Failed to create SSL configuration"))?;
 
-    let ssl = connect_configuration
-      .into_ssl(domain.as_str())
-      .map_err(|_err| io::Error::new(io::ErrorKind::Other, ""))?;
+        let ssl = connect_configuration
+          .into_ssl(domain.as_str())
+          .map_err(|err| io::Error::new(io::ErrorKind::Other, "Failed to create SSL context"))?;
 
-    let mut ssl_stream = SslStream::new(ssl, s).map_err(|_err| io::Error::new(io::ErrorKind::Other, ""))?;
-    Pin::new(&mut ssl_stream)
-      .connect()
-      .await
-      .map_err(|_err| io::Error::new(io::ErrorKind::ConnectionRefused, ""))?;
+        let mut ssl_stream =
+          SslStream::new(ssl, s).map_err(|err| io::Error::new(io::ErrorKind::Other, "Failed to create SSL stream"))?;
 
-    Ok(Self::Ssl((ssl_stream, addrs, domain, ssl_connector)))
+        Pin::new(&mut ssl_stream)
+          .connect()
+          .await
+          .map_err(|err| io::Error::new(io::ErrorKind::ConnectionRefused, err.to_string()))?;
+
+        Ok(Self::Ssl((ssl_stream, addrs, domain, ssl_connector)))
+      }
+      b'N' => Err(io::Error::new(io::ErrorKind::ConnectionReset, "ssl not available")),
+      code => {
+        panic!("Unexpected backend message: {:?}", char::from(code))
+      }
+    }
   }
 
   pub async fn duplicate(&self) -> io::Result<Self> {
@@ -78,25 +93,6 @@ impl Stream {
       #[cfg(feature = "ssl")]
       Stream::Ssl((_, addrs, domain, ssl_connector)) => {
         Self::connect_ssl(addrs.clone(), domain.clone(), ssl_connector.clone()).await
-      }
-    }
-  }
-
-  async fn ssl_handshake(&mut self) -> io::Result<()> {
-    const SSL_HANDSHAKE_CODE: i32 = 80877103;
-
-    self.write_i32(8).await?;
-    self.write_i32(SSL_HANDSHAKE_CODE).await?;
-    self.flush().await?;
-
-    match self.read_u8().await? {
-      b'S' => {
-        // https://www.postgresql.org/docs/11/protocol-flow.html#id-1.10.5.7.11
-        todo!()
-      }
-      b'N' => Err(io::Error::new(io::ErrorKind::ConnectionReset, "ssl not available")),
-      code => {
-        panic!("Unexpected backend message: {:?}", char::from(code))
       }
     }
   }

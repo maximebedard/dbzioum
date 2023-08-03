@@ -13,9 +13,8 @@ async fn test_ping_user_postgres() {
 #[tokio::test]
 #[cfg(feature = "ssl")]
 async fn test_ping_user_ssl() {
-  let connector = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
-    .unwrap()
-    .build();
+  let mut ssl_connector_builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
+  ssl_connector_builder.set_ca_file("scripts/pg/server.crt").unwrap();
 
   let mut conn = Connection::connect_ssl(
     default_addrs(),
@@ -24,7 +23,7 @@ async fn test_ping_user_ssl() {
       user: "ssl_user".to_string(),
       ..default_connection_options()
     },
-    connector,
+    ssl_connector_builder.build(),
   )
   .await
   .unwrap();

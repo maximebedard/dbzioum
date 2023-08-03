@@ -7,7 +7,7 @@ edition = "2021"
 
 [features]
 default = ["ssl"]
-ssl = ["dep:openssl", "dep:tokio-openssl"]
+ssl = ["dep:openssl", "dep:openssl-sys", "dep:tokio-openssl"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 hyper = { version = "0.14", features = ["client", "http2", "tcp"]}
 base64 = { version = "0.13" }
+openssl-sys = { version = "0.9", optional = true }
 openssl = { version = "0.10", optional = true }
 tokio-openssl = { version = "0.6", optional = true }
 chrono = { version = "0.4" }
