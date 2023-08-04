@@ -4,7 +4,10 @@ use clap::{Arg, Command};
 use url::Url;
 
 use dbzioum::{
-  pg::{self, ColumnChange, ReplicationEvent, WalCursor},
+  pg::{
+    conn::Connection,
+    wal::{ColumnChange, DataChange, ReplicationEvent, WalCursor},
+  },
   sink::{Column, ColumnType, ColumnValue, RowEvent},
 };
 
@@ -23,7 +26,7 @@ async fn main() {
   let slot = matches.remove_one::<String>("slot").unwrap();
   let wal_cursor = matches.remove_one::<WalCursor>("wal-cursor");
 
-  let mut conn_pg = pg::Connection::connect_from_url(&url).await.unwrap();
+  let mut conn_pg = Connection::connect_from_url(&url).await.unwrap();
 
   let wal_cursor = match wal_cursor {
     Some(wal_cursor) => wal_cursor,
@@ -93,11 +96,11 @@ impl EventProcessor {
       ReplicationEvent::Data { end, data_change, .. } => {
         self.wal_cursor.lsn = end;
         match data_change {
-          pg::DataChange::Insert { schema, table, columns } => {
+          DataChange::Insert { schema, table, columns } => {
             let columns = map_column_change(columns);
             Some(RowEvent::Insert { schema, table, columns })
           }
-          pg::DataChange::Update {
+          DataChange::Update {
             schema,
             table,
             columns,
@@ -112,7 +115,7 @@ impl EventProcessor {
               identity,
             })
           }
-          pg::DataChange::Delete {
+          DataChange::Delete {
             schema,
             table,
             identity,
@@ -124,10 +127,10 @@ impl EventProcessor {
               identity,
             })
           }
-          pg::DataChange::Message { .. } => None,
-          pg::DataChange::Truncate { .. } => None,
-          pg::DataChange::Begin => None,
-          pg::DataChange::Commit => None,
+          DataChange::Message { .. } => None,
+          DataChange::Truncate { .. } => None,
+          DataChange::Begin => None,
+          DataChange::Commit => None,
         }
       }
       ReplicationEvent::KeepAlive { end, .. } => {

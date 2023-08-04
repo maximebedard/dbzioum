@@ -1,4 +1,9 @@
-use dbzioum::pg::{openssl, Connection, ConnectionOptions, CreateReplicationSlot, IdentifySystem, ReplicationEvent};
+use dbzioum::pg::{
+  conn::{Connection, ConnectionOptions},
+  openssl,
+  query::{CreateReplicationSlot, IdentifySystem},
+  wal::ReplicationEvent,
+};
 use std::{net::SocketAddr, time::Duration};
 
 #[tokio::test]

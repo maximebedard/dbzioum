@@ -79,7 +79,7 @@ impl Stream {
 
         Ok(Self::Ssl((ssl_stream, addrs, domain, ssl_connector)))
       }
-      b'N' => Err(io::Error::new(io::ErrorKind::ConnectionReset, "ssl not available")),
+      b'N' => Err(io::Error::new(io::ErrorKind::ConnectionReset, "SSL not available")),
       code => {
         panic!("Unexpected backend message: {:?}", char::from(code))
       }
