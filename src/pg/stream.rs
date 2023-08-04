@@ -6,6 +6,7 @@ use std::{
   task::{Context, Poll},
 };
 
+use bytes::BytesMut;
 use tokio::{
   io::{AsyncRead, AsyncWrite, BufStream, ReadBuf},
   net::{TcpStream, UnixStream},
@@ -84,6 +85,14 @@ impl Stream {
         panic!("Unexpected backend message: {:?}", char::from(code))
       }
     }
+  }
+
+  pub async fn read_packet(&mut self) -> io::Result<(u8, bytes::Bytes)> {
+    let op = self.read_u8().await?;
+    let len = (self.read_i32().await? - 4).try_into().unwrap();
+    let mut buffer = BytesMut::with_capacity(len);
+    self.read_buf(&mut buffer).await?;
+    Ok((op, buffer.freeze()))
   }
 
   pub async fn duplicate(&self) -> io::Result<Self> {

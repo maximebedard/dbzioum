@@ -91,10 +91,6 @@ impl SelectQueryResult {
     self.columns.len()
   }
 
-  pub fn is_empty(&self) -> bool {
-    self.columns().is_empty()
-  }
-
   pub fn row(&self, i: usize) -> &[RowValue] {
     let len = self.columns.len();
     let start = i * len;

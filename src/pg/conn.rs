@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
 
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
@@ -18,7 +17,7 @@ use url::Url;
 use super::cancel::CancelHandle;
 use super::query::{Column, CreateReplicationSlot, IdentifySystem, QueryResult, QueryResults, SelectQueryResult};
 use super::stream::Stream;
-use super::wal::{DataChange, ReplicationEvent, ReplicationStream, WalCursor};
+use super::wal::{ReplicationStream, WalCursor};
 
 #[derive(Debug, Clone)]
 pub struct ConnectionOptions {
@@ -163,7 +162,11 @@ impl Connection {
     match (self.pid, self.secret_key) {
       (Some(pid), Some(secret_key)) => {
         let stream = self.stream.duplicate().await?;
-        Ok(CancelHandle::new(stream, secret_key, pid))
+        Ok(CancelHandle {
+          stream,
+          secret_key,
+          pid,
+        })
       }
       (_, _) => Err(io::Error::new(
         io::ErrorKind::NotConnected,
@@ -237,7 +240,7 @@ impl Connection {
               self.stream.write_i32(len as i32).await?;
               self.stream.write_all(password).await?;
               self.stream.write_u8(0).await?;
-              self.stream.flush().await?
+              self.stream.flush().await?;
             }
             5 => {
               // AuthenticationMD5Password
@@ -597,83 +600,7 @@ impl Connection {
       }
     }
 
-    let conn = self;
-
-    Ok(ReplicationStream::new(conn))
-  }
-
-  pub(crate) async fn read_replication_event(&mut self) -> io::Result<ReplicationEvent> {
-    loop {
-      let op = self.stream.read_u8().await?;
-      let len = self.stream.read_i32().await?;
-      match op {
-        b'E' => {
-          return Err(self.read_backend_error().await);
-        }
-        b'N' => {
-          self.read_backend_notice().await;
-        }
-        b'd' => {
-          let len: usize = len.try_into().unwrap();
-
-          match self.stream.read_u8().await? {
-            b'w' => {
-              let start = self.stream.read_i64().await?;
-              let end = self.stream.read_i64().await?;
-              let system_clock = self.stream.read_i64().await?;
-              let mut buffer = vec![0; len - 4 - 1 - 8 - 8 - 8];
-              self.stream.read_exact(&mut buffer).await?;
-
-              let data_change = serde_json::from_slice::<DataChange>(buffer.as_slice())
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-
-              return Ok(ReplicationEvent::Data {
-                start,
-                end,
-                system_clock,
-                data_change,
-              });
-            }
-            b'k' => {
-              // https://www.postgresql.org/docs/current/protocol-replication.html
-              let end = self.stream.read_i64().await?;
-              let system_clock = self.stream.read_i64().await?;
-              let must_reply_status = self.stream.read_u8().await?;
-
-              return Ok(ReplicationEvent::KeepAlive {
-                end,
-                system_clock,
-                must_reply: must_reply_status == 1,
-              });
-            }
-            code => {
-              panic!("Unexpected backend message: {:?}", char::from(code))
-            }
-          }
-        }
-        code => {
-          panic!("Unexpected backend message: {:?}", char::from(code))
-        }
-      }
-    }
-  }
-
-  pub async fn write_status_update(&mut self, written: i64, flushed: i64, applied: i64) -> io::Result<()> {
-    let dt = SystemTime::now()
-      .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800))
-      .unwrap();
-
-    let system_clock = dt.as_micros() as i64;
-
-    self.stream.write_u8(b'd').await?;
-    self.stream.write_i32(1 + 4 + 8 + 8 + 8 + 8 + 1).await?;
-    self.stream.write_u8(b'r').await?;
-    self.stream.write_i64(written).await?;
-    self.stream.write_i64(flushed).await?;
-    self.stream.write_i64(applied).await?;
-    self.stream.write_i64(system_clock).await?;
-    self.stream.write_u8(0).await?;
-    self.stream.flush().await
+    Ok(ReplicationStream { stream: self.stream })
   }
 
   pub async fn create_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<CreateReplicationSlot> {
@@ -709,7 +636,7 @@ impl Connection {
         slot.as_ref()
       ))
       .await?;
-    Ok(!result.as_selected_query_result().unwrap().is_empty())
+    Ok(!result.as_selected_query_result().unwrap().values.is_empty())
   }
 
   pub async fn identify_system(&mut self) -> io::Result<IdentifySystem> {
@@ -742,14 +669,12 @@ impl Connection {
     self.stream.write_i32(len as i32).await?;
     self.stream.write_all(query.as_ref().as_bytes()).await?;
     self.stream.write_u8(0).await?;
-    self.stream.flush().await?;
-    Ok(())
+    self.stream.flush().await
   }
 
   pub async fn query_first(&mut self, query: impl AsRef<str>) -> io::Result<QueryResult> {
-    let mut results = self.query(query.as_ref()).await?;
+    let QueryResults { mut results, .. } = self.query(query.as_ref()).await?;
     results
-      .results
       .pop_front()
       .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing query result"))
   }
@@ -766,6 +691,7 @@ impl Connection {
     loop {
       let op = self.stream.read_u8().await?;
       let _len = self.stream.read_i32().await?;
+
       match op {
         b'C' => {
           // CommandComplete (B)
@@ -1007,8 +933,6 @@ impl Connection {
   pub async fn close(mut self) -> io::Result<()> {
     self.stream.write_u8(b'X').await?;
     self.stream.write_i32(4).await?;
-    self.stream.flush().await?;
-    self.stream.shutdown().await?;
-    Ok(())
+    self.stream.shutdown().await
   }
 }

@@ -336,7 +336,9 @@ async fn test_query_cancellation() {
   let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
     .await
     .unwrap();
+
   let cancel_handle = conn.cancel_handle().await.unwrap();
+
   tokio::task::spawn(async move {
     tokio::time::sleep(Duration::from_millis(100)).await;
     cancel_handle.cancel().await.unwrap();
@@ -345,7 +347,7 @@ async fn test_query_cancellation() {
   assert_eq!(
     "Server error 57014: canceling statement due to user request",
     conn
-      .query_first("SELECT pg_sleep(1000);")
+      .query_first("SELECT pg_sleep(100);")
       .await
       .unwrap()
       .as_backend_error()

@@ -1,29 +1,102 @@
-use std::{fmt, io, str::FromStr};
+use std::{
+  fmt, io,
+  str::FromStr,
+  time::{Duration, SystemTime},
+};
 
-use super::conn::Connection;
+use bytes::Buf;
+use tokio::io::AsyncWriteExt;
+
+use super::stream::Stream;
 
 #[derive(Debug)]
 pub struct ReplicationStream {
-  conn: Connection,
+  pub(crate) stream: Stream,
 }
 
 impl ReplicationStream {
-  pub(crate) fn new(conn: Connection) -> Self {
-    Self { conn }
-  }
-
   pub async fn recv(&mut self) -> Option<io::Result<ReplicationEvent>> {
     // TODO: handle disconnects and reconnect here...
-    Some(self.conn.read_replication_event().await)
+    Some(self.read_replication_event().await)
   }
 
   pub async fn write_status_update(&mut self, lsn: i64) -> io::Result<()> {
     // TODO: maybe support splitting the receiver from the sender...
-    self.conn.write_status_update(lsn, lsn, lsn).await
+    self.write_status_update2(lsn, lsn, lsn).await
   }
 
-  pub async fn close(self) -> io::Result<()> {
-    self.conn.close().await
+  pub async fn close(mut self) -> io::Result<()> {
+    self.stream.shutdown().await
+  }
+
+  async fn read_replication_event(&mut self) -> io::Result<ReplicationEvent> {
+    let (op, mut buffer) = self.stream.read_packet().await?;
+
+    match op {
+      b'E' => {
+        todo!("handle backend error")
+        // return Err(self.read_backend_error().await);
+      }
+      b'N' => {
+        todo!("handle backend notice")
+        // self.read_backend_notice().await;
+      }
+      b'd' => {
+        match buffer.get_u8() {
+          b'w' => {
+            let start = buffer.get_i64();
+            let end = buffer.get_i64();
+            let system_clock = buffer.get_i64();
+
+            let data_change = serde_json::from_slice::<DataChange>(buffer.chunk())
+              .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+            Ok(ReplicationEvent::Data {
+              start,
+              end,
+              system_clock,
+              data_change,
+            })
+          }
+          b'k' => {
+            // https://www.postgresql.org/docs/current/protocol-replication.html
+            let end = buffer.get_i64();
+            let system_clock = buffer.get_i64();
+            let must_reply_status = buffer.get_u8();
+
+            Ok(ReplicationEvent::KeepAlive {
+              end,
+              system_clock,
+              must_reply: must_reply_status == 1,
+            })
+          }
+          code => {
+            panic!("Unexpected backend message: {:?}", char::from(code))
+          }
+        }
+      }
+      code => {
+        panic!("Unexpected backend message: {:?}", char::from(code))
+      }
+    }
+  }
+
+  async fn write_status_update2(&mut self, written: i64, flushed: i64, applied: i64) -> io::Result<()> {
+    let dt = SystemTime::now()
+      .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800))
+      .unwrap();
+
+    let system_clock = dt.as_micros() as i64;
+
+    self.stream.write_u8(b'd').await?;
+    self.stream.write_i32(1 + 4 + 8 + 8 + 8 + 8 + 1).await?;
+    self.stream.write_u8(b'r').await?;
+    self.stream.write_i64(written).await?;
+    self.stream.write_i64(flushed).await?;
+    self.stream.write_i64(applied).await?;
+    self.stream.write_i64(system_clock).await?;
+    self.stream.write_u8(0).await?;
+    self.stream.flush().await
   }
 }
 
