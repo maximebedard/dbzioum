@@ -292,7 +292,7 @@ impl Connection {
               // https://datatracker.ietf.org/doc/html/rfc5802#section-3
               let mut mechanisms = Vec::new();
               loop {
-                match buffer.get_c_string()? {
+                match buffer.pg_get_null_terminated_string()? {
                   m if m.is_empty() => break,
                   m => mechanisms.push(m),
                 }
@@ -448,7 +448,7 @@ impl Connection {
             code => panic!("Unexpected backend authentication code {:?}", code),
           }
         }
-        b'E' => return Err(buffer.get_backend_error()),
+        b'E' => return Err(buffer.pg_get_backend_error()),
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
         }
@@ -484,18 +484,18 @@ impl Connection {
           //         The name of the run-time parameter being reported.
           //     String
           //         The current value of the parameter.
-          let key = buffer.get_c_string()?;
-          let value = buffer.get_c_string()?;
+          let key = buffer.pg_get_null_terminated_string()?;
+          let value = buffer.pg_get_null_terminated_string()?;
           self.metadata.insert(key, value);
         }
         b'Z' => {
           break;
         }
         b'E' => {
-          return Err(buffer.get_backend_error());
+          return Err(buffer.pg_get_backend_error());
         }
         b'N' => {
-          buffer.get_backend_notice();
+          buffer.pg_get_backend_notice();
         }
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
@@ -532,7 +532,7 @@ impl Connection {
         buffer.advance(4); // skip 12
         String::from_utf8(buffer.to_vec()).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
       }
-      b'E' => Err(buffer.get_backend_error()),
+      b'E' => Err(buffer.pg_get_backend_error()),
       code => {
         panic!("Unexpected backend message: {:?}", char::from(code))
       }
@@ -564,7 +564,7 @@ impl Connection {
 
     match op {
       b'E' => {
-        return Err(buffer.get_backend_error());
+        return Err(buffer.pg_get_backend_error());
       }
       b'W' => {
         let format = buffer.get_i8();
@@ -690,7 +690,7 @@ impl Connection {
           //         For a MOVE command, the tag is MOVE rows where rows is the number of rows the cursor's position has been changed by.
           //         For a FETCH command, the tag is FETCH rows where rows is the number of rows that have been retrieved from the cursor.
           //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
-          let op = buffer.get_c_string()?;
+          let op = buffer.pg_get_null_terminated_string()?;
           match current.take() {
             Some(select_query_result) => results.push_back(QueryResult::Selected(select_query_result)),
             None => results.push_back(QueryResult::Success),
@@ -750,7 +750,7 @@ impl Connection {
           let mut columns = Vec::new();
           let num_columns = buffer.get_i16();
           for i in 0..num_columns {
-            let name = buffer.get_c_string()?;
+            let name = buffer.pg_get_null_terminated_string()?;
             let oid = buffer.get_i32();
             let attr_number = buffer.get_i16();
             let datatype_oid = buffer.get_i32();
@@ -792,7 +792,7 @@ impl Connection {
             let len = buffer.get_i32();
 
             if len > 0 {
-              let value = buffer.get_fixed_length_string(len.try_into().unwrap())?;
+              let value = buffer.pg_get_fixed_length_string(len.try_into().unwrap())?;
               values.push(Some(value));
             } else if len == 0 {
               values.push(Some("".to_string()));
@@ -813,11 +813,11 @@ impl Connection {
           // self.read_ready_for_query().await?;
           break;
         }
-        b'E' => match buffer.get_backend_error() {
+        b'E' => match buffer.pg_get_backend_error() {
           err if err.kind() == io::ErrorKind::Other => results.push_back(QueryResult::BackendError(err)),
           err => return Err(err),
         },
-        b'N' => match buffer.get_backend_notice() {
+        b'N' => match buffer.pg_get_backend_notice() {
           notice if notice.kind() == io::ErrorKind::Other => notices.push_back(notice),
           notice => return Err(notice),
         },

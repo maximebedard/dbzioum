@@ -2,7 +2,7 @@ use bytes::Buf;
 use std::{collections::BTreeMap, io};
 
 pub trait BufExt: Buf {
-  fn get_c_string(&mut self) -> io::Result<String> {
+  fn pg_get_null_terminated_string(&mut self) -> io::Result<String> {
     match self.chunk().iter().position(|x| *x == 0x00) {
       Some(len) => {
         let mut buffer = vec![0; len];
@@ -15,7 +15,7 @@ pub trait BufExt: Buf {
     }
   }
 
-  fn get_fixed_length_string(&mut self, len: usize) -> io::Result<String> {
+  fn pg_get_fixed_length_string(&mut self, len: usize) -> io::Result<String> {
     if self.remaining() >= len {
       let mut bytes = vec![0; len];
       self.copy_to_slice(bytes.as_mut_slice());
@@ -29,13 +29,13 @@ pub trait BufExt: Buf {
     }
   }
 
-  fn get_fields(&mut self) -> io::Result<BTreeMap<char, String>> {
+  fn pg_get_fields(&mut self) -> io::Result<BTreeMap<char, String>> {
     let mut fields = BTreeMap::new();
     loop {
       match self.get_u8() {
         0 => break,
         token => {
-          let msg = self.get_c_string()?;
+          let msg = self.pg_get_null_terminated_string()?;
           fields.insert(char::from(token), msg);
         }
       }
@@ -43,7 +43,7 @@ pub trait BufExt: Buf {
     Ok(fields)
   }
 
-  fn get_backend_error(&mut self) -> io::Error {
+  fn pg_get_backend_error(&mut self) -> io::Error {
     // https://www.postgresql.org/docs/11/protocol-error-fields.html
     // ErrorResponse (B)
     //     Byte1('E')
@@ -55,7 +55,7 @@ pub trait BufExt: Buf {
     //         A code identifying the field type; if zero, this is the message terminator and no string follows. The presently defined field types are listed in Section 53.8. Since more field types might be added in future, frontends should silently ignore fields of unrecognized type.
     //     String
     //         The field value.
-    match self.get_fields() {
+    match self.pg_get_fields() {
       Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
       Ok(fields) => io::Error::new(
         io::ErrorKind::Other,
@@ -65,7 +65,7 @@ pub trait BufExt: Buf {
     }
   }
 
-  fn get_backend_notice(&mut self) -> io::Error {
+  fn pg_get_backend_notice(&mut self) -> io::Error {
     // https://www.postgresql.org/docs/11/protocol-error-fields.html
     // NoticeResponse (B)
     //     Byte1('N')
@@ -77,7 +77,7 @@ pub trait BufExt: Buf {
     //         A code identifying the field type; if zero, this is the message terminator and no string follows. The presently defined field types are listed in Section 53.8. Since more field types might be added in future, frontends should silently ignore fields of unrecognized type.
     //     String
     //         The field value.
-    match self.get_fields() {
+    match self.pg_get_fields() {
       Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
       Ok(fields) => io::Error::new(
         io::ErrorKind::Other,

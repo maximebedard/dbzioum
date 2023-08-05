@@ -7,7 +7,7 @@ pub trait BufExt: Buf {
   }
 
   // Returns a utf-8 encoded string terminated by \0.
-  fn mysql_null_terminated_string(&mut self) -> io::Result<String> {
+  fn mysql_get_null_terminated_string(&mut self) -> io::Result<String> {
     match self.chunk().iter().position(|x| *x == 0x00) {
       Some(len) => {
         let mut buffer = vec![0; len];

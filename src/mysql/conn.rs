@@ -616,7 +616,7 @@ impl Handshake {
   fn parse(mut b: Bytes) -> io::Result<Self> {
     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
     let protocol_version = b.get_u8();
-    let server_version = b.mysql_null_terminated_string()?;
+    let server_version = b.mysql_get_null_terminated_string()?;
     let connection_id = b.get_u32_le();
     let scramble_1 = b.split_to(8);
     b.advance(1);
@@ -636,7 +636,7 @@ impl Handshake {
 
     let mut auth_plugin_name = None;
     if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
-      auth_plugin_name = Some(b.mysql_null_terminated_string()?);
+      auth_plugin_name = Some(b.mysql_get_null_terminated_string()?);
     }
 
     Ok(Self {
