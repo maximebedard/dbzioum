@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use rand::distributions::Alphanumeric;
@@ -26,6 +27,9 @@ pub struct ConnectionOptions {
   pub user: String,
   pub password: Option<String>,
   pub database: Option<String>,
+  pub connect_timeout: Option<Duration>,
+  pub read_timeout: Option<Duration>,
+  pub write_timeout: Option<Duration>,
 }
 
 impl Default for ConnectionOptions {
@@ -34,6 +38,9 @@ impl Default for ConnectionOptions {
       user: "postgres".to_string(),
       password: None,
       database: None,
+      connect_timeout: None,
+      read_timeout: None,
+      write_timeout: None,
     }
   }
 }
@@ -51,10 +58,28 @@ impl TryFrom<&Url> for ConnectionOptions {
     let query_pairs = url.query_pairs().collect::<BTreeMap<_, _>>();
     let database = query_pairs.get("database").map(|v| v.to_string());
 
+    let connect_timeout = query_pairs
+      .get("connect_timeout_ms")
+      .and_then(|v| v.parse().ok())
+      .map(Duration::from_millis);
+
+    let read_timeout = query_pairs
+      .get("read_timeout_ms")
+      .and_then(|v| v.parse().ok())
+      .map(Duration::from_millis);
+
+    let write_timeout = query_pairs
+      .get("write_timeout_ms")
+      .and_then(|v| v.parse().ok())
+      .map(Duration::from_millis);
+
     Ok(Self {
       user,
       password,
       database,
+      connect_timeout,
+      read_timeout,
+      write_timeout,
     })
   }
 }
@@ -98,12 +123,24 @@ impl Connection {
   }
 
   pub async fn connect_tcp(addrs: impl Into<Vec<SocketAddr>>, options: ConnectionOptions) -> io::Result<Self> {
-    let stream = Stream::connect_tcp(addrs).await?;
+    let stream = match options.connect_timeout {
+      Some(connect_timeout) => tokio::time::timeout(connect_timeout, Stream::connect_tcp(addrs))
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        .and_then(|r| r),
+      None => Stream::connect_tcp(addrs).await,
+    }?;
     Self::connect(stream, options).await
   }
 
   pub async fn connect_unix(path: impl Into<PathBuf>, options: ConnectionOptions) -> io::Result<Self> {
-    let stream = Stream::connect_unix(path).await?;
+    let stream = match options.connect_timeout {
+      Some(connect_timeout) => tokio::time::timeout(connect_timeout, Stream::connect_unix(path))
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        .and_then(|r| r),
+      None => Stream::connect_unix(path).await,
+    }?;
     Self::connect(stream, options).await
   }
 
@@ -139,7 +176,13 @@ impl Connection {
     options: ConnectionOptions,
     ssl_connector: openssl::ssl::SslConnector,
   ) -> io::Result<Self> {
-    let stream = Stream::connect_ssl(addrs, domain, ssl_connector).await?;
+    let stream = match options.connect_timeout {
+      Some(connect_timeout) => tokio::time::timeout(connect_timeout, Stream::connect_ssl(addrs, domain, ssl_connector))
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        .and_then(|r| r),
+      None => Stream::connect_ssl(addrs, domain, ssl_connector).await,
+    }?;
     Self::connect(stream, options).await
   }
 
@@ -156,14 +199,14 @@ impl Connection {
   }
 
   pub async fn duplicate(&self) -> io::Result<Self> {
-    let stream = self.stream.duplicate().await?;
+    let stream = self.stream_duplicate().await?;
     Self::connect(stream, self.options.clone()).await
   }
 
   pub async fn cancel_handle(&self) -> io::Result<CancelHandle> {
     match (self.pid, self.secret_key) {
       (Some(pid), Some(secret_key)) => {
-        let stream = self.stream.duplicate().await?;
+        let stream = self.stream_duplicate().await?;
         Ok(CancelHandle {
           stream,
           secret_key,
@@ -174,6 +217,36 @@ impl Connection {
         io::ErrorKind::NotConnected,
         "unable to create cancel handle",
       )),
+    }
+  }
+
+  async fn stream_duplicate(&self) -> io::Result<Stream> {
+    match self.options.connect_timeout {
+      Some(connect_timeout) => tokio::time::timeout(connect_timeout, self.stream.duplicate())
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
+        .and_then(|r| r),
+      None => self.stream.duplicate().await,
+    }
+  }
+
+  async fn stream_read_packet(&mut self) -> io::Result<(u8, Bytes)> {
+    match self.options.read_timeout {
+      Some(read_timeout) => tokio::time::timeout(read_timeout, self.stream.read_packet())
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "read timed out"))
+        .and_then(|r| r),
+      None => self.stream.read_packet().await,
+    }
+  }
+
+  async fn stream_flush(&mut self) -> io::Result<()> {
+    match self.options.write_timeout {
+      Some(write_timeout) => tokio::time::timeout(write_timeout, self.stream.flush())
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))
+        .and_then(|r| r),
+      None => self.stream.flush().await,
     }
   }
 
@@ -206,7 +279,7 @@ impl Connection {
     }
 
     self.stream.write_u8(0).await?;
-    self.stream.flush().await?;
+    self.stream_flush().await?;
 
     self.authenticate().await?;
 
@@ -215,7 +288,7 @@ impl Connection {
 
   async fn authenticate(&mut self) -> io::Result<()> {
     loop {
-      let (op, mut buffer) = self.stream.read_packet().await?;
+      let (op, mut buffer) = self.stream_read_packet().await?;
 
       match op {
         b'R' => {
@@ -241,7 +314,7 @@ impl Connection {
               self.stream.write_i32(len as i32).await?;
               self.stream.write_all(password).await?;
               self.stream.write_u8(0).await?;
-              self.stream.flush().await?;
+              self.stream_flush().await?;
             }
             5 => {
               // AuthenticationMD5Password
@@ -268,7 +341,7 @@ impl Connection {
               self.stream.write_i32(len as i32).await?;
               self.stream.write_all(password.as_bytes()).await?;
               self.stream.write_u8(0).await?;
-              self.stream.flush().await?
+              self.stream_flush().await?
             }
             6 => {
               return Err(io::Error::new(
@@ -324,7 +397,7 @@ impl Connection {
               self.stream.write_u8(0).await?;
               self.stream.write_i32(client_first_message.len() as i32).await?;
               self.stream.write_all(client_first_message.as_bytes()).await?;
-              self.stream.flush().await?;
+              self.stream_flush().await?;
 
               let server_first_message = self.read_sasl_response().await?;
 
@@ -417,7 +490,7 @@ impl Connection {
               self.stream.write_u8(b'p').await?;
               self.stream.write_i32(len as i32).await?;
               self.stream.write_all(client_final_message.as_bytes()).await?;
-              self.stream.flush().await?;
+              self.stream_flush().await?;
 
               let sasl_final_response = self.read_sasl_response().await?;
 
@@ -458,7 +531,7 @@ impl Connection {
     self.metadata.clear();
 
     loop {
-      let (op, mut buffer) = self.stream.read_packet().await?;
+      let (op, mut buffer) = self.stream_read_packet().await?;
 
       match op {
         b'K' => {
@@ -506,7 +579,7 @@ impl Connection {
   }
 
   async fn read_sasl_response(&mut self) -> io::Result<String> {
-    let (op, mut buffer) = self.stream.read_packet().await?;
+    let (op, mut buffer) = self.stream_read_packet().await?;
 
     match op {
       b'R' => {
@@ -560,7 +633,7 @@ impl Connection {
     // After streaming all the WAL on a timeline that is not the latest one, the server will end streaming by exiting the COPY mode. When the client acknowledges this by also exiting COPY mode, the server sends a result set with one row and two columns, indicating the next timeline in this server's history. The first column is the next timeline's ID (type int8), and the second column is the WAL location where the switch happened (type text). Usually, the switch position is the end of the WAL that was streamed, but there are corner cases where the server can send some WAL from the old timeline that it has not itself replayed before promoting. Finally, the server sends two CommandComplete messages (one that ends the CopyData and the other ends the START_REPLICATION itself), and is ready to accept a new command.
     // WAL data is sent as a series of CopyData messages. (This allows other information to be intermixed; in particular the server can send an ErrorResponse message if it encounters a failure after beginning to stream.) The payload of each CopyData message from server to the client contains a message of one of the following formats:
 
-    let (op, mut buffer) = self.stream.read_packet().await?;
+    let (op, mut buffer) = self.stream_read_packet().await?;
 
     match op {
       b'E' => {
@@ -652,7 +725,7 @@ impl Connection {
     self.stream.write_i32(len as i32).await?;
     self.stream.write_all(query.as_ref().as_bytes()).await?;
     self.stream.write_u8(0).await?;
-    self.stream.flush().await
+    self.stream_flush().await
   }
 
   pub async fn query_first(&mut self, query: impl AsRef<str>) -> io::Result<QueryResult> {
@@ -672,7 +745,7 @@ impl Connection {
     let mut current: Option<SelectQueryResult> = None;
 
     loop {
-      let (op, mut buffer) = self.stream.read_packet().await?;
+      let (op, mut buffer) = self.stream_read_packet().await?;
 
       match op {
         b'C' => {
