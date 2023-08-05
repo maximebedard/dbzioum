@@ -280,7 +280,7 @@ impl Connection {
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(0xFB) => todo!("infile not supported"),
       Some(_) => {
-        let column_count = payload.mysql_get_lenc_uint().unwrap().try_into().unwrap();
+        let column_count = payload.mysql_get_lenc_uint().try_into().unwrap();
         let columns = self.read_columns(column_count).await?;
         let values = self.read_row_values(&columns).await?;
         let query_results = QueryResults { columns, values };
@@ -617,7 +617,6 @@ impl Handshake {
     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
     let protocol_version = b.get_u8();
     let server_version = b.mysql_null_terminated_string()?;
-    b.advance(1);
     let connection_id = b.get_u32_le();
     let scramble_1 = b.split_to(8);
     b.advance(1);
@@ -677,8 +676,8 @@ struct ServerOk {
 impl ServerOk {
   fn parse(mut b: Bytes, capability_flags: CapabilityFlags) -> io::Result<Self> {
     let _header = b.get_u8();
-    let affected_rows = b.mysql_get_lenc_uint().unwrap();
-    let last_inserted_id = b.mysql_get_lenc_uint().unwrap();
+    let affected_rows = b.mysql_get_lenc_uint();
+    let last_inserted_id = b.mysql_get_lenc_uint();
 
     let mut status_flags = None;
     let mut warnings = None;
@@ -828,7 +827,7 @@ impl Column {
     let org_table = b.mysql_get_lenc_string().unwrap();
     let name = b.mysql_get_lenc_string().unwrap();
     let org_name = b.mysql_get_lenc_string().unwrap();
-    let fixed_len = b.mysql_get_lenc_uint().unwrap();
+    let fixed_len = b.mysql_get_lenc_uint();
     assert_eq!(0x0C, fixed_len);
     let character_set = (b.get_u16_le() as u8).try_into().unwrap();
     let column_length = b.get_u32_le();

@@ -91,7 +91,9 @@ impl Stream {
     let op = self.read_u8().await?;
     let len = (self.read_i32().await? - 4).try_into().unwrap();
     let mut buffer = BytesMut::with_capacity(len);
-    self.read_buf(&mut buffer).await?;
+    if len > 0 {
+      self.read_buf(&mut buffer).await?;
+    }
     Ok((op, buffer.freeze()))
   }
 

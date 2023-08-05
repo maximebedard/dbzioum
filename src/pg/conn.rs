@@ -3,6 +3,7 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
 
+use bytes::Buf;
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use rand::distributions::Alphanumeric;
@@ -10,10 +11,11 @@ use rand::{thread_rng, Rng};
 use sha2::digest::FixedOutput;
 use sha2::Sha256;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net;
 use url::Url;
 
+use super::buf_ext::BufExt;
 use super::cancel::CancelHandle;
 use super::query::{Column, CreateReplicationSlot, IdentifySystem, QueryResult, QueryResults, SelectQueryResult};
 use super::stream::Stream;
@@ -213,12 +215,11 @@ impl Connection {
 
   async fn authenticate(&mut self) -> io::Result<()> {
     loop {
-      let op = self.stream.read_u8().await?;
-      let _len = self.stream.read_i32().await?;
+      let (op, mut buffer) = self.stream.read_packet().await?;
 
       match op {
         b'R' => {
-          match self.stream.read_i32().await? {
+          match buffer.get_i32() {
             0 => break,
             2 => {
               return Err(io::Error::new(
@@ -252,7 +253,7 @@ impl Connection {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "password is required"))?;
 
               let mut salt = vec![0; 4];
-              self.stream.read_exact(&mut salt).await?;
+              buffer.copy_to_slice(&mut salt);
 
               let mut md5 = Md5::new();
               md5.update(password);
@@ -291,7 +292,7 @@ impl Connection {
               // https://datatracker.ietf.org/doc/html/rfc5802#section-3
               let mut mechanisms = Vec::new();
               loop {
-                match self.read_c_string().await? {
+                match buffer.get_c_string()? {
                   m if m.is_empty() => break,
                   m => mechanisms.push(m),
                 }
@@ -325,33 +326,7 @@ impl Connection {
               self.stream.write_all(client_first_message.as_bytes()).await?;
               self.stream.flush().await?;
 
-              let op = self.stream.read_u8().await?;
-              let len = self.stream.read_i32().await?;
-
-              let server_first_message = match op {
-                b'R' => {
-                  // AuthenticationSASLContinue (B)
-                  //   Byte1('R')
-                  //       Identifies the message as an authentication request.
-                  //   Int32
-                  //       Length of message contents in bytes, including self.
-                  //   Int32(11)
-                  //       Specifies that this message contains a SASL challenge.
-                  //   Byten
-                  //       SASL data, specific to the SASL mechanism being used.
-                  self.stream.read_i32().await?; // skip 11
-                  let mut body = vec![0; (len - 8) as usize];
-                  self.stream.read_exact(&mut body).await?;
-
-                  String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                }
-                b'E' => {
-                  return Err(self.read_backend_error().await);
-                }
-                code => {
-                  panic!("Unexpected backend message: {:?}", char::from(code))
-                }
-              };
+              let server_first_message = self.read_sasl_response().await?;
 
               let mut chunks = server_first_message.splitn(3, |v| v == ',');
               let server_nonce = chunks
@@ -444,36 +419,11 @@ impl Connection {
               self.stream.write_all(client_final_message.as_bytes()).await?;
               self.stream.flush().await?;
 
-              let op = self.stream.read_u8().await?;
-              let len = self.stream.read_i32().await?;
-              let body = match op {
-                b'R' => {
-                  // AuthenticationSASLFinal (B)
-                  //   Byte1('R')
-                  //       Identifies the message as an authentication request.
-                  //   Int32
-                  //       Length of message contents in bytes, including self.
-                  //   Int32(12)
-                  //       Specifies that SASL authentication has completed.
-                  //   Byten
-                  //       SASL outcome "additional data", specific to the SASL mechanism being used.
-                  self.stream.read_i32().await?; // skip 12
-                  let mut body = vec![0; (len - 8) as usize];
-                  self.stream.read_exact(&mut body).await?;
+              let sasl_final_response = self.read_sasl_response().await?;
 
-                  String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                }
-                b'E' => {
-                  return Err(self.read_backend_error().await);
-                }
-                code => {
-                  panic!("Unexpected backend message: {:?}", char::from(code))
-                }
-              };
-
-              if let Some(err) = body.strip_prefix("e=") {
+              if let Some(err) = sasl_final_response.strip_prefix("e=") {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
-              } else if let Some(verifier) = body.strip_prefix("v=") {
+              } else if let Some(verifier) = sasl_final_response.strip_prefix("v=") {
                 let verifier = base64::decode(verifier)
                   .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, "Failed to decode base64 sasl verifier"))?;
 
@@ -498,7 +448,7 @@ impl Connection {
             code => panic!("Unexpected backend authentication code {:?}", code),
           }
         }
-        b'E' => return Err(self.read_backend_error().await),
+        b'E' => return Err(buffer.get_backend_error()),
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
         }
@@ -508,8 +458,8 @@ impl Connection {
     self.metadata.clear();
 
     loop {
-      let op = self.stream.read_u8().await?;
-      let _len = self.stream.read_i32().await?;
+      let (op, mut buffer) = self.stream.read_packet().await?;
+
       match op {
         b'K' => {
           // BackendKeyData (B)
@@ -521,8 +471,8 @@ impl Connection {
           //         The process ID of this backend.
           //     Int32
           //         The secret key of this backend.
-          self.pid.replace(self.stream.read_i32().await?);
-          self.secret_key.replace(self.stream.read_i32().await?);
+          self.pid.replace(buffer.get_i32());
+          self.secret_key.replace(buffer.get_i32());
         }
         b'S' => {
           // ParameterStatus (B)
@@ -534,19 +484,18 @@ impl Connection {
           //         The name of the run-time parameter being reported.
           //     String
           //         The current value of the parameter.
-          let key = self.read_c_string().await?;
-          let value = self.read_c_string().await?;
+          let key = buffer.get_c_string()?;
+          let value = buffer.get_c_string()?;
           self.metadata.insert(key, value);
         }
         b'Z' => {
-          self.read_ready_for_query().await?;
           break;
         }
         b'E' => {
-          return Err(self.read_backend_error().await);
+          return Err(buffer.get_backend_error());
         }
         b'N' => {
-          self.read_backend_notice().await;
+          buffer.get_backend_notice();
         }
         code => {
           panic!("Unexpected backend message: {:?}", char::from(code))
@@ -554,6 +503,40 @@ impl Connection {
       }
     }
     Ok(())
+  }
+
+  async fn read_sasl_response(&mut self) -> io::Result<String> {
+    let (op, mut buffer) = self.stream.read_packet().await?;
+
+    match op {
+      b'R' => {
+        // AuthenticationSASLContinue (B)
+        //   Byte1('R')
+        //       Identifies the message as an authentication request.
+        //   Int32
+        //       Length of message contents in bytes, including self.
+        //   Int32(11)
+        //       Specifies that this message contains a SASL challenge.
+        //   Byten
+        //       SASL data, specific to the SASL mechanism being used.
+        //
+        // AuthenticationSASLFinal (B)
+        //   Byte1('R')
+        //       Identifies the message as an authentication request.
+        //   Int32
+        //       Length of message contents in bytes, including self.
+        //   Int32(12)
+        //       Specifies that SASL authentication has completed.
+        //   Byten
+        //       SASL outcome "additional data", specific to the SASL mechanism being used.
+        buffer.advance(4); // skip 12
+        String::from_utf8(buffer.to_vec()).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+      }
+      b'E' => Err(buffer.get_backend_error()),
+      code => {
+        panic!("Unexpected backend message: {:?}", char::from(code))
+      }
+    }
   }
 
   pub async fn ping(&mut self) -> io::Result<()> {
@@ -577,18 +560,18 @@ impl Connection {
     // After streaming all the WAL on a timeline that is not the latest one, the server will end streaming by exiting the COPY mode. When the client acknowledges this by also exiting COPY mode, the server sends a result set with one row and two columns, indicating the next timeline in this server's history. The first column is the next timeline's ID (type int8), and the second column is the WAL location where the switch happened (type text). Usually, the switch position is the end of the WAL that was streamed, but there are corner cases where the server can send some WAL from the old timeline that it has not itself replayed before promoting. Finally, the server sends two CommandComplete messages (one that ends the CopyData and the other ends the START_REPLICATION itself), and is ready to accept a new command.
     // WAL data is sent as a series of CopyData messages. (This allows other information to be intermixed; in particular the server can send an ErrorResponse message if it encounters a failure after beginning to stream.) The payload of each CopyData message from server to the client contains a message of one of the following formats:
 
-    let op = self.stream.read_u8().await?;
-    let _len = self.stream.read_i32().await?;
+    let (op, mut buffer) = self.stream.read_packet().await?;
+
     match op {
       b'E' => {
-        return Err(self.read_backend_error().await);
+        return Err(buffer.get_backend_error());
       }
       b'W' => {
-        let format = self.stream.read_i8().await?;
-        let num_columns = self.stream.read_i16().await?;
+        let format = buffer.get_i8();
+        let num_columns = buffer.get_i16();
         let mut column_formats = vec![0; num_columns.try_into().unwrap()];
         for i in 0..column_formats.len() {
-          column_formats.push(self.stream.read_i16().await?);
+          column_formats.push(buffer.get_i16());
         }
 
         assert_eq!(0, format);
@@ -689,8 +672,7 @@ impl Connection {
     let mut current: Option<SelectQueryResult> = None;
 
     loop {
-      let op = self.stream.read_u8().await?;
-      let _len = self.stream.read_i32().await?;
+      let (op, mut buffer) = self.stream.read_packet().await?;
 
       match op {
         b'C' => {
@@ -708,7 +690,7 @@ impl Connection {
           //         For a MOVE command, the tag is MOVE rows where rows is the number of rows the cursor's position has been changed by.
           //         For a FETCH command, the tag is FETCH rows where rows is the number of rows that have been retrieved from the cursor.
           //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
-          let op = self.read_c_string().await?;
+          let op = buffer.get_c_string()?;
           match current.take() {
             Some(select_query_result) => results.push_back(QueryResult::Selected(select_query_result)),
             None => results.push_back(QueryResult::Success),
@@ -766,15 +748,15 @@ impl Connection {
           //     Int16
           //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
           let mut columns = Vec::new();
-          let num_columns = self.stream.read_i16().await?;
+          let num_columns = buffer.get_i16();
           for i in 0..num_columns {
-            let name = self.read_c_string().await?;
-            let oid = self.stream.read_i32().await?;
-            let attr_number = self.stream.read_i16().await?;
-            let datatype_oid = self.stream.read_i32().await?;
-            let datatype_size = self.stream.read_i16().await?;
-            let type_modifier = self.stream.read_i32().await?;
-            let format = self.stream.read_i16().await?;
+            let name = buffer.get_c_string()?;
+            let oid = buffer.get_i32();
+            let attr_number = buffer.get_i16();
+            let datatype_oid = buffer.get_i32();
+            let datatype_size = buffer.get_i16();
+            let type_modifier = buffer.get_i32();
+            let format = buffer.get_i16();
 
             columns.push(Column {
               name,
@@ -805,14 +787,13 @@ impl Connection {
           //     Byten
           //         The value of the column, in the format indicated by the associated format code. n is the above length.
           let values = &mut current.as_mut().unwrap().values;
-          let num_values = self.stream.read_i16().await?;
+          let num_values = buffer.get_i16();
           for i in 0..num_values {
-            let len = self.stream.read_i32().await?;
+            let len = buffer.get_i32();
 
             if len > 0 {
-              let mut buffer = vec![0; len.try_into().unwrap()];
-              self.stream.read_exact(&mut buffer).await?;
-              values.push(Some(String::from_utf8(buffer).unwrap()));
+              let value = buffer.get_fixed_length_string(len.try_into().unwrap())?;
+              values.push(Some(value));
             } else if len == 0 {
               values.push(Some("".to_string()));
             } else if len == -1 {
@@ -829,14 +810,14 @@ impl Connection {
           results.push_back(QueryResult::Success);
         }
         b'Z' => {
-          self.read_ready_for_query().await?;
+          // self.read_ready_for_query().await?;
           break;
         }
-        b'E' => match self.read_backend_error().await {
+        b'E' => match buffer.get_backend_error() {
           err if err.kind() == io::ErrorKind::Other => results.push_back(QueryResult::BackendError(err)),
           err => return Err(err),
         },
-        b'N' => match self.read_backend_notice().await {
+        b'N' => match buffer.get_backend_notice() {
           notice if notice.kind() == io::ErrorKind::Other => notices.push_back(notice),
           notice => return Err(notice),
         },
@@ -847,87 +828,6 @@ impl Connection {
     }
 
     Ok(QueryResults { notices, results })
-  }
-
-  async fn read_ready_for_query(&mut self) -> io::Result<()> {
-    // ReadyForQuery (B)
-    //     Byte1('Z')
-    //         Identifies the message type. ReadyForQuery is sent whenever the backend is ready for a new query cycle.
-    //     Int32(5)
-    //         Length of message contents in bytes, including self.
-    //     Byte1
-    //         Current backend transaction status indicator. Possible values are 'I' if idle (not in a transaction block); 'T' if in a transaction block; or 'E' if in a failed transaction block (queries will be rejected until block is ended).
-    let status = self.stream.read_u8().await?;
-    Ok(())
-  }
-
-  async fn read_backend_error(&mut self) -> io::Error {
-    // https://www.postgresql.org/docs/11/protocol-error-fields.html
-    // ErrorResponse (B)
-    //     Byte1('E')
-    //         Identifies the message as an error.
-    //     Int32
-    //         Length of message contents in bytes, including self.
-    //     The message body consists of one or more identified fields, followed by a zero byte as a terminator. Fields can appear in any order. For each field there is the following:
-    //     Byte1
-    //         A code identifying the field type; if zero, this is the message terminator and no string follows. The presently defined field types are listed in Section 53.8. Since more field types might be added in future, frontends should silently ignore fields of unrecognized type.
-    //     String
-    //         The field value.
-    match self.read_fields().await {
-      Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
-      Ok(fields) => io::Error::new(
-        io::ErrorKind::Other,
-        format!("Server error {}: {}", fields[&'C'], fields[&'M']),
-      ),
-      Err(err) => err,
-    }
-  }
-
-  async fn read_backend_notice(&mut self) -> io::Error {
-    // https://www.postgresql.org/docs/11/protocol-error-fields.html
-    // NoticeResponse (B)
-    //     Byte1('N')
-    //         Identifies the message as a notice.
-    //     Int32
-    //         Length of message contents in bytes, including self.
-    //     The message body consists of one or more identified fields, followed by a zero byte as a terminator. Fields can appear in any order. For each field there is the following:
-    //     Byte1
-    //         A code identifying the field type; if zero, this is the message terminator and no string follows. The presently defined field types are listed in Section 53.8. Since more field types might be added in future, frontends should silently ignore fields of unrecognized type.
-    //     String
-    //         The field value.
-    match self.read_fields().await {
-      Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
-      Ok(fields) => io::Error::new(
-        io::ErrorKind::Other,
-        format!("Server notice {}: {}", fields[&'C'], fields[&'M']),
-      ),
-      Err(err) => err,
-    }
-  }
-
-  async fn read_fields(&mut self) -> io::Result<BTreeMap<char, String>> {
-    let mut fields = BTreeMap::new();
-    loop {
-      match self.stream.read_u8().await? {
-        0 => break,
-        token => {
-          let msg = self.read_c_string().await?;
-          fields.insert(char::from(token), msg);
-        }
-      }
-    }
-    Ok(fields)
-  }
-
-  async fn read_c_string(&mut self) -> io::Result<String> {
-    let mut bytes = Vec::new();
-    loop {
-      match self.stream.read_u8().await? {
-        0 => break,
-        b => bytes.push(b),
-      }
-    }
-    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
   }
 
   pub async fn close(mut self) -> io::Result<()> {
