@@ -4,9 +4,10 @@ use std::{
   path::PathBuf,
   pin::Pin,
   task::{Context, Poll},
+  time::Duration,
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::{
   io::{AsyncRead, AsyncWrite, BufStream, ReadBuf},
   net::{TcpStream, UnixStream},
@@ -87,7 +88,7 @@ impl Stream {
     }
   }
 
-  pub async fn read_packet(&mut self) -> io::Result<(u8, bytes::Bytes)> {
+  pub async fn read_packet(&mut self) -> io::Result<(u8, Bytes)> {
     let op = self.read_u8().await?;
     let len = (self.read_i32().await? - 4).try_into().unwrap();
     let mut buffer = BytesMut::with_capacity(len);
@@ -95,6 +96,26 @@ impl Stream {
       self.read_buf(&mut buffer).await?;
     }
     Ok((op, buffer.freeze()))
+  }
+
+  pub async fn read_packet_with_timeout(&mut self, duration: Option<Duration>) -> io::Result<(u8, Bytes)> {
+    match duration {
+      Some(duration) => tokio::time::timeout(duration, self.read_packet())
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "read timed out"))
+        .and_then(|r| r),
+      None => self.read_packet().await,
+    }
+  }
+
+  pub async fn flush_with_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
+    match duration {
+      Some(duration) => tokio::time::timeout(duration, self.flush())
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))
+        .and_then(|r| r),
+      None => self.flush().await,
+    }
   }
 
   pub async fn duplicate(&self) -> io::Result<Self> {
@@ -105,6 +126,16 @@ impl Stream {
       Stream::Ssl((_, addrs, domain, ssl_connector)) => {
         Self::connect_ssl(addrs.clone(), domain.clone(), ssl_connector.clone()).await
       }
+    }
+  }
+
+  pub async fn duplicate_with_timeout(&self, duration: Option<Duration>) -> io::Result<Self> {
+    match duration {
+      Some(duration) => tokio::time::timeout(duration, self.duplicate())
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
+        .and_then(|r| r),
+      None => self.duplicate().await,
     }
   }
 }

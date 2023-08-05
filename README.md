@@ -8,29 +8,27 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
 
 # TODOS:
 
-- [ ] simple postgresql client (> v11)
-  - [x] auth
-    - [x] password
-    - [x] deprecated md5
-    - [x] scram-sha-256
-    - [x] ssl (partial)
-  - [x] read/write/connect timeouts
+- [ ] simple postgresql client (>= v11)
+  - [x] auth (cleartext password, md5, scram-sha-256, ssl)
+  - [x] timeouts (connect, read, write)
   - [x] simple query support
   - [x] query cancellation support
   - [x] create/exists/delete replication slot
-  - [ ] create replication stream using replication slot
+  - [ ] wal streaming
     - [x] read wal2json v2 events
     - [x] commit cursor position
-    - [ ] parse row event values based on their column type
-    - [ ] support timelines
-- [ ] simple mysql client (> v8)
+    - [ ] read wal events (without wal2json)
+    - [ ] timeline support
+- [ ] pg2kafka
+- [ ] simple mysql client (>= v8)
   - [ ] auth
     - [x] mysql_native_password
     - [ ] caching_sha2_password (see https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password)
     - [ ] ssl
   - [x] simple query support
+  - [ ] query cancellation support
   - [x] switch connection to replica
-  - [ ] stream binary log events
+  - [ ] binlog streaming
     - [x] supports row based replication events
       - [x] support INSERT/UPDATE/DELETE events
       - [ ] parse row event values based on their column type
@@ -44,6 +42,7 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
         - [x] _partial_ Date and Time
         - [ ] _partial_ JSON (needs custom parser)
     - [x] commit cursor position
+- [ ] mysql2kafka
 - [x] bridge pg/mysql schema to standardized schema
 - [x] stream values and write them to sink
 
@@ -54,19 +53,18 @@ docker-compose up
 cargo test
 ```
 
-# Special configs
+# Special configs & implementation notes
 
 - pg
   - `wal_level=logical`
 - mysql ([ref gcp](https://cloud.google.com/datastream/docs/configure-your-source-mysql-database))
+
   - `--default-authentication-plugin=mysql_native_password`
   - `--binlog-format=ROW` (default)
   - `--binlog-row-image=FULL` (default)
   - `--binlog-checksum=NONE` (TODO: remove this)
   - `--binlog-row-metadata=FULL`
   - `GRANT REPLICATION SLAVE, SELECT, REPLICATION CLIENT ON *.* TO 'mysql'@'%';`
-
-# Notes
 
 - Only support UTF8
 - MYSQL shenenigans
@@ -77,3 +75,4 @@ cargo test
 - https://www.postgresql.org/docs/current/libpq-envars.html
 - https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html#Table_table_map_event_optional_metadata
 - https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp
+- https://www.postgresql.org/docs/current/protocol.html

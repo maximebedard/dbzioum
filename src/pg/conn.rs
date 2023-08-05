@@ -221,33 +221,15 @@ impl Connection {
   }
 
   async fn stream_duplicate(&self) -> io::Result<Stream> {
-    match self.options.connect_timeout {
-      Some(connect_timeout) => tokio::time::timeout(connect_timeout, self.stream.duplicate())
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
-        .and_then(|r| r),
-      None => self.stream.duplicate().await,
-    }
-  }
-
-  async fn stream_read_packet(&mut self) -> io::Result<(u8, Bytes)> {
-    match self.options.read_timeout {
-      Some(read_timeout) => tokio::time::timeout(read_timeout, self.stream.read_packet())
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "read timed out"))
-        .and_then(|r| r),
-      None => self.stream.read_packet().await,
-    }
+    self.stream.duplicate_with_timeout(self.options.connect_timeout).await
   }
 
   async fn stream_flush(&mut self) -> io::Result<()> {
-    match self.options.write_timeout {
-      Some(write_timeout) => tokio::time::timeout(write_timeout, self.stream.flush())
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))
-        .and_then(|r| r),
-      None => self.stream.flush().await,
-    }
+    self.stream.flush_with_timeout(self.options.write_timeout).await
+  }
+
+  async fn stream_read_packet(&mut self) -> io::Result<(u8, Bytes)> {
+    self.stream.read_packet_with_timeout(self.options.read_timeout).await
   }
 
   // https://www.postgresql.org/docs/11/protocol.html
@@ -656,7 +638,19 @@ impl Connection {
       }
     }
 
-    Ok(ReplicationStream { stream: self.stream })
+    let Connection { stream, options, .. } = self;
+    let ConnectionOptions {
+      connect_timeout,
+      read_timeout,
+      write_timeout,
+      ..
+    } = options;
+    Ok(ReplicationStream {
+      stream,
+      connect_timeout,
+      read_timeout,
+      write_timeout,
+    })
   }
 
   pub async fn create_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<CreateReplicationSlot> {

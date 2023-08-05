@@ -7,11 +7,14 @@ use std::{
 use bytes::Buf;
 use tokio::io::AsyncWriteExt;
 
-use super::stream::Stream;
+use super::{buf_ext::BufExt, stream::Stream};
 
 #[derive(Debug)]
 pub struct ReplicationStream {
   pub(crate) stream: Stream,
+  pub(crate) connect_timeout: Option<Duration>,
+  pub(crate) read_timeout: Option<Duration>,
+  pub(crate) write_timeout: Option<Duration>,
 }
 
 impl ReplicationStream {
@@ -33,14 +36,8 @@ impl ReplicationStream {
     let (op, mut buffer) = self.stream.read_packet().await?;
 
     match op {
-      b'E' => {
-        todo!("handle backend error")
-        // return Err(self.read_backend_error().await);
-      }
-      b'N' => {
-        todo!("handle backend notice")
-        // self.read_backend_notice().await;
-      }
+      b'E' => Err(buffer.pg_get_backend_error()),
+      b'N' => Err(buffer.pg_get_backend_notice()),
       b'd' => {
         match buffer.get_u8() {
           b'w' => {
