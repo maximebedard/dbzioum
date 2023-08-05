@@ -1,0 +1,17 @@
+[package]
+name = "pg2kafka"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["ssl"]
+ssl = ["pg/ssl"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4.2" }
+url = { version = "2.3" }
+pg = { path = "../pg" }
+sink = { path = "../sink" }

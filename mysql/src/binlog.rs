@@ -1,4 +1,4 @@
-use crate::mysql::constants::{CharacterSet, ColumnMetadataType};
+use crate::constants::{CharacterSet, ColumnMetadataType};
 
 use super::constants::ColumnType;
 use super::{buf_ext::BufExt, constants::BinlogEventType};
@@ -223,7 +223,7 @@ impl TableMapEvent {
       Ok(column_charsets)
     }
 
-    fn parse_str_value(b: Bytes) -> io::Result<Vec<String>> {
+    fn parse_str_value(_b: Bytes) -> io::Result<Vec<String>> {
       todo!()
     }
 
@@ -446,7 +446,7 @@ impl FormatDescriptionEvent {
   fn parse(mut b: Bytes) -> io::Result<Self> {
     let version = b.get_u16_le();
 
-    let server_version = b.split_to(50);
+    let _server_version = b.split_to(50);
 
     let server_version = b.mysql_get_null_terminated_string().unwrap();
 
@@ -560,7 +560,7 @@ impl RowEvent {
             8 => Value::F64(b.get_f64_le()),
             _ => unreachable!(),
           },
-          ColumnTypeDefinition::Decimal { precision, scale } => {
+          ColumnTypeDefinition::Decimal { precision: _, scale: _ } => {
             let len = b.mysql_get_lenc_uint().try_into().unwrap();
             let buffer = b.copy_to_bytes(len);
             Value::Decimal(buffer)

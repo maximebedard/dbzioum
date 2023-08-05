@@ -65,14 +65,14 @@ impl Stream {
         // https://www.postgresql.org/docs/11/protocol-flow.html#id-1.10.5.7.11
         let connect_configuration = ssl_connector
           .configure()
-          .map_err(|err| io::Error::new(io::ErrorKind::Other, "Failed to create SSL configuration"))?;
+          .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to create SSL configuration"))?;
 
         let ssl = connect_configuration
           .into_ssl(domain.as_str())
-          .map_err(|err| io::Error::new(io::ErrorKind::Other, "Failed to create SSL context"))?;
+          .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to create SSL context"))?;
 
         let mut ssl_stream =
-          SslStream::new(ssl, s).map_err(|err| io::Error::new(io::ErrorKind::Other, "Failed to create SSL stream"))?;
+          SslStream::new(ssl, s).map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to create SSL stream"))?;
 
         Pin::new(&mut ssl_stream)
           .connect()
@@ -102,7 +102,7 @@ impl Stream {
     match duration {
       Some(duration) => tokio::time::timeout(duration, self.read_packet())
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "read timed out"))
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read timed out"))
         .and_then(|r| r),
       None => self.read_packet().await,
     }
@@ -112,7 +112,7 @@ impl Stream {
     match duration {
       Some(duration) => tokio::time::timeout(duration, self.flush())
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))
         .and_then(|r| r),
       None => self.flush().await,
     }
@@ -133,7 +133,7 @@ impl Stream {
     match duration {
       Some(duration) => tokio::time::timeout(duration, self.duplicate())
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
         .and_then(|r| r),
       None => self.duplicate().await,
     }

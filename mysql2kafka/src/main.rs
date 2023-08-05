@@ -1,14 +1,11 @@
 use clap::{value_parser, Arg, Command};
 use url::Url;
 
-use dbzioum::{
-  mysql::{
-    self,
-    binlog::{self, TableMapEvent},
-    BinlogCursor,
-  },
-  sink::{Column, ColumnType, ColumnValue, RowEvent},
+use mysql::{
+  binlog::{self, TableMapEvent},
+  BinlogCursor,
 };
+use sink::{Column, ColumnType, ColumnValue, RowEvent};
 
 #[tokio::main]
 async fn main() {

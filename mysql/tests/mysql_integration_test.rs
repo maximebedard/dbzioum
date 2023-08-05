@@ -1,6 +1,6 @@
 use std::env;
 
-use dbzioum::mysql::{binlog::BinlogEvent, Connection, ConnectionOptions};
+use mysql::{binlog::BinlogEvent, Connection, ConnectionOptions};
 
 #[tokio::test]
 async fn test_ping() {

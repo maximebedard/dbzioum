@@ -3,13 +3,11 @@ use std::time::Duration;
 use clap::{Arg, Command};
 use url::Url;
 
-use dbzioum::{
-  pg::{
-    conn::Connection,
-    wal::{ColumnChange, DataChange, ReplicationEvent, WalCursor},
-  },
-  sink::{Column, ColumnType, ColumnValue, RowEvent},
+use pg::{
+  conn::Connection,
+  wal::{ColumnChange, DataChange, ReplicationEvent, WalCursor},
 };
+use sink::{Column, ColumnType, ColumnValue, RowEvent};
 
 #[tokio::main]
 async fn main() {

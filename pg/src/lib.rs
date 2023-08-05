@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[cfg(feature = "ssl")]
 pub use openssl;
 

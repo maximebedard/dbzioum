@@ -1,30 +1,5 @@
-[package]
-name = "dbzioum"
-version = "0.1.0"
-edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[features]
-default = ["ssl"]
-ssl = ["dep:openssl", "dep:openssl-sys", "dep:tokio-openssl"]
 
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-bytes = { version = "1" }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1" }
-hyper = { version = "0.14", features = ["client", "http2", "tcp"]}
-base64 = { version = "0.13" }
-openssl-sys = { version = "0.9", optional = true }
-openssl = { version = "0.10", optional = true }
-tokio-openssl = { version = "0.6", optional = true }
-chrono = { version = "0.4" }
-bitflags = { version = "2.0" }
-md-5 = { version = "0.10" }
-sha1 = { version = "0.10" }
-sha2 = { version = "0.10" }
-clap = { version = "4.2" }
-rand = { version = "0.8" }
-url = { version = "2.3" }
-hmac = { version = "0.12" }
+[workspace]
+members = ["mysql", "mysql2kafka", "pg", "pg2kafka", "sink"]

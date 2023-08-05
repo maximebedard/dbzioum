@@ -126,7 +126,7 @@ impl Connection {
     let stream = match options.connect_timeout {
       Some(connect_timeout) => tokio::time::timeout(connect_timeout, Stream::connect_tcp(addrs))
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        .map_err(|_err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
         .and_then(|r| r),
       None => Stream::connect_tcp(addrs).await,
     }?;
@@ -137,7 +137,7 @@ impl Connection {
     let stream = match options.connect_timeout {
       Some(connect_timeout) => tokio::time::timeout(connect_timeout, Stream::connect_unix(path))
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        .map_err(|_err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
         .and_then(|r| r),
       None => Stream::connect_unix(path).await,
     }?;
@@ -179,7 +179,7 @@ impl Connection {
     let stream = match options.connect_timeout {
       Some(connect_timeout) => tokio::time::timeout(connect_timeout, Stream::connect_ssl(addrs, domain, ssl_connector))
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
         .and_then(|r| r),
       None => Stream::connect_ssl(addrs, domain, ssl_connector).await,
     }?;
@@ -480,7 +480,7 @@ impl Connection {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
               } else if let Some(verifier) = sasl_final_response.strip_prefix("v=") {
                 let verifier = base64::decode(verifier)
-                  .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, "Failed to decode base64 sasl verifier"))?;
+                  .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to decode base64 sasl verifier"))?;
 
                 let server_key = Hmac::<Sha256>::new_from_slice(&salted_password)
                   .unwrap()
@@ -595,7 +595,7 @@ impl Connection {
   }
 
   pub async fn ping(&mut self) -> io::Result<()> {
-    self.query_first("SELECT 1").await.map(|_| ())
+    self.query_first("SELECT 1").await.map(|_r| ())
   }
 
   pub async fn start_replication_stream(
@@ -625,7 +625,7 @@ impl Connection {
         let format = buffer.get_i8();
         let num_columns = buffer.get_i16();
         let mut column_formats = vec![0; num_columns.try_into().unwrap()];
-        for i in 0..column_formats.len() {
+        for _i in 0..column_formats.len() {
           column_formats.push(buffer.get_i16());
         }
 
@@ -675,8 +675,10 @@ impl Connection {
   }
 
   pub async fn delete_replication_slot(&mut self, slot: impl AsRef<str>) -> io::Result<()> {
-    let result = self.query(format!("DROP_REPLICATION_SLOT {}", slot.as_ref())).await?;
-    Ok(())
+    self
+      .query(format!("DROP_REPLICATION_SLOT {}", slot.as_ref()))
+      .await
+      .map(|_r| ())
   }
 
   pub async fn replication_slot_exists(&mut self, slot: impl AsRef<str>) -> io::Result<bool> {
@@ -757,7 +759,7 @@ impl Connection {
           //         For a MOVE command, the tag is MOVE rows where rows is the number of rows the cursor's position has been changed by.
           //         For a FETCH command, the tag is FETCH rows where rows is the number of rows that have been retrieved from the cursor.
           //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
-          let op = buffer.pg_get_null_terminated_string()?;
+          let _op = buffer.pg_get_null_terminated_string()?;
           match current.take() {
             Some(select_query_result) => results.push_back(QueryResult::Selected(select_query_result)),
             None => results.push_back(QueryResult::Success),
@@ -816,7 +818,7 @@ impl Connection {
           //         The format code being used for the field. Currently will be zero (text) or one (binary). In a RowDescription returned from the statement variant of Describe, the format code is not yet known and will always be zero.
           let mut columns = Vec::new();
           let num_columns = buffer.get_i16();
-          for i in 0..num_columns {
+          for _i in 0..num_columns {
             let name = buffer.pg_get_null_terminated_string()?;
             let oid = buffer.get_i32();
             let attr_number = buffer.get_i16();
@@ -855,7 +857,7 @@ impl Connection {
           //         The value of the column, in the format indicated by the associated format code. n is the above length.
           let values = &mut current.as_mut().unwrap().values;
           let num_values = buffer.get_i16();
-          for i in 0..num_values {
+          for _i in 0..num_values {
             let len = buffer.get_i32();
 
             if len > 0 {

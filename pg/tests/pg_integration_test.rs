@@ -1,4 +1,4 @@
-use dbzioum::pg::{
+use pg::{
   conn::{Connection, ConnectionOptions},
   openssl,
   query::{CreateReplicationSlot, IdentifySystem},
@@ -19,7 +19,7 @@ async fn test_ping_user_postgres() {
 #[cfg(feature = "ssl")]
 async fn test_ping_user_ssl() {
   let mut ssl_connector_builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
-  ssl_connector_builder.set_ca_file("scripts/pg/server.crt").unwrap();
+  ssl_connector_builder.set_ca_file("../scripts/pg/server.crt").unwrap();
 
   let mut conn = Connection::connect_ssl(
     default_addrs(),

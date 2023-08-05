@@ -1,4 +1,5 @@
 use std::fmt::{self, Debug};
+
 pub struct DebugBytesRef<'a>(pub &'a [u8]);
 
 impl Debug for DebugBytesRef<'_> {

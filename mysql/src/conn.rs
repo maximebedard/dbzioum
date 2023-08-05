@@ -13,6 +13,7 @@ use tokio::net::{self, TcpStream};
 use crate::debug::DebugBytesRef;
 
 use super::binlog::BinlogEventPacket;
+
 use super::buf_ext::{BufExt, BufMutExt};
 use super::constants::{
   BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType, Command, StatusFlags,
@@ -296,7 +297,7 @@ impl Connection {
   async fn read_columns(&mut self, column_count: usize) -> io::Result<Vec<Column>> {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::Resultset
     let mut columns = Vec::with_capacity(column_count);
-    for i in 0..column_count {
+    for _i in 0..column_count {
       let payload = self.read_payload().await?;
       match payload.first() {
         Some(0x00) => {
@@ -330,7 +331,7 @@ impl Connection {
           break;
         }
         Some(_) => {
-          for i in 0..columns.len() {
+          for _i in 0..columns.len() {
             match payload.first() {
               Some(0xFB) => {
                 payload.advance(1);
@@ -360,7 +361,7 @@ impl Connection {
     Ok(row_values)
   }
 
-  async fn authenticate(&mut self, auth_plugin_name: &str, nonce: &[u8]) -> io::Result<()> {
+  async fn authenticate(&mut self, auth_plugin_name: &str, _nonce: &[u8]) -> io::Result<()> {
     let payload = self.read_payload().await?;
 
     // 0x00 = Ok, 0xFF = Err, 0xFE = AuthSwitch, 0x01 = AuthMoreData
@@ -378,7 +379,7 @@ impl Connection {
 
         Err(io::Error::new(io::ErrorKind::InvalidData, "todo"))
       }
-      other => unimplemented!(),
+      _other => unimplemented!(),
     }
   }
 
@@ -597,7 +598,7 @@ pub fn scramble_password(
     (password, CACHING_SHA2_PASSWORD_PLUGIN_NAME) => {
       Ok(super::scramble::scramble_sha256(nonce.as_ref(), password.as_bytes()).map(|x| x.to_vec()))
     }
-    (password, custom_plugin_name) => unimplemented!(),
+    (_password, _custom_plugin_name) => unimplemented!(),
   }
 }
 
@@ -616,8 +617,8 @@ impl Handshake {
   fn parse(mut b: Bytes) -> io::Result<Self> {
     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
     let protocol_version = b.get_u8();
-    let server_version = b.mysql_get_null_terminated_string()?;
-    let connection_id = b.get_u32_le();
+    let _server_version = b.mysql_get_null_terminated_string()?;
+    let _connection_id = b.get_u32_le();
     let scramble_1 = b.split_to(8);
     b.advance(1);
     let capabilities_1 = b.get_u16_le();
@@ -826,7 +827,7 @@ impl Column {
     let table = b.mysql_get_lenc_string().unwrap();
     let org_table = b.mysql_get_lenc_string().unwrap();
     let name = b.mysql_get_lenc_string().unwrap();
-    let org_name = b.mysql_get_lenc_string().unwrap();
+    let _org_name = b.mysql_get_lenc_string().unwrap();
     let fixed_len = b.mysql_get_lenc_uint();
     assert_eq!(0x0C, fixed_len);
     let character_set = (b.get_u16_le() as u8).try_into().unwrap();
