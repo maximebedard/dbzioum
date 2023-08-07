@@ -1,14 +1,10 @@
 # dbzioum
 
-Fun weekend project that aims to be similar to [debezium](https://debezium.io/). It currently supports postgresql@11 and mysql@8 and stream row changes to STDOUT.
+Event log streamer for postgresql@11 and mysql@8, heavily inspired from [debezium](https://debezium.io/). Work in progress.
 
-# Why
+# Features
 
-Started as a hackaton project where we originally wanted to stream rows from MYSQL 5.6 to [noria](https://github.com/mit-pdos/noria). Then I had a similar use case to stream rows from postgres, so I attempted to merge the two projects into one.
-
-# TODOS:
-
-- [ ] simple postgresql client (>= v11)
+- [ ] pg: simple postgresql client (>= v11)
   - [x] auth (cleartext password, md5, scram-sha-256, ssl)
   - [x] timeouts (connect, read, write)
   - [x] simple query support
@@ -20,7 +16,8 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
     - [ ] read wal events (without wal2json)
     - [ ] timeline support
 - [ ] pg2kafka
-- [ ] simple mysql client (>= v8)
+  - [ ] bridge pg events to row events
+- [ ] mysql: simple mysql client (>= v8)
   - [ ] auth
     - [x] mysql_native_password
     - [ ] caching_sha2_password (see https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password)
@@ -31,7 +28,7 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
   - [ ] binlog streaming
     - [x] supports row based replication events
       - [x] support INSERT/UPDATE/DELETE events
-      - [ ] parse row event values based on their column type
+      - [ ] parse mysql row event values
         - [x] Integers (integer, int, smallint, tinyint, mediumint, bigint)
         - [ ] _partial_ Fixed point (decimal, numeric) (needs custom parser)
         - [x] Floating point (float, double)
@@ -43,8 +40,10 @@ Started as a hackaton project where we originally wanted to stream rows from MYS
         - [ ] _partial_ JSON (needs custom parser)
     - [x] commit cursor position
 - [ ] mysql2kafka
-- [x] bridge pg/mysql schema to standardized schema
-- [x] stream values and write them to sink
+  - [ ] bridge mysql events to row events
+- [ ] sink:
+  - [x] standardized row events
+  - [ ] filter row events by table
 
 # testing
 

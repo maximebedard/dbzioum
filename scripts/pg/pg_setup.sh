@@ -88,15 +88,15 @@ local   all             postgres                             trust
 CONF
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-SQL
-  CREATE ROLE pass_user PASSWORD 'password' LOGIN;
-  SET password_encryption to 'md5';
-  CREATE ROLE md5_user PASSWORD 'password' LOGIN;
-  SET password_encryption TO 'scram-sha-256';
-  CREATE ROLE scram_user PASSWORD 'password' LOGIN;
-  CREATE ROLE ssl_user LOGIN;
+CREATE ROLE pass_user PASSWORD 'password' LOGIN;
+SET password_encryption to 'md5';
+CREATE ROLE md5_user PASSWORD 'password' LOGIN;
+SET password_encryption TO 'scram-sha-256';
+CREATE ROLE scram_user PASSWORD 'password' LOGIN;
+CREATE ROLE ssl_user LOGIN;
 
-  ALTER USER pass_user WITH REPLICATION;
-  ALTER USER md5_user WITH REPLICATION;
-  ALTER USER scram_user WITH REPLICATION;
-  ALTER USER ssl_user WITH REPLICATION;
+ALTER USER pass_user WITH REPLICATION;
+ALTER USER md5_user WITH REPLICATION;
+ALTER USER scram_user WITH REPLICATION;
+ALTER USER ssl_user WITH REPLICATION;
 SQL

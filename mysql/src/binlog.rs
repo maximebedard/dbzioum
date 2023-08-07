@@ -1,6 +1,4 @@
-use crate::constants::{CharacterSet, ColumnMetadataType};
-
-use super::constants::ColumnType;
+use super::constants::{CharacterSet, ColumnMetadataType, ColumnType};
 use super::{buf_ext::BufExt, constants::BinlogEventType};
 use bytes::{Buf, Bytes};
 use std::io;

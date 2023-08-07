@@ -1,59 +1,107 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
 use std::cmp::max;
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::time::Duration;
 use url::Url;
 
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::slice::{ChunksExact, ChunksExactMut};
-use std::{fmt, io};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
-use tokio::net::{self, TcpStream};
 
-use crate::debug::DebugBytesRef;
+use std::{fmt, io};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net;
+
+use crate::stream::Stream;
+
+use super::buf_ext::BufMutExt;
+use super::query::{Column, QueryResults, RowValue};
+use super::scramble;
+
+use super::debug::DebugBytesRef;
 
 use super::binlog::BinlogEventPacket;
 
-use super::buf_ext::{BufExt, BufMutExt};
+use super::buf_ext::BufExt;
 use super::constants::{
-  BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnFlags, ColumnType, Command, StatusFlags,
-  CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
+  BinlogDumpFlags, CapabilityFlags, CharacterSet, Command, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME,
+  MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
+
+#[cfg(feature = "ssl")]
+use openssl::ssl::SslConnector;
 
 #[derive(Debug, Clone)]
 pub struct ConnectionOptions {
-  pub addr: SocketAddr,
   pub user: String,
   pub password: Option<String>,
   pub database: Option<String>,
-  pub hostname: Option<String>,
-  pub use_compression: bool,
-  pub use_ssl: bool,
+  pub connect_timeout: Option<Duration>,
+  pub read_timeout: Option<Duration>,
+  pub write_timeout: Option<Duration>,
 }
 
 impl Default for ConnectionOptions {
   fn default() -> Self {
     Self {
-      addr: "[::]:3306".parse().unwrap(),
-      user: "root".to_string(),
+      user: "mysql".to_string(),
       password: None,
       database: None,
-      hostname: None,
-      use_compression: false,
-      use_ssl: false,
+      connect_timeout: None,
+      read_timeout: None,
+      write_timeout: None,
     }
+  }
+}
+
+impl TryFrom<&Url> for ConnectionOptions {
+  type Error = io::Error;
+
+  fn try_from(url: &Url) -> Result<Self, Self::Error> {
+    let user = match url.username() {
+      "" => "mysql".to_string(),
+      user => user.to_string(),
+    };
+    let password = url.password().map(ToString::to_string);
+
+    let query_pairs = url.query_pairs().collect::<BTreeMap<_, _>>();
+    let database = query_pairs.get("database").map(|v| v.to_string());
+
+    let connect_timeout = query_pairs
+      .get("connect_timeout_ms")
+      .and_then(|v| v.parse().ok())
+      .map(Duration::from_millis);
+
+    let read_timeout = query_pairs
+      .get("read_timeout_ms")
+      .and_then(|v| v.parse().ok())
+      .map(Duration::from_millis);
+
+    let write_timeout = query_pairs
+      .get("write_timeout_ms")
+      .and_then(|v| v.parse().ok())
+      .map(Duration::from_millis);
+
+    Ok(Self {
+      user,
+      password,
+      database,
+      connect_timeout,
+      read_timeout,
+      write_timeout,
+    })
   }
 }
 
 #[derive(Debug)]
 pub struct Connection {
-  stream: BufStream<TcpStream>,
+  stream: Stream,
   capabilities: CapabilityFlags,
   status_flags: StatusFlags,
   server_character_set: CharacterSet,
   sequence_id: u8,
   last_command_id: u8,
-  opts: ConnectionOptions,
+  options: ConnectionOptions,
   max_packet_size: u32,
   warnings: u16,
   affected_rows: u64,
@@ -61,43 +109,67 @@ pub struct Connection {
 }
 
 impl Connection {
-  pub async fn connect_from_url(u: &Url) -> io::Result<Self> {
-    assert_eq!("tcp", u.scheme()); // only support tcp for now
-    let user = match u.username() {
-      "" => "root".to_string(),
-      user => user.to_string(),
-    };
-    let password = u.password().map(|v| v.to_string());
-    let port = u.port().unwrap_or(3306);
-    let addr = match u.host() {
-      Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
-        .await
-        .and_then(|mut v| {
-          v.next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "unable to find host"))
-        })?,
-      Some(url::Host::Ipv4(ip)) => SocketAddrV4::new(ip, port).into(),
-      Some(url::Host::Ipv6(ip)) => SocketAddrV6::new(ip, port, 0, 0).into(),
-      None => format!("[::]:{port}").parse().unwrap(),
-    };
-
-    let query_pairs = u
-      .query_pairs()
-      .map(|(k, v)| (k.to_string(), v.to_string()))
-      .collect::<BTreeMap<String, String>>();
-    let database = query_pairs.get("database").cloned();
-
-    let opts = ConnectionOptions {
-      addr,
-      user,
-      password,
-      database,
-      ..Default::default()
-    };
-    Self::connect(opts).await
+  pub async fn connect_from_url(url: &Url) -> io::Result<Self> {
+    match url.scheme() {
+      "tcp" => {
+        let port = url.port().unwrap_or(3306);
+        let addrs = match url.host() {
+          Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
+            .await
+            .map(|v| v.collect::<Vec<_>>())?,
+          Some(url::Host::Ipv4(ip)) => vec![SocketAddrV4::new(ip, port).into()],
+          Some(url::Host::Ipv6(ip)) => vec![SocketAddrV6::new(ip, port, 0, 0).into()],
+          None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "url has no host")),
+        };
+        let options = url.try_into()?;
+        Self::connect_tcp(addrs, options).await
+      }
+      scheme => Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not supported", scheme),
+      )),
+    }
   }
 
-  pub async fn connect(opts: impl Into<ConnectionOptions>) -> io::Result<Self> {
+  #[cfg(feature = "ssl")]
+  pub async fn connect_ssl_from_url(url: &Url, ssl_connector: SslConnector) -> io::Result<Self> {
+    match url.scheme() {
+      "tcp" => {
+        let port = url.port().unwrap_or(3306);
+        let (domain, addrs) = match url.host() {
+          Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
+            .await
+            .map(|v| (domain.to_string(), v.collect::<Vec<_>>()))?,
+          Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![SocketAddrV4::new(ip, port).into()]),
+          Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![SocketAddrV6::new(ip, port, 0, 0).into()]),
+          None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "url has no host")),
+        };
+        let options = url.try_into()?;
+        Self::connect_ssl(addrs, domain, options, ssl_connector).await
+      }
+      scheme => Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is not supported", scheme),
+      )),
+    }
+  }
+
+  pub async fn connect_tcp(addrs: impl Into<Vec<SocketAddr>>, options: ConnectionOptions) -> io::Result<Self> {
+    let stream = Stream::connect_tcp(addrs).await?;
+    Self::connect(stream, options).await
+  }
+
+  #[cfg(feature = "ssl")]
+  pub async fn connect_ssl(
+    _addrs: impl Into<Vec<SocketAddr>>,
+    _domain: impl Into<String>,
+    _options: ConnectionOptions,
+    _ssl_connector: SslConnector,
+  ) -> io::Result<Self> {
+    todo!()
+  }
+
+  async fn connect(stream: Stream, options: ConnectionOptions) -> io::Result<Self> {
     let capabilities = CapabilityFlags::empty();
     let status_flags = StatusFlags::empty();
     let server_character_set = CharacterSet::UTF8MB4;
@@ -107,12 +179,9 @@ impl Connection {
     let warnings = 0;
     let affected_rows = 0;
     let max_packet_size = 16_777_216; // 16MB
-    let opts = opts.into();
-    let io = TcpStream::connect(opts.addr).await?;
-    let io = BufStream::new(io);
 
     let mut connection = Self {
-      stream: io,
+      stream,
       capabilities,
       sequence_id,
       last_command_id,
@@ -120,7 +189,7 @@ impl Connection {
       warnings,
       affected_rows,
       max_packet_size, // 16MB
-      opts,
+      options,
       status_flags,
       server_character_set,
     };
@@ -131,7 +200,8 @@ impl Connection {
   }
 
   pub async fn duplicate(&self) -> io::Result<Self> {
-    Self::connect(self.opts.clone()).await
+    let stream = self.stream.duplicate().await?;
+    Self::connect(stream, self.options.clone()).await
   }
 
   pub async fn close(mut self) -> io::Result<()> {
@@ -171,6 +241,7 @@ impl Connection {
   }
 
   async fn handle_handshake(&mut self, p: Handshake) -> io::Result<()> {
+    // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
     if p.protocol_version != 10u8 {
       unimplemented!()
     }
@@ -180,30 +251,60 @@ impl Connection {
     }
 
     // Intersection between what the server supports, and what our client supports.
-    self.capabilities = p.capabilities & default_client_capabilities(&self.opts);
+    self.capabilities = p.capabilities & default_client_capabilities(&self.options);
     self.status_flags = p.status_flags;
     self.server_character_set = p.character_set;
 
-    if self.opts.use_ssl {
-      // TODO: ssl
-      unimplemented!()
-    }
+    // if self.options.use_ssl {
+    //   // TODO: ssl
+    //   unimplemented!()
+    // }
 
-    let nonce = p.nonce();
-    let auth_plugin_name = p.auth_plugin_name.clone().unwrap_or_default();
-    let password = self.opts.password.clone().unwrap_or_default();
-    let auth_data = scramble_password(&auth_plugin_name, &password, &nonce)?;
     self
-      .write_handshake_response(auth_plugin_name.as_str(), auth_data)
+      .write_handshake_response(p.auth_plugin.as_str(), p.nonce().chunk())
       .await?;
-    self.authenticate(auth_plugin_name.as_str(), &nonce).await?;
-
-    if self.opts.use_compression {
-      // TODO: wrap stream to a compressed stream.
-      unimplemented!()
-    }
+    self.read_auth_switch_request().await?;
 
     Ok(())
+  }
+
+  pub async fn read_auth_switch_request(&mut self) -> io::Result<()> {
+    loop {
+      let mut payload = self.read_payload().await?;
+
+      match payload.first() {
+        Some(0x00) => return self.parse_and_handle_server_ok(payload),
+        // AuthMoreData
+        Some(0x01) => {
+          if payload.chunk() == &[0x01, 0x04] {
+            return Err(io::Error::new(io::ErrorKind::ConnectionReset, "SSL required"));
+          }
+
+          todo!("AuthMoreData");
+        }
+        // AuthNextFactor
+        Some(0x02) => {
+          todo!("AuthNextFactor");
+        }
+        // AuthSwitch
+        Some(0xFE) => {
+          payload.advance(1);
+          let auth_plugin = payload.mysql_get_null_terminated_string()?;
+          let nonce = payload.mysql_get_null_terminated_string()?;
+          self
+            .write_auth_switch_response(auth_plugin.as_str(), nonce.as_bytes())
+            .await?;
+        }
+        Some(0xFF) => return Err(self.parse_and_handle_server_error(payload)),
+        Some(_) => panic!(),
+        None => {
+          return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Unexpected EOF while parsing login response",
+          ))
+        }
+      }
+    }
   }
 
   /// Send a text query to MYSQL and returns a result set.
@@ -361,28 +462,6 @@ impl Connection {
     Ok(row_values)
   }
 
-  async fn authenticate(&mut self, auth_plugin_name: &str, _nonce: &[u8]) -> io::Result<()> {
-    let payload = self.read_payload().await?;
-
-    // 0x00 = Ok, 0xFF = Err, 0xFE = AuthSwitch, 0x01 = AuthMoreData
-    match auth_plugin_name {
-      MYSQL_NATIVE_PASSWORD_PLUGIN_NAME | CACHING_SHA2_PASSWORD_PLUGIN_NAME => {
-        if let Some(&0x00) = payload.first() {
-          return self.parse_and_handle_server_ok(payload);
-        }
-
-        // TODO: figure out what is this actually used for???
-        if payload.chunk() == [0x01, 0x03] {
-          let payload = self.read_payload().await?;
-          return self.parse_and_handle_server_ok(payload);
-        }
-
-        Err(io::Error::new(io::ErrorKind::InvalidData, "todo"))
-      }
-      _other => unimplemented!(),
-    }
-  }
-
   fn handle_server_ok(&mut self, ok: ServerOk) {
     self.affected_rows = ok.affected_rows;
     self.last_inserted_id = ok.last_inserted_id;
@@ -392,44 +471,56 @@ impl Connection {
 
   async fn read_payload(&mut self) -> io::Result<Bytes> {
     let (sequence_id, payload) = self.read_packet().await?;
-    self.check_sequence_id(sequence_id)?;
+    if self.sequence_id != sequence_id {
+      return Err(io::Error::new(io::ErrorKind::InvalidData, "Packet is out of sync"));
+    }
+    self.sequence_id = self.sequence_id.wrapping_add(1);
     eprintln!("<< {:?}", DebugBytesRef(payload.chunk()));
     Ok(payload)
   }
 
-  fn check_sequence_id(&mut self, sequence_id: u8) -> io::Result<()> {
-    if self.sequence_id != sequence_id {
-      return Err(io::Error::new(io::ErrorKind::InvalidData, "Packet is out of sync"));
+  fn scramble_password(&self, auth_plugin: &str, nonce: &[u8]) -> io::Result<Vec<u8>> {
+    let password = self.options.password.as_ref().map(String::as_bytes).unwrap_or_default();
+
+    if password.is_empty() {
+      return Err(io::Error::new(io::ErrorKind::InvalidInput, "password is required"));
     }
 
-    self.sequence_id = self.sequence_id.wrapping_add(1);
-    Ok(())
+    match auth_plugin {
+      MYSQL_NATIVE_PASSWORD_PLUGIN_NAME => Ok(scramble::scramble_native(nonce, password).to_vec()),
+      CACHING_SHA2_PASSWORD_PLUGIN_NAME => Ok(scramble::scramble_sha256(nonce, password).to_vec()),
+      custom_auth_plugin => Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!("{} is not supported", custom_auth_plugin),
+      )),
+    }
   }
 
-  async fn write_handshake_response(
-    &mut self,
-    auth_plugin_name: &str,
-    scrambled_data: Option<Vec<u8>>,
-  ) -> io::Result<()> {
+  async fn write_auth_switch_response(&mut self, auth_plugin: &str, nonce: &[u8]) -> io::Result<()> {
+    let scrambled_data = self.scramble_password(auth_plugin, nonce)?;
+    self.write_payload(scrambled_data.into()).await
+  }
+
+  async fn write_handshake_response(&mut self, auth_plugin: &str, nonce: &[u8]) -> io::Result<()> {
     let mut b = BytesMut::new();
     b.put_u32_le(self.capabilities.bits());
     b.put_u32_le(self.max_packet_size);
     b.put_u8(CharacterSet::UTF8 as u8);
     b.put(&[0; 23][..]);
-    b.put(self.opts.user.as_bytes());
+    b.put(self.options.user.as_bytes());
     b.put_u8(0);
 
-    if let Some(scrambled_data) = scrambled_data {
-      b.mysql_put_lenc_uint(scrambled_data.len() as u64);
-      b.put(scrambled_data.as_slice());
-    }
+    let scrambled_data = self.scramble_password(auth_plugin, nonce)?;
 
-    if let Some(db_name) = self.opts.database.as_ref() {
+    b.mysql_put_lenc_uint(scrambled_data.len() as u64);
+    b.put(scrambled_data.as_slice());
+
+    if let Some(db_name) = self.options.database.as_ref() {
       b.put(db_name.as_bytes());
       b.put_u8(0);
     }
 
-    b.put(auth_plugin_name.as_bytes());
+    b.put(auth_plugin.as_bytes());
     b.put_u8(0);
 
     // TODO: connection attributes (e.g. name of the client, version, etc...)
@@ -440,9 +531,10 @@ impl Connection {
     let mut header = vec![0; 4];
     self.stream.read_exact(&mut header).await?;
 
-    let mut header_buffer = header.as_slice();
-    let payload_len = header_buffer.get_uint_le(3).try_into().unwrap();
-    let sequence_id = header_buffer.get_u8();
+    let mut header = header.as_slice();
+
+    let payload_len = header.get_uint_le(3).try_into().unwrap();
+    let sequence_id = header.get_u8();
 
     let mut payload = vec![0; payload_len];
     self.stream.read_exact(&mut payload).await?;
@@ -518,11 +610,11 @@ impl Connection {
   }
 
   async fn register_as_replica(&mut self, server_id: u32) -> io::Result<()> {
-    let ip = self.opts.addr.ip().to_string();
-    let hostname = ip.as_bytes();
-    let port = self.opts.addr.port();
-    let user = self.opts.user.as_bytes();
-    let password = self.opts.password.as_ref().map(|v| v.as_bytes()).unwrap_or(b"");
+    // TODO: figure out something else here...
+    let hostname = &b"localhost"[..];
+    let port = 1322;
+    let user = self.options.user.as_bytes();
+    let password = self.options.password.as_ref().map(String::as_bytes).unwrap_or(b"");
 
     let payload_len = 4 + 1 + hostname.len() + 1 + user.len() + 1 + password.len() + 2 + 4 + 4;
 
@@ -570,36 +662,15 @@ fn default_client_capabilities(opts: &ConnectionOptions) -> CapabilityFlags {
         // | CapabilityFlags::CLIENT_CONNECT_ATTRS
         | CapabilityFlags::CLIENT_DEPRECATE_EOF;
 
-  if opts.use_compression {
-    capabilities.insert(CapabilityFlags::CLIENT_COMPRESS);
-  }
-
   if opts.database.as_ref().filter(|v| !v.is_empty()).is_some() {
     capabilities.insert(CapabilityFlags::CLIENT_CONNECT_WITH_DB);
   }
 
-  if opts.use_ssl {
-    capabilities.insert(CapabilityFlags::CLIENT_SSL);
-  }
+  // if opts.use_ssl {
+  //   capabilities.insert(CapabilityFlags::CLIENT_SSL);
+  // }
 
   capabilities
-}
-
-pub fn scramble_password(
-  auth_plugin_name: impl AsRef<str>,
-  password: impl AsRef<str>,
-  nonce: impl AsRef<[u8]>,
-) -> io::Result<Option<Vec<u8>>> {
-  match (password.as_ref(), auth_plugin_name.as_ref()) {
-    ("", _) => Ok(None),
-    (password, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME) => {
-      Ok(super::scramble::scramble_native(nonce.as_ref(), password.as_bytes()).map(|x| x.to_vec()))
-    }
-    (password, CACHING_SHA2_PASSWORD_PLUGIN_NAME) => {
-      Ok(super::scramble::scramble_sha256(nonce.as_ref(), password.as_bytes()).map(|x| x.to_vec()))
-    }
-    (_password, _custom_plugin_name) => unimplemented!(),
-  }
 }
 
 #[derive(Debug)]
@@ -608,7 +679,7 @@ pub struct Handshake {
   protocol_version: u8,
   scramble_1: Bytes,
   scramble_2: Option<Bytes>,
-  auth_plugin_name: Option<String>,
+  auth_plugin: String,
   character_set: CharacterSet,
   status_flags: StatusFlags,
 }
@@ -628,6 +699,13 @@ impl Handshake {
 
     let capabilities = CapabilityFlags::from_bits_truncate(capabilities_1 as u32 | ((capabilities_2 as u32) << 16));
 
+    if !capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
+      return Err(io::Error::new(
+        io::ErrorKind::Other,
+        "CLIENT_PLUGIN_AUTH flag is not set",
+      ));
+    }
+
     let scramble_len: i16 = b.get_u8().try_into().unwrap();
     b.advance(10);
 
@@ -635,17 +713,14 @@ impl Handshake {
     let scramble_2 = Some(b.split_to(scramble_2_len));
     b.advance(1);
 
-    let mut auth_plugin_name = None;
-    if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
-      auth_plugin_name = Some(b.mysql_get_null_terminated_string()?);
-    }
+    let auth_plugin = b.mysql_get_null_terminated_string()?;
 
     Ok(Self {
       capabilities,
       protocol_version,
       scramble_1,
       scramble_2,
-      auth_plugin_name,
+      auth_plugin,
       status_flags,
       character_set,
     })
@@ -653,9 +728,9 @@ impl Handshake {
 
   fn nonce(&self) -> Bytes {
     let mut out = BytesMut::new();
-    out.extend_from_slice(&self.scramble_1);
+    out.extend_from_slice(self.scramble_1.chunk());
 
-    if let Some(scramble_2) = &self.scramble_2 {
+    if let Some(scramble_2) = self.scramble_2.as_ref().map(Bytes::chunk) {
       out.extend_from_slice(scramble_2);
     }
 
@@ -750,107 +825,6 @@ impl ServerError {
   }
 }
 
-/// Owned results for 0..N rows.
-#[derive(Debug, Default)]
-pub struct QueryResults {
-  columns: Vec<Column>,
-  values: Vec<RowValue>,
-}
-
-impl QueryResults {
-  pub fn columns_len(&self) -> usize {
-    self.columns.len()
-  }
-
-  pub fn row(&self, i: usize) -> &[RowValue] {
-    let len = self.columns.len();
-    let start = i * len;
-    let end = start + len;
-    &self.values[start..end]
-  }
-
-  pub fn row_mut(&mut self, i: usize) -> &mut [RowValue] {
-    let len = self.columns.len();
-    let start = i * len;
-    let end = start + len;
-    &mut self.values[start..end]
-  }
-
-  pub fn rows_len(&self) -> usize {
-    if !self.columns.is_empty() {
-      self.values.len() / self.columns.len()
-    } else {
-      0
-    }
-  }
-
-  pub fn rows(&self) -> Option<ChunksExact<'_, RowValue>> {
-    if !self.columns.is_empty() {
-      Some(self.values.chunks_exact(self.columns.len()))
-    } else {
-      None
-    }
-  }
-
-  pub fn rows_mut(&mut self) -> Option<ChunksExactMut<'_, RowValue>> {
-    if !self.columns.is_empty() {
-      Some(self.values.chunks_exact_mut(self.columns.len()))
-    } else {
-      None
-    }
-  }
-}
-
-// https://mariadb.com/kb/en/connection/#sslrequest-packet
-// https://dev.mysql.com/doc/refman/8.0/en/charset-connection.html
-pub type RowValue = Option<String>;
-
-#[derive(Debug)]
-pub struct Column {
-  catalog: String,
-  schema: String,
-  table: String,
-  name: String,
-  org_table: String,
-  character_set: CharacterSet,
-  column_length: u32,
-  column_type: ColumnType,
-  flags: ColumnFlags,
-  decimals: u8,
-}
-
-impl Column {
-  fn parse(mut b: Bytes) -> io::Result<Self> {
-    let catalog = b.mysql_get_lenc_string().unwrap();
-    assert_eq!("def", catalog.as_str());
-    let schema = b.mysql_get_lenc_string().unwrap();
-    let table = b.mysql_get_lenc_string().unwrap();
-    let org_table = b.mysql_get_lenc_string().unwrap();
-    let name = b.mysql_get_lenc_string().unwrap();
-    let _org_name = b.mysql_get_lenc_string().unwrap();
-    let fixed_len = b.mysql_get_lenc_uint();
-    assert_eq!(0x0C, fixed_len);
-    let character_set = (b.get_u16_le() as u8).try_into().unwrap();
-    let column_length = b.get_u32_le();
-    let column_type = b.get_u8().try_into().unwrap();
-    let flags = ColumnFlags::from_bits_truncate(b.get_u16_le());
-    let decimals = b.get_u8();
-
-    Ok(Self {
-      catalog,
-      schema,
-      table,
-      name,
-      org_table,
-      character_set,
-      column_length,
-      column_type,
-      flags,
-      decimals,
-    })
-  }
-}
-
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
 pub struct BinlogCursor {
   pub log_file: String,
@@ -884,9 +858,9 @@ pub struct BinlogStream {
 }
 
 impl BinlogStream {
-  pub async fn close(self) -> io::Result<()> {
+  pub async fn close(mut self) -> io::Result<()> {
     // force shutdown the underlying stream since the stream is no longer in duplex mode.
-    self.conn.stream.into_inner().shutdown().await
+    self.conn.stream.shutdown().await
   }
 
   pub async fn recv(&mut self) -> Option<io::Result<BinlogEventPacket>> {

@@ -1,17 +1,37 @@
-use std::env;
+use std::net::SocketAddr;
 
 use mysql::{binlog::BinlogEvent, Connection, ConnectionOptions};
 
 #[tokio::test]
 async fn test_ping() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
+  assert!(conn.ping().await.is_ok());
+  conn.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "ssl is not supported yet"]
+async fn test_ping_user_sha2() {
+  let mut conn = Connection::connect_tcp(
+    default_addrs(),
+    ConnectionOptions {
+      user: "sha2_user".to_string(),
+      ..default_connection_options()
+    },
+  )
+  .await
+  .unwrap();
   assert!(conn.ping().await.is_ok());
   conn.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn test_connection_server_info() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let results = conn.query("SELECT version()").await.unwrap();
   assert_eq!(
     results.row(0).last().unwrap().as_ref().map(String::as_str),
@@ -22,7 +42,9 @@ async fn test_connection_server_info() {
 
 #[tokio::test]
 async fn test_query() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let results = conn.query("SELECT 1,2,NULL UNION ALL SELECT 4,5,6").await.unwrap();
   assert_eq!(results.columns_len(), 3);
   assert_eq!(results.rows_len(), 2);
@@ -31,7 +53,9 @@ async fn test_query() {
 
 #[tokio::test]
 async fn test_noop_query() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let results = conn.query("DO NULL").await.unwrap();
   assert_eq!(results.columns_len(), 0);
   assert_eq!(results.rows_len(), 0);
@@ -40,7 +64,9 @@ async fn test_noop_query() {
 
 #[tokio::test]
 async fn test_binlog_inserts() {
-  let mut conn = Connection::connect(default_connection_options()).await.unwrap();
+  let mut conn = Connection::connect_tcp(default_addrs(), default_connection_options())
+    .await
+    .unwrap();
   let binlog_cursor = conn.binlog_cursor().await.unwrap();
   let mut commited = binlog_cursor.clone();
 
@@ -168,15 +194,15 @@ async fn test_binlog_inserts() {
   tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
 
+fn default_addrs() -> Vec<SocketAddr> {
+  vec!["[::]:3306".parse::<SocketAddr>().unwrap()]
+}
+
 fn default_connection_options() -> ConnectionOptions {
   ConnectionOptions {
-    addr: env::var("MYSQL_ADDR")
-      .unwrap_or_else(|_| "[::]:3306".to_string())
-      .parse()
-      .unwrap(),
-    user: env::var("MYSQL_USER").unwrap_or_else(|_| "mysql".to_string()),
-    password: env::var("MYSQL_PASSWORD").ok(),
-    database: env::var("MYSQL_DATABASE").ok(),
+    user: "native_user".to_string(),
+    password: Some("password".to_string()),
+    database: Some("test".to_string()),
     ..Default::default()
   }
 }

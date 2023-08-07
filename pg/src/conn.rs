@@ -106,7 +106,7 @@ impl Connection {
             .map(|v| v.collect::<Vec<_>>())?,
           Some(url::Host::Ipv4(ip)) => vec![SocketAddrV4::new(ip, port).into()],
           Some(url::Host::Ipv6(ip)) => vec![SocketAddrV6::new(ip, port, 0, 0).into()],
-          None => vec![format!("[::]:{port}").parse().unwrap()],
+          None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "url has no host")),
         };
         let options = url.try_into()?;
         Self::connect_tcp(addrs, options).await
@@ -154,11 +154,9 @@ impl Connection {
           Some(url::Host::Domain(domain)) => net::lookup_host(format!("{}:{}", domain, port))
             .await
             .map(|v| (domain.to_string(), v.collect::<Vec<_>>()))?,
-          Some(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "")),
-          None => (
-            "localhost".to_string(),
-            vec![format!("[::]:{}", port).parse::<SocketAddr>().unwrap()],
-          ),
+          Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![SocketAddrV4::new(ip, port).into()]),
+          Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![SocketAddrV6::new(ip, port, 0, 0).into()]),
+          None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "url has no host")),
         };
         Self::connect_ssl(addrs, domain, options, ssl_connector).await
       }
