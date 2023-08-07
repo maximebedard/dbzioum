@@ -5,7 +5,8 @@ Event log streamer for postgresql@11 and mysql@8, heavily inspired from [debeziu
 # Features
 
 - [ ] pg: simple postgresql client (>= v11)
-  - [x] auth (cleartext password, md5, scram-sha-256, ssl)
+  - [x] auth (cleartext password, md5, scram-sha-256)
+  - [x] ssl
   - [x] timeouts (connect, read, write)
   - [x] simple query support
   - [x] query cancellation support
@@ -18,12 +19,9 @@ Event log streamer for postgresql@11 and mysql@8, heavily inspired from [debeziu
 - [ ] pg2kafka
   - [ ] bridge pg events to row events
 - [ ] mysql: simple mysql client (>= v8)
-  - [ ] auth
-    - [x] mysql_native_password
-    - [ ] caching_sha2_password (see https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password)
-    - [ ] ssl
+  - [x] auth (mysql_native, caching_sha2)
+  - [ ] ssl
   - [x] simple query support
-  - [ ] query cancellation support
   - [x] switch connection to replica
   - [ ] binlog streaming
     - [x] supports row based replication events
@@ -75,3 +73,4 @@ cargo test
 - https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html#Table_table_map_event_optional_metadata
 - https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp
 - https://www.postgresql.org/docs/current/protocol.html
+- https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password

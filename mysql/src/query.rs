@@ -81,13 +81,13 @@ pub struct Column {
 
 impl Column {
   pub(crate) fn parse(mut b: Bytes) -> io::Result<Self> {
-    let catalog = b.mysql_get_lenc_string().unwrap();
+    let catalog = b.mysql_get_lenc_string();
     assert_eq!("def", catalog.as_str());
-    let schema = b.mysql_get_lenc_string().unwrap();
-    let table = b.mysql_get_lenc_string().unwrap();
-    let org_table = b.mysql_get_lenc_string().unwrap();
-    let name = b.mysql_get_lenc_string().unwrap();
-    let _org_name = b.mysql_get_lenc_string().unwrap();
+    let schema = b.mysql_get_lenc_string();
+    let table = b.mysql_get_lenc_string();
+    let org_table = b.mysql_get_lenc_string();
+    let name = b.mysql_get_lenc_string();
+    let _org_name = b.mysql_get_lenc_string();
     let fixed_len = b.mysql_get_lenc_uint();
     assert_eq!(0x0C, fixed_len);
     let character_set = (b.get_u16_le() as u8).try_into().unwrap();

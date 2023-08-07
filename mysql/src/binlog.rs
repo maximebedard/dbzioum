@@ -446,7 +446,7 @@ impl FormatDescriptionEvent {
 
     let _server_version = b.split_to(50);
 
-    let server_version = b.mysql_get_null_terminated_string().unwrap();
+    let server_version = b.mysql_get_null_terminated_string();
 
     let create_timestamp = b.get_u32_le();
     let event_header_length = b.get_u8();

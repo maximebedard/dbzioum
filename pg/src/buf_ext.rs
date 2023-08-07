@@ -2,45 +2,37 @@ use bytes::Buf;
 use std::{collections::BTreeMap, io};
 
 pub trait BufExt: Buf {
-  fn pg_get_null_terminated_string(&mut self) -> io::Result<String> {
+  fn pg_get_null_terminated_string(&mut self) -> String {
     match self.chunk().iter().position(|x| *x == 0x00) {
       Some(len) => {
         let mut buffer = vec![0; len];
         self.copy_to_slice(buffer.as_mut_slice());
         self.advance(1);
 
-        String::from_utf8(buffer).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+        String::from_utf8(buffer).unwrap()
       }
-      None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing null terminator")),
+      None => panic!("missing null terminator"),
     }
   }
 
-  fn pg_get_fixed_length_string(&mut self, len: usize) -> io::Result<String> {
-    if self.remaining() >= len {
-      let mut bytes = vec![0; len];
-      self.copy_to_slice(bytes.as_mut_slice());
-
-      String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-    } else {
-      Err(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        format!("expected {}, got {}", len, self.remaining()),
-      ))
-    }
+  fn pg_get_fixed_length_string(&mut self, len: usize) -> String {
+    let mut bytes = vec![0; len];
+    self.copy_to_slice(bytes.as_mut_slice());
+    String::from_utf8(bytes).unwrap()
   }
 
-  fn pg_get_fields(&mut self) -> io::Result<BTreeMap<char, String>> {
+  fn pg_get_fields(&mut self) -> BTreeMap<char, String> {
     let mut fields = BTreeMap::new();
     loop {
       match self.get_u8() {
         0 => break,
         token => {
-          let msg = self.pg_get_null_terminated_string()?;
+          let msg = self.pg_get_null_terminated_string();
           fields.insert(char::from(token), msg);
         }
       }
     }
-    Ok(fields)
+    fields
   }
 
   fn pg_get_backend_error(&mut self) -> io::Error {
@@ -56,12 +48,11 @@ pub trait BufExt: Buf {
     //     String
     //         The field value.
     match self.pg_get_fields() {
-      Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
-      Ok(fields) => io::Error::new(
+      fields if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
+      fields => io::Error::new(
         io::ErrorKind::Other,
         format!("Server error {}: {}", fields[&'C'], fields[&'M']),
       ),
-      Err(err) => err,
     }
   }
 
@@ -78,12 +69,11 @@ pub trait BufExt: Buf {
     //     String
     //         The field value.
     match self.pg_get_fields() {
-      Ok(fields) if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
-      Ok(fields) => io::Error::new(
+      fields if fields.is_empty() => io::Error::new(io::ErrorKind::InvalidData, "missing error fields from server"),
+      fields => io::Error::new(
         io::ErrorKind::Other,
         format!("Server notice {}: {}", fields[&'C'], fields[&'M']),
       ),
-      Err(err) => err,
     }
   }
 }

@@ -345,7 +345,7 @@ impl Connection {
               // https://datatracker.ietf.org/doc/html/rfc5802#section-3
               let mut mechanisms = Vec::new();
               loop {
-                match buffer.pg_get_null_terminated_string()? {
+                match buffer.pg_get_null_terminated_string() {
                   m if m.is_empty() => break,
                   m => mechanisms.push(m),
                 }
@@ -537,8 +537,8 @@ impl Connection {
           //         The name of the run-time parameter being reported.
           //     String
           //         The current value of the parameter.
-          let key = buffer.pg_get_null_terminated_string()?;
-          let value = buffer.pg_get_null_terminated_string()?;
+          let key = buffer.pg_get_null_terminated_string();
+          let value = buffer.pg_get_null_terminated_string();
           self.metadata.insert(key, value);
         }
         b'Z' => {
@@ -757,7 +757,7 @@ impl Connection {
           //         For a MOVE command, the tag is MOVE rows where rows is the number of rows the cursor's position has been changed by.
           //         For a FETCH command, the tag is FETCH rows where rows is the number of rows that have been retrieved from the cursor.
           //         For a COPY command, the tag is COPY rows where rows is the number of rows copied. (Note: the row count appears only in PostgreSQL 8.2 and later.)
-          let _op = buffer.pg_get_null_terminated_string()?;
+          let _op = buffer.pg_get_null_terminated_string();
           match current.take() {
             Some(select_query_result) => results.push_back(QueryResult::Selected(select_query_result)),
             None => results.push_back(QueryResult::Success),
@@ -817,7 +817,7 @@ impl Connection {
           let mut columns = Vec::new();
           let num_columns = buffer.get_i16();
           for _i in 0..num_columns {
-            let name = buffer.pg_get_null_terminated_string()?;
+            let name = buffer.pg_get_null_terminated_string();
             let oid = buffer.get_i32();
             let attr_number = buffer.get_i16();
             let datatype_oid = buffer.get_i32();
@@ -859,7 +859,7 @@ impl Connection {
             let len = buffer.get_i32();
 
             if len > 0 {
-              let value = buffer.pg_get_fixed_length_string(len.try_into().unwrap())?;
+              let value = buffer.pg_get_fixed_length_string(len.try_into().unwrap());
               values.push(Some(value));
             } else if len == 0 {
               values.push(Some("".to_string()));

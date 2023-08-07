@@ -1,42 +1,32 @@
 use bytes::{Buf, BufMut};
-use std::io;
 
 pub trait BufExt: Buf {
-  fn mysql_get_eof_string(&mut self) -> io::Result<String> {
+  fn mysql_get_eof_string(&mut self) -> String {
     self.mysql_get_fixed_length_string(self.remaining())
   }
 
   // Returns a utf-8 encoded string terminated by \0.
-  fn mysql_get_null_terminated_string(&mut self) -> io::Result<String> {
+  fn mysql_get_null_terminated_string(&mut self) -> String {
     match self.chunk().iter().position(|x| *x == 0x00) {
       Some(len) => {
         let mut buffer = vec![0; len];
         self.copy_to_slice(buffer.as_mut_slice());
         self.advance(1);
-
-        String::from_utf8(buffer).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+        String::from_utf8(buffer).unwrap()
       }
-      None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing null terminator")),
+      None => panic!("missing null terminator"),
     }
   }
 
   // Returns a utf-8 encoded string of length N, where N are in bytes.
-  fn mysql_get_fixed_length_string(&mut self, len: usize) -> io::Result<String> {
-    if self.remaining() >= len {
-      let mut bytes = vec![0; len];
-      self.copy_to_slice(bytes.as_mut_slice());
-
-      String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-    } else {
-      Err(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        format!("expected {}, got {}", len, self.remaining()),
-      ))
-    }
+  fn mysql_get_fixed_length_string(&mut self, len: usize) -> String {
+    let mut bytes = vec![0; len];
+    self.copy_to_slice(bytes.as_mut_slice());
+    String::from_utf8(bytes).unwrap()
   }
 
   // Returns a utf-8 encoded string of variable length. See `BufExt::get_lenc_uint`.
-  fn mysql_get_lenc_string(&mut self) -> io::Result<String> {
+  fn mysql_get_lenc_string(&mut self) -> String {
     let len = self.mysql_get_lenc_uint();
     let len = len.try_into().unwrap();
     self.mysql_get_fixed_length_string(len)

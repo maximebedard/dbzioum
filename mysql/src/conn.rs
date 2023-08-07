@@ -289,8 +289,8 @@ impl Connection {
         // AuthSwitch
         Some(0xFE) => {
           payload.advance(1);
-          let auth_plugin = payload.mysql_get_null_terminated_string()?;
-          let nonce = payload.mysql_get_null_terminated_string()?;
+          let auth_plugin = payload.mysql_get_null_terminated_string();
+          let nonce = payload.mysql_get_null_terminated_string();
           self
             .write_auth_switch_response(auth_plugin.as_str(), nonce.as_bytes())
             .await?;
@@ -439,7 +439,7 @@ impl Connection {
                 row_values.push(None);
               }
               Some(_) => {
-                let value = payload.mysql_get_lenc_string()?;
+                let value = payload.mysql_get_lenc_string();
                 row_values.push(Some(value));
               }
               None => {
@@ -688,7 +688,7 @@ impl Handshake {
   fn parse(mut b: Bytes) -> io::Result<Self> {
     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
     let protocol_version = b.get_u8();
-    let _server_version = b.mysql_get_null_terminated_string()?;
+    let _server_version = b.mysql_get_null_terminated_string();
     let _connection_id = b.get_u32_le();
     let scramble_1 = b.split_to(8);
     b.advance(1);
@@ -713,7 +713,7 @@ impl Handshake {
     let scramble_2 = Some(b.split_to(scramble_2_len));
     b.advance(1);
 
-    let auth_plugin = b.mysql_get_null_terminated_string()?;
+    let auth_plugin = b.mysql_get_null_terminated_string();
 
     Ok(Self {
       capabilities,
@@ -765,7 +765,7 @@ impl ServerOk {
     }
 
     let (info, session_state_changes) = if capability_flags.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
-      let info = b.mysql_get_lenc_string().unwrap();
+      let info = b.mysql_get_lenc_string();
 
       let has_session_state_changes = status_flags
         .map(|f| f.contains(StatusFlags::SERVER_SESSION_STATE_CHANGED))
@@ -773,12 +773,12 @@ impl ServerOk {
 
       let mut session_state_changes = None;
       if has_session_state_changes {
-        session_state_changes = Some(b.mysql_get_lenc_string().unwrap())
+        session_state_changes = Some(b.mysql_get_lenc_string())
       }
 
       (info, session_state_changes)
     } else {
-      let info = b.mysql_get_eof_string().unwrap();
+      let info = b.mysql_get_eof_string();
       (info, None)
     };
 
@@ -811,11 +811,11 @@ impl ServerError {
     let mut state = None;
 
     if capability_flags.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
-      state_marker = Some(b.mysql_get_fixed_length_string(1).unwrap());
-      state = Some(b.mysql_get_fixed_length_string(5).unwrap());
+      state_marker = Some(b.mysql_get_fixed_length_string(1));
+      state = Some(b.mysql_get_fixed_length_string(5));
     }
 
-    let error_message = b.mysql_get_eof_string().unwrap();
+    let error_message = b.mysql_get_eof_string();
     Ok(Self {
       error_code,
       state_marker,
