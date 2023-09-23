@@ -4,17 +4,16 @@ use bytes::{Buf, Bytes};
 use std::io;
 
 #[derive(Debug)]
-pub struct BinlogEventPacket {
+pub struct BinlogEventHeader {
   pub timestamp: u32,
   pub server_id: u32,
   pub log_position: u32,
   pub flags: u16,
-  pub event: BinlogEvent,
   pub checksum: Bytes,
 }
 
-impl BinlogEventPacket {
-  pub fn parse(mut b: Bytes) -> io::Result<BinlogEventPacket> {
+impl BinlogEventHeader {
+  pub fn parse(mut b: Bytes) -> io::Result<(BinlogEventHeader, BinlogEvent)> {
     // skip OK byte
     assert_eq!(0x00, b.get_u8());
 
@@ -28,33 +27,38 @@ impl BinlogEventPacket {
     let payload = b.split_to(payload_len);
     let checksum = b.clone();
 
-    let event = match event_type {
-      BinlogEventType::TABLE_MAP_EVENT => TableMapEvent::parse(payload).map(BinlogEvent::TableMap),
-      BinlogEventType::ROTATE_EVENT => {
-        // NOTE: Strangely enough, the checksum is actually the suffix of the binlog file name.
-        RotateEvent::parse(payload, checksum.clone()).map(BinlogEvent::Rotate)
-      }
-      BinlogEventType::FORMAT_DESCRIPTION_EVENT => FormatDescriptionEvent::parse(payload).map(BinlogEvent::Format),
-      BinlogEventType::WRITE_ROWS_EVENTV0 => RowEvent::parse(payload, false, false, true).map(BinlogEvent::Insert),
-      BinlogEventType::WRITE_ROWS_EVENTV1 => RowEvent::parse(payload, false, false, true).map(BinlogEvent::Insert),
-      BinlogEventType::WRITE_ROWS_EVENTV2 => RowEvent::parse(payload, true, false, true).map(BinlogEvent::Insert),
-      BinlogEventType::UPDATE_ROWS_EVENTV0 => RowEvent::parse(payload, false, true, true).map(BinlogEvent::Update),
-      BinlogEventType::UPDATE_ROWS_EVENTV1 => RowEvent::parse(payload, false, true, true).map(BinlogEvent::Update),
-      BinlogEventType::UPDATE_ROWS_EVENTV2 => RowEvent::parse(payload, true, true, true).map(BinlogEvent::Update),
-      BinlogEventType::DELETE_ROWS_EVENTV0 => RowEvent::parse(payload, false, true, false).map(BinlogEvent::Delete),
-      BinlogEventType::DELETE_ROWS_EVENTV1 => RowEvent::parse(payload, false, true, false).map(BinlogEvent::Delete),
-      BinlogEventType::DELETE_ROWS_EVENTV2 => RowEvent::parse(payload, true, true, false).map(BinlogEvent::Delete),
-      not_supported => Ok(BinlogEvent::NotSupported(not_supported)),
-    }?;
-
-    Ok(BinlogEventPacket {
+    let header = BinlogEventHeader {
       timestamp,
       server_id,
       log_position,
       flags,
-      event,
-      checksum,
-    })
+      checksum: checksum.clone(),
+    };
+
+    let event = match event_type {
+      BinlogEventType::TABLE_MAP_EVENT => TableMapEvent::parse(payload).map(BinlogEvent::TableMap),
+      BinlogEventType::ROTATE_EVENT => {
+        // NOTE: Strangely enough, the checksum is actually the suffix of the binlog file name.
+        RotateEvent::parse(payload, checksum).map(BinlogEvent::Rotate)
+      }
+      BinlogEventType::FORMAT_DESCRIPTION_EVENT => {
+        FormatDescriptionEvent::parse(payload).map(BinlogEvent::FormatDescription)
+      }
+      BinlogEventType::WRITE_ROWS_EVENTV0 => InsertRowEvent::parse(payload, false).map(BinlogEvent::Insert),
+      BinlogEventType::WRITE_ROWS_EVENTV1 => InsertRowEvent::parse(payload, false).map(BinlogEvent::Insert),
+      BinlogEventType::WRITE_ROWS_EVENTV2 => InsertRowEvent::parse(payload, true).map(BinlogEvent::Insert),
+      BinlogEventType::UPDATE_ROWS_EVENTV0 => UpdateRowEvent::parse(payload, false).map(BinlogEvent::Update),
+      BinlogEventType::UPDATE_ROWS_EVENTV1 => UpdateRowEvent::parse(payload, false).map(BinlogEvent::Update),
+      BinlogEventType::UPDATE_ROWS_EVENTV2 => UpdateRowEvent::parse(payload, true).map(BinlogEvent::Update),
+      BinlogEventType::DELETE_ROWS_EVENTV0 => DeleteRowEvent::parse(payload, false).map(BinlogEvent::Delete),
+      BinlogEventType::DELETE_ROWS_EVENTV1 => DeleteRowEvent::parse(payload, false).map(BinlogEvent::Delete),
+      BinlogEventType::DELETE_ROWS_EVENTV2 => DeleteRowEvent::parse(payload, true).map(BinlogEvent::Delete),
+      BinlogEventType::GTID_EVENT => GtidEvent::parse(payload).map(BinlogEvent::Gtid),
+      BinlogEventType::PREVIOUS_GTIDS_EVENT => PreviousGtidEvent::parse(payload).map(BinlogEvent::PreviousGtid),
+      not_supported => Ok(BinlogEvent::NotSupported(not_supported)),
+    }?;
+
+    Ok((header, event))
   }
 }
 
@@ -62,10 +66,12 @@ impl BinlogEventPacket {
 pub enum BinlogEvent {
   TableMap(TableMapEvent),
   Rotate(RotateEvent),
-  Format(FormatDescriptionEvent),
-  Insert(RowEvent),
-  Update(RowEvent),
-  Delete(RowEvent),
+  FormatDescription(FormatDescriptionEvent),
+  Insert(InsertRowEvent),
+  Update(UpdateRowEvent),
+  Delete(DeleteRowEvent),
+  Gtid(GtidEvent),
+  PreviousGtid(PreviousGtidEvent),
   NotSupported(BinlogEventType),
 }
 
@@ -225,7 +231,7 @@ impl TableMapEvent {
       todo!()
     }
 
-    pub fn parse_strings(mut b: Bytes) -> io::Result<Vec<String>> {
+    pub fn parse_column_names(mut b: Bytes) -> io::Result<Vec<String>> {
       let mut column_names = Vec::new();
       while b.remaining() > 0 {
         let len = b.mysql_get_lenc_uint().try_into().unwrap();
@@ -253,7 +259,7 @@ impl TableMapEvent {
           metadata.column_charsets = Some(column_charset)
         }
         ColumnMetadataType::COLUMN_NAME => {
-          let column_names = parse_strings(metadata_value)?;
+          let column_names = parse_column_names(metadata_value)?;
           metadata.column_names = Some(column_names);
         }
         ColumnMetadataType::SET_STR_VALUE => {
@@ -293,21 +299,8 @@ impl TableMapEvent {
   }
 
   pub fn columns(&self) -> Vec<Column> {
-    fn is_numeric(t: ColumnType) -> bool {
-      if let ColumnType::MYSQL_TYPE_TINY
-      | ColumnType::MYSQL_TYPE_SHORT
-      | ColumnType::MYSQL_TYPE_INT24
-      | ColumnType::MYSQL_TYPE_LONG
-      | ColumnType::MYSQL_TYPE_LONGLONG = t
-      {
-        return true;
-      }
-      false
-    }
-
-    let mut j = 0;
     (0..self.column_count)
-      .map(|i| {
+      .scan(0, |j, i| {
         let column_name = self.metadata.column_names.as_ref().unwrap()[i].clone();
         let column_type = self.column_types[i];
         let column_meta = self.column_metas[i];
@@ -320,7 +313,7 @@ impl TableMapEvent {
           .metadata
           .is_unsigned_integer_bitmap
           .as_ref()
-          .filter(|v| v[j / 8] & (0x80 >> (j % 8)) != 0)
+          .filter(|v| v[*j / 8] & (0x80 >> (*j % 8)) != 0)
           .is_some();
 
         let column_type_definition = match column_type {
@@ -417,15 +410,20 @@ impl TableMapEvent {
           ColumnType::MYSQL_TYPE_GEOMETRY => todo!(),
         };
 
-        if is_numeric(column_type) {
-          j += 1;
+        if let ColumnType::MYSQL_TYPE_TINY
+        | ColumnType::MYSQL_TYPE_SHORT
+        | ColumnType::MYSQL_TYPE_INT24
+        | ColumnType::MYSQL_TYPE_LONG
+        | ColumnType::MYSQL_TYPE_LONGLONG = column_type
+        {
+          *j += 1;
         }
 
-        Column {
-          name: column_name,
+        Some(Column {
+          column_name,
           is_nullable,
-          column_type: column_type_definition,
-        }
+          column_type_definition,
+        })
       })
       .collect()
   }
@@ -443,14 +441,10 @@ pub struct FormatDescriptionEvent {
 impl FormatDescriptionEvent {
   fn parse(mut b: Bytes) -> io::Result<Self> {
     let version = b.get_u16_le();
-
     let _server_version = b.split_to(50);
-
     let server_version = b.mysql_get_null_terminated_string();
-
     let create_timestamp = b.get_u32_le();
     let event_header_length = b.get_u8();
-
     let event_type_header_lengths = b;
 
     Ok(Self {
@@ -464,180 +458,285 @@ impl FormatDescriptionEvent {
 }
 
 #[derive(Debug)]
-pub struct RowEvent {
-  pub table_id: u64,
-  pub flags: u16,
-  pub extras: Option<Bytes>,
-  pub column_count: u64,
-  pub columns_before_image: Option<Bytes>,
-  pub columns_after_image: Option<Bytes>,
-  pub null_bitmap: Option<Bytes>,
-  pub rows: Bytes,
+pub struct InsertRowEvent {
+  table_id: u64,
+  flags: u16,
+  extras: Option<Bytes>,
+  column_count: usize,
+  columns_after_image: Bytes,
+  rows: Bytes,
 }
 
-impl RowEvent {
-  fn parse(
-    mut b: Bytes,
-    use_extras: bool,
-    use_columns_before_image: bool,
-    use_columns_after_image: bool,
-  ) -> io::Result<Self> {
+impl InsertRowEvent {
+  fn parse(mut b: Bytes, use_extras: bool) -> io::Result<Self> {
     // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Rows__event.html
+    // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html
+    // https://dev.mysql.com/doc/refman/8.0/en/mysqlbinlog-row-events.html
+    let RowEventHeader {
+      table_id,
+      flags,
+      extras,
+      column_count,
+    } = RowEventHeader::parse(&mut b, use_extras);
+    let bitmap_len = (column_count + 7) / 8;
+    let columns_after_image = b.split_to(bitmap_len);
+    let rows = b;
+    Ok(Self {
+      table_id,
+      flags,
+      extras,
+      column_count,
+      columns_after_image,
+      rows,
+    })
+  }
+
+  pub fn rows(&self, columns: &[Column]) -> Vec<Value> {
+    parse_rows(&mut self.rows.clone(), columns, &self.columns_after_image)
+  }
+}
+
+struct RowEventHeader {
+  table_id: u64,
+  flags: u16,
+  extras: Option<Bytes>,
+  column_count: usize,
+}
+
+impl RowEventHeader {
+  pub fn parse(b: &mut Bytes, use_extras: bool) -> Self {
     let table_id = b.get_uint_le(6);
     let flags = b.get_u16_le();
-
     let mut extras = None;
     if use_extras {
       let extras_len = (b.get_u16_le() - 2).try_into().unwrap();
       extras = Some(b.split_to(extras_len))
     }
+    let column_count = b.mysql_get_lenc_uint().try_into().unwrap();
+    RowEventHeader {
+      table_id,
+      flags,
+      extras,
+      column_count,
+    }
+  }
+}
 
-    let column_count = b.mysql_get_lenc_uint();
+fn parse_rows(b: &mut Bytes, columns: &[Column], _column_present: &Bytes) -> Vec<Value> {
+  let mut rows = vec![];
+  while b.remaining() > 0 {
+    rows.append(&mut parse_row(b, columns, _column_present));
+  }
+  rows
+}
 
-    let bitmap_len = ((column_count + 7) / 8).try_into().unwrap();
+fn parse_row(b: &mut Bytes, columns: &[Column], _column_present: &Bytes) -> Vec<Value> {
+  let null_bitmap = b.split_to(_column_present.len());
 
-    let mut columns_before_image = None;
-    if use_columns_before_image {
-      columns_before_image = Some(b.split_to(bitmap_len));
+  columns
+    .iter()
+    .enumerate()
+    .map(|(i, c)| {
+      let Column {
+        is_nullable,
+        column_type_definition,
+        ..
+      } = c;
+
+      let is_null = null_bitmap[i / 8] & (1 << (i % 8)) != 0;
+
+      if *is_nullable && is_null {
+        return Value::Null;
+      }
+
+      match column_type_definition {
+        ColumnTypeDefinition::U64 { pack_length } => Value::U64(b.get_uint_le(*pack_length)),
+        ColumnTypeDefinition::I64 { pack_length } => Value::I64(b.get_int_le(*pack_length)),
+        ColumnTypeDefinition::F64 { pack_length } => match *pack_length {
+          4 => Value::F64(b.get_f32_le().into()),
+          8 => Value::F64(b.get_f64_le()),
+          _ => unreachable!(),
+        },
+        ColumnTypeDefinition::Decimal { precision: _, scale: _ } => {
+          let len = b.mysql_get_lenc_uint().try_into().unwrap();
+          let buffer = b.copy_to_bytes(len);
+          Value::Decimal(buffer)
+        }
+        ColumnTypeDefinition::String { pack_length } => {
+          let len = b.get_uint_le(*pack_length).try_into().unwrap();
+          let buffer = b.copy_to_bytes(len);
+          Value::String(String::from_utf8(buffer.into()).unwrap())
+        }
+        ColumnTypeDefinition::Blob { pack_length } => {
+          let len = b.get_uint_le(*pack_length).try_into().unwrap();
+          let buffer = b.copy_to_bytes(len);
+          Value::Blob(buffer)
+        }
+        ColumnTypeDefinition::Json { pack_length } => {
+          let len = b.get_uint_le(*pack_length).try_into().unwrap();
+          let buffer = b.copy_to_bytes(len);
+          Value::Json(buffer)
+        }
+        ColumnTypeDefinition::Year => {
+          let year: u64 = b.get_u8().into();
+          Value::U64(1900 + year)
+        }
+        ColumnTypeDefinition::Timestamp => Value::U64(b.get_u32_le().into()),
+        ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U24) => {
+          let tmp = b.get_uint_le(3);
+          let day = (tmp & 31).try_into().unwrap();
+          let month = ((tmp >> 5) & 15).try_into().unwrap();
+          let year = (tmp >> 9).try_into().unwrap();
+          Value::Date {
+            year,
+            month,
+            day,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            micro_second: 0,
+          }
+        }
+        ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U64) => {
+          let tmp = b.get_u64_le();
+          let date = tmp / 1_000_000;
+          let time = tmp % 1_000_000;
+          let year = (date / 10000).try_into().unwrap();
+          let month = ((date % 10000) / 100).try_into().unwrap();
+          let day = (date % 100).try_into().unwrap();
+          let hour = (time / 10000).try_into().unwrap();
+          let minute = ((time % 10000) / 100).try_into().unwrap();
+          let second = (time % 100).try_into().unwrap();
+          Value::Date {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            micro_second: 0,
+          }
+        }
+        ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::Arbitrary(_)) => todo!(),
+        ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::U24) => {
+          let tmp = b.get_uint_le(3);
+          let hours = (tmp / 10000).try_into().unwrap();
+          let minutes = ((tmp % 10000) / 100).try_into().unwrap();
+          let seconds = (tmp % 100).try_into().unwrap();
+          Value::Time {
+            hours,
+            minutes,
+            seconds,
+            micro_seconds: 0,
+          }
+        }
+        ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::Arbitrary(_)) => todo!(),
+      }
+    })
+    .collect()
+}
+
+#[derive(Debug)]
+pub struct UpdateRowEvent {
+  table_id: u64,
+  flags: u16,
+  extras: Option<Bytes>,
+  column_count: usize,
+  columns_before_image: Bytes,
+  columns_after_image: Bytes,
+  rows: Bytes,
+}
+
+impl UpdateRowEvent {
+  pub fn parse(mut b: Bytes, use_extras: bool) -> io::Result<Self> {
+    // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Rows__event.html
+    let RowEventHeader {
+      table_id,
+      flags,
+      extras,
+      column_count,
+    } = RowEventHeader::parse(&mut b, use_extras);
+    let bitmap_len = (column_count + 7) / 8;
+    let columns_after_image = b.split_to(bitmap_len);
+    let columns_before_image = b.split_to(bitmap_len);
+    let rows = b;
+    Ok(Self {
+      table_id,
+      flags,
+      extras,
+      column_count,
+      columns_after_image,
+      columns_before_image,
+      rows,
+    })
+  }
+
+  pub fn rows(&self, columns: &[Column]) -> (Vec<Value>, Vec<Value>) {
+    let mut before = vec![];
+    let mut after = vec![];
+
+    let mut b = self.rows.clone();
+    while b.remaining() > 0 {
+      before.append(&mut parse_row(&mut b, columns, &self.columns_before_image));
+      after.append(&mut parse_row(&mut b, columns, &self.columns_after_image));
     }
 
-    let mut columns_after_image = None;
-    if use_columns_after_image {
-      columns_after_image = Some(b.split_to(bitmap_len));
-    }
+    (before, after)
+  }
+}
 
-    let mut null_bitmap = None;
-    if bitmap_len > 0 {
-      null_bitmap = Some(b.split_to(bitmap_len));
-    }
+#[derive(Debug)]
+pub struct DeleteRowEvent {
+  table_id: u64,
+  flags: u16,
+  extras: Option<Bytes>,
+  column_count: usize,
+  columns_before_image: Bytes,
+  rows: Bytes,
+}
 
-    //https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html
-    // https://dev.mysql.com/doc/refman/8.0/en/mysqlbinlog-row-events.html
-    let rows = b.clone();
-
+impl DeleteRowEvent {
+  pub fn parse(mut b: Bytes, use_extras: bool) -> io::Result<Self> {
+    // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Rows__event.html
+    let RowEventHeader {
+      table_id,
+      flags,
+      extras,
+      column_count,
+    } = RowEventHeader::parse(&mut b, use_extras);
+    let bitmap_len = (column_count + 7) / 8;
+    let columns_before_image = b.split_to(bitmap_len);
+    let rows = b;
     Ok(Self {
       table_id,
       flags,
       extras,
       column_count,
       columns_before_image,
-      columns_after_image,
-      null_bitmap,
       rows,
     })
   }
 
-  pub fn values(&self, columns: &[Column]) -> Vec<Value> {
-    let mut b = self.rows.clone();
+  pub fn rows(&self, columns: &[Column]) -> Vec<Value> {
+    parse_row(&mut self.rows.clone(), columns, &self.columns_before_image)
+  }
+}
 
-    let values = columns
-      .iter()
-      .enumerate()
-      .map(|(i, c)| {
-        let Column {
-          is_nullable,
-          column_type: column_type_definition,
-          ..
-        } = c;
+#[derive(Debug)]
+pub struct GtidEvent {}
 
-        let is_null = self
-          .null_bitmap
-          .as_ref()
-          .filter(|v| v[i / 8] & (1 << (i % 8)) != 0)
-          .is_some();
+impl GtidEvent {
+  pub fn parse(_b: Bytes) -> io::Result<Self> {
+    Ok(GtidEvent {})
+  }
+}
 
-        if *is_nullable && is_null {
-          return Value::Null;
-        }
+#[derive(Debug)]
+pub struct PreviousGtidEvent {}
 
-        match column_type_definition {
-          ColumnTypeDefinition::U64 { pack_length } => Value::U64(b.get_uint_le(*pack_length)),
-          ColumnTypeDefinition::I64 { pack_length } => Value::I64(b.get_int_le(*pack_length)),
-          ColumnTypeDefinition::F64 { pack_length } => match *pack_length {
-            4 => Value::F64(b.get_f32_le().into()),
-            8 => Value::F64(b.get_f64_le()),
-            _ => unreachable!(),
-          },
-          ColumnTypeDefinition::Decimal { precision: _, scale: _ } => {
-            let len = b.mysql_get_lenc_uint().try_into().unwrap();
-            let buffer = b.copy_to_bytes(len);
-            Value::Decimal(buffer)
-          }
-          ColumnTypeDefinition::String { pack_length } => {
-            let len = b.get_uint_le(*pack_length).try_into().unwrap();
-            let buffer = b.copy_to_bytes(len);
-            Value::String(String::from_utf8(buffer.into()).unwrap())
-          }
-          ColumnTypeDefinition::Blob { pack_length } => {
-            let len = b.get_uint_le(*pack_length).try_into().unwrap();
-            let buffer = b.copy_to_bytes(len);
-            Value::Blob(buffer)
-          }
-          ColumnTypeDefinition::Json { pack_length } => {
-            let len = b.get_uint_le(*pack_length).try_into().unwrap();
-            let buffer = b.copy_to_bytes(len);
-            Value::Json(buffer)
-          }
-          ColumnTypeDefinition::Year => {
-            let year: u64 = b.get_u8().into();
-            Value::U64(1900 + year)
-          }
-          ColumnTypeDefinition::Timestamp => Value::U64(b.get_u32_le().into()),
-          ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U24) => {
-            let tmp = b.get_uint_le(3);
-            let day = (tmp & 31).try_into().unwrap();
-            let month = ((tmp >> 5) & 15).try_into().unwrap();
-            let year = (tmp >> 9).try_into().unwrap();
-            Value::Date {
-              year,
-              month,
-              day,
-              hour: 0,
-              minute: 0,
-              second: 0,
-              micro_second: 0,
-            }
-          }
-          ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::U64) => {
-            let tmp = b.get_u64_le();
-            let date = tmp / 1_000_000;
-            let time = tmp % 1_000_000;
-            let year = (date / 10000).try_into().unwrap();
-            let month = ((date % 10000) / 100).try_into().unwrap();
-            let day = (date % 100).try_into().unwrap();
-            let hour = (time / 10000).try_into().unwrap();
-            let minute = ((time % 10000) / 100).try_into().unwrap();
-            let second = (time % 100).try_into().unwrap();
-            Value::Date {
-              year,
-              month,
-              day,
-              hour,
-              minute,
-              second,
-              micro_second: 0,
-            }
-          }
-          ColumnTypeDefinition::Date(ColumnTypeDefinitionDate::Arbitrary(_)) => todo!(),
-          ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::U24) => {
-            let tmp = b.get_uint_le(3);
-            let hours = (tmp / 10000).try_into().unwrap();
-            let minutes = ((tmp % 10000) / 100).try_into().unwrap();
-            let seconds = (tmp % 100).try_into().unwrap();
-            Value::Time {
-              hours,
-              minutes,
-              seconds,
-              micro_seconds: 0,
-            }
-          }
-          ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::Arbitrary(_)) => todo!(),
-        }
-      })
-      .collect();
-
-    assert_eq!(0, b.remaining());
-    values
+impl PreviousGtidEvent {
+  pub fn parse(_b: Bytes) -> io::Result<Self> {
+    Ok(PreviousGtidEvent {})
   }
 }
 
@@ -672,9 +771,9 @@ pub enum Value {
 
 #[derive(Debug)]
 pub struct Column {
-  pub name: String,
+  pub column_name: String,
   pub is_nullable: bool,
-  pub column_type: ColumnTypeDefinition,
+  pub column_type_definition: ColumnTypeDefinition,
 }
 
 #[derive(Debug)]
@@ -707,7 +806,7 @@ pub enum ColumnTypeDefinition {
 
 #[cfg(test)]
 mod test {
-  use super::{BinlogEvent, BinlogEventPacket, BinlogEventType};
+  use super::{BinlogEvent, BinlogEventHeader, BinlogEventType};
 
   #[test]
   fn parses_rotate() {
@@ -715,8 +814,8 @@ mod test {
                                        \x00\x20\x00\x96\x00\x00\x00\x00\x00\x00\x00\x73\x68\x6f\x70\x69\x66\
                                        \x79\x2d\x62\x69\x6e\x2e\x30\x30\x30\x30\x30\x35";
 
-    let packet = BinlogEventPacket::parse(ROTATE_EVENT.into()).unwrap();
-    match packet.event {
+    let (_header, event) = BinlogEventHeader::parse(ROTATE_EVENT.into()).unwrap();
+    match event {
       BinlogEvent::Rotate(packet) => {
         assert_eq!(150, packet.next_log_position);
         assert_eq!("shopify-bin.000005", packet.next_log_file);
@@ -737,9 +836,9 @@ mod test {
                                                    \x02\x00\x00\x00\x0a\x0a\x0a\x2a\x2a\x00\x12\x34\x00\x00\xc2\x36\x0c\
                                                    \xdf";
 
-    let packet = BinlogEventPacket::parse(FORMAT_DESCRIPTION_EVENT.into()).unwrap();
-    match packet.event {
-      BinlogEvent::Format(packet) => {
+    let (_header, event) = BinlogEventHeader::parse(FORMAT_DESCRIPTION_EVENT.into()).unwrap();
+    match event {
+      BinlogEvent::FormatDescription(packet) => {
         assert_eq!(4, packet.version);
         assert_eq!("5.7.18-16-log", packet.server_version);
         assert_eq!(0, packet.create_timestamp);
@@ -755,8 +854,8 @@ mod test {
                                                \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\
                                                \x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00";
 
-    let packet = BinlogEventPacket::parse(ANONYMOUS_GTID_EVENT.into()).unwrap();
-    match packet.event {
+    let (_header, event) = BinlogEventHeader::parse(ANONYMOUS_GTID_EVENT.into()).unwrap();
+    match event {
       BinlogEvent::NotSupported(BinlogEventType::ANONYMOUS_GTID_EVENT) => {}
       _ => panic!(),
     }
@@ -770,8 +869,8 @@ mod test {
                                       \x64\x04\x21\x00\x21\x00\x2d\x00\x70\x65\x74\x73\x00\x42\x45\x47\x49\
                                       \x4e";
 
-    let packet = BinlogEventPacket::parse(QUERY_EVENT.into()).unwrap();
-    match packet.event {
+    let (_header, event) = BinlogEventHeader::parse(QUERY_EVENT.into()).unwrap();
+    match event {
       BinlogEvent::NotSupported(BinlogEventType::QUERY_EVENT) => {}
       _ => panic!(),
     }
@@ -784,8 +883,8 @@ mod test {
                                           \x00\x00\x00\x2d\x0a\x00\x00\x00\x00\x01\x00\x04\x70\x65\x74\x73\x00\
                                           \x04\x63\x61\x74\x73\x00\x04\x03\x0f\x0f\x0a\x04\x58\x02\x58\x02\x00";
 
-    let packet = BinlogEventPacket::parse(TABLE_MAP_EVENT.into()).unwrap();
-    match packet.event {
+    let (_header, event) = BinlogEventHeader::parse(TABLE_MAP_EVENT.into()).unwrap();
+    match event {
       BinlogEvent::TableMap(packet) => {
         assert_eq!(2605, packet.table_id);
         assert_eq!(1, packet.flags);
@@ -805,8 +904,8 @@ mod test {
                                            \x00\x00\x00\x07\x00\x43\x68\x61\x72\x6c\x69\x65\x05\x00\x52\x69\x76\
                                            \x65\x72\xb5\xc0\x0f";
 
-    let packet = BinlogEventPacket::parse(INSERT_ROW_EVENT.into()).unwrap();
-    match packet.event {
+    let (_header, event) = BinlogEventHeader::parse(INSERT_ROW_EVENT.into()).unwrap();
+    match event {
       BinlogEvent::Insert(packet) => {
         assert_eq!(2605, packet.table_id);
         assert_eq!(1, packet.flags);
@@ -830,8 +929,8 @@ mod test {
     const XID_EVENT: &[u8] = b"\x00\xfc\x5a\x5d\x5d\x10\x01\x00\x00\x00\x1b\x00\x00\x00\x9b\x01\x00\
                                     \x00\x00\x00\x72\x0e\x00\x00\x00\x00\x00\x00";
 
-    let packet = BinlogEventPacket::parse(XID_EVENT.into()).unwrap();
-    match packet.event {
+    let (_header, event) = BinlogEventHeader::parse(XID_EVENT.into()).unwrap();
+    match event {
       BinlogEvent::NotSupported(BinlogEventType::XID_EVENT) => {}
       _ => panic!(),
     }

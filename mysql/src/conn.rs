@@ -1,32 +1,25 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-
-use std::cmp::max;
-use std::collections::BTreeMap;
-use std::str::FromStr;
-use std::time::Duration;
-use url::Url;
-
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-
-use std::{fmt, io};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net;
-
-use crate::stream::Stream;
-
-use super::buf_ext::BufMutExt;
-use super::query::{Column, QueryResults, RowValue};
-use super::scramble;
-
-use super::debug::DebugBytesRef;
-
-use super::binlog::BinlogEventPacket;
-
+use super::binlog::BinlogEvent;
+use super::binlog::BinlogEventHeader;
 use super::buf_ext::BufExt;
+use super::buf_ext::BufMutExt;
 use super::constants::{
   BinlogDumpFlags, CapabilityFlags, CharacterSet, Command, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME,
   MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
+use super::debug::DebugBytesRef;
+use super::query::{Column, QueryResults, RowValue};
+use super::scramble;
+use super::stream::Stream;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::cmp::max;
+use std::collections::BTreeMap;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::str::FromStr;
+use std::time::Duration;
+use std::{fmt, io};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net;
+use url::Url;
 
 #[cfg(feature = "ssl")]
 use openssl::ssl::SslConnector;
@@ -276,7 +269,7 @@ impl Connection {
         Some(0x00) => return self.parse_and_handle_server_ok(payload),
         // AuthMoreData
         Some(0x01) => {
-          if payload.chunk() == &[0x01, 0x04] {
+          if payload.chunk() == [0x01, 0x04] {
             return Err(io::Error::new(io::ErrorKind::ConnectionReset, "SSL required"));
           }
 
@@ -566,11 +559,11 @@ impl Connection {
     Ok(BinlogStream { conn })
   }
 
-  async fn read_binlog_event_packet(&mut self) -> io::Result<BinlogEventPacket> {
+  async fn read_binlog_event_packet(&mut self) -> io::Result<(BinlogEventHeader, BinlogEvent)> {
     let payload = self.read_payload().await?;
 
     match payload.first() {
-      Some(0x00) => BinlogEventPacket::parse(payload),
+      Some(0x00) => BinlogEventHeader::parse(payload),
       Some(0xFF) => Err(self.parse_and_handle_server_error(payload)),
       Some(_) => Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -863,7 +856,7 @@ impl BinlogStream {
     self.conn.stream.shutdown().await
   }
 
-  pub async fn recv(&mut self) -> Option<io::Result<BinlogEventPacket>> {
+  pub async fn recv(&mut self) -> Option<io::Result<(BinlogEventHeader, BinlogEvent)>> {
     // TODO: handle disconnects and reconnect here...
     Some(self.conn.read_binlog_event_packet().await)
   }

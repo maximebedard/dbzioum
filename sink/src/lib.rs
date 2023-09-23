@@ -34,8 +34,14 @@ pub struct Column {
 pub enum ColumnType {
   I64,
   U64,
+  F64,
   String,
   Bytes,
+  Date,
+  Time,
+  Timestamp,
+  Decimal,
+  Json,
 }
 
 #[derive(Debug)]
@@ -43,6 +49,7 @@ pub enum ColumnValue {
   Null,
   U64(u64),
   I64(i64),
+  F64(f64),
   String(String),
   Bytes(Bytes),
 }

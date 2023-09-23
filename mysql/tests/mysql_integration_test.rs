@@ -135,26 +135,37 @@ async fn test_binlog_inserts() {
   conn
     .query(
       r#"
-    INSERT INTO Users
-    VALUES (1, 'bob', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024', '2024-01-01 01:01:01');
-    "#,
+      INSERT INTO Users
+      VALUES (1, 'bob', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024', '2024-01-01 01:01:01');
+      "#,
     )
     .await
     .unwrap();
-  // conn
-  //   .query(
-  //     r#"
-  //   INSERT INTO Users
-  //   VALUES (2, 'pat', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024');
-  //   "#,
-  //   )
-  //   .await
-  //   .unwrap();
-  // conn.query("DELETE FROM Users WHERE id = 2;").await.unwrap();
-  // conn
-  //   .query("UPDATE Users SET name = 'chad' WHERE id = 1;")
-  //   .await
-  //   .unwrap();
+  conn
+    .query(
+      r#"
+      INSERT INTO Users
+      VALUES (2, 'pat', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024', '2024-01-01 01:01:01');
+      "#,
+    )
+    .await
+    .unwrap();
+  conn
+    .query(
+      r#"
+      INSERT INTO Users
+      VALUES
+        (3, 'lel', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024', '2024-01-01 01:01:01'),
+        (4, 'kek', -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 3.14, 3.14, b'10000001', NULL, 'a', 'b', 'c', 'd', 'e', '{"a": "b"}', '2024', '2024-01-01 01:01:01');
+      "#
+    )
+    .await
+    .unwrap();
+  conn.query("DELETE FROM Users WHERE id = 2;").await.unwrap();
+  conn
+    .query("UPDATE Users SET name = 'chad' WHERE id = 1;")
+    .await
+    .unwrap();
 
   let cursor = conn.binlog_cursor().await.unwrap();
 
@@ -166,10 +177,10 @@ async fn test_binlog_inserts() {
       break;
     }
 
-    let packet = stream.recv().await.unwrap().unwrap();
+    let (header, event) = stream.recv().await.unwrap().unwrap();
 
     // Insert/Update/Delete are always preceded by a TableMap event.
-    match packet.event {
+    match event {
       BinlogEvent::TableMap(v) => {
         table_map_evt.replace(v);
       }
@@ -183,14 +194,40 @@ async fn test_binlog_inserts() {
       _ => {}
     }
 
-    commited.log_position = packet.log_position;
+    commited.log_position = header.log_position;
   }
 
-  if let (z, BinlogEvent::Insert(v)) = &events[0] {
-    let columns = z.columns();
-    println!("{:#?}", &columns);
-    println!("{:?}", v.values(&columns));
+  for (table_map_event, binlog_event) in events {
+    let columns = table_map_event.columns();
+    match binlog_event {
+      BinlogEvent::Insert(v) => {
+        println!(
+          "insert {}.{} => {:?}",
+          table_map_event.schema,
+          table_map_event.table,
+          v.rows(&columns)
+        );
+      }
+      BinlogEvent::Update(v) => {
+        println!(
+          "update {}.{} => {:?}",
+          table_map_event.schema,
+          table_map_event.table,
+          v.rows(&columns)
+        );
+      }
+      BinlogEvent::Delete(v) => {
+        println!(
+          "delete {}.{} => {:?}",
+          table_map_event.schema,
+          table_map_event.table,
+          v.rows(&columns)
+        );
+      }
+      _ => {}
+    }
   }
+
   tokio::try_join!(stream.close(), conn.close()).unwrap();
 }
 
