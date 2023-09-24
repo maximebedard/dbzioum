@@ -190,7 +190,7 @@ impl TableMapEvent {
         | ColumnType::MYSQL_TYPE_TINY_BLOB
         | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
         | ColumnType::MYSQL_TYPE_LONG_BLOB => {
-          todo!();
+          unreachable!()
         }
       }
     }
@@ -308,29 +308,34 @@ impl TableMapEvent {
         // SCAN from LSB to MSB
         let is_nullable = self.null_bitmap[i / 8] & (1 << (i % 8)) != 0;
 
-        // SCAN from MSB to LSB
-        let is_unsigned = self
-          .metadata
-          .is_unsigned_integer_bitmap
-          .as_ref()
-          .filter(|v| v[*j / 8] & (0x80 >> (*j % 8)) != 0)
-          .is_some();
-
         let column_type_definition = match column_type {
-          ColumnType::MYSQL_TYPE_TINY if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 1 },
-          ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::I64 { pack_length: 1 },
+          ColumnType::MYSQL_TYPE_TINY
+          | ColumnType::MYSQL_TYPE_SHORT
+          | ColumnType::MYSQL_TYPE_INT24
+          | ColumnType::MYSQL_TYPE_LONG
+          | ColumnType::MYSQL_TYPE_LONGLONG => {
+            // SCAN from MSB to LSB
+            let is_unsigned =
+              self.metadata.is_unsigned_integer_bitmap.as_ref().unwrap()[*j / 8] & (0x80 >> (*j % 8)) != 0;
 
-          ColumnType::MYSQL_TYPE_SHORT if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 2 },
-          ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::I64 { pack_length: 2 },
+            let t = match column_type {
+              ColumnType::MYSQL_TYPE_TINY if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 1 },
+              ColumnType::MYSQL_TYPE_TINY => ColumnTypeDefinition::I64 { pack_length: 1 },
+              ColumnType::MYSQL_TYPE_SHORT if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 2 },
+              ColumnType::MYSQL_TYPE_SHORT => ColumnTypeDefinition::I64 { pack_length: 2 },
+              ColumnType::MYSQL_TYPE_INT24 if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 3 },
+              ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::I64 { pack_length: 3 },
+              ColumnType::MYSQL_TYPE_LONG if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 4 },
+              ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::I64 { pack_length: 4 },
+              ColumnType::MYSQL_TYPE_LONGLONG if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 8 },
+              ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::I64 { pack_length: 8 },
+              _ => unreachable!(),
+            };
 
-          ColumnType::MYSQL_TYPE_INT24 if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 3 },
-          ColumnType::MYSQL_TYPE_INT24 => ColumnTypeDefinition::I64 { pack_length: 3 },
+            *j += 1;
 
-          ColumnType::MYSQL_TYPE_LONG if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 4 },
-          ColumnType::MYSQL_TYPE_LONG => ColumnTypeDefinition::I64 { pack_length: 4 },
-
-          ColumnType::MYSQL_TYPE_LONGLONG if is_unsigned => ColumnTypeDefinition::U64 { pack_length: 8 },
-          ColumnType::MYSQL_TYPE_LONGLONG => ColumnTypeDefinition::I64 { pack_length: 8 },
+            t
+          }
 
           ColumnType::MYSQL_TYPE_DECIMAL => unreachable!(),
           ColumnType::MYSQL_TYPE_NEWDECIMAL => {
@@ -374,8 +379,8 @@ impl TableMapEvent {
             let pack_length = column_meta.try_into().unwrap();
             ColumnTypeDefinition::Json { pack_length }
           }
-          ColumnType::MYSQL_TYPE_ENUM => todo!(),
-          ColumnType::MYSQL_TYPE_SET => todo!(),
+          ColumnType::MYSQL_TYPE_ENUM => unreachable!(),
+          ColumnType::MYSQL_TYPE_SET => unreachable!(),
           ColumnType::MYSQL_TYPE_NULL => {
             unreachable!()
           }
@@ -396,28 +401,38 @@ impl TableMapEvent {
             ColumnTypeDefinition::String { pack_length }
           }
           ColumnType::MYSQL_TYPE_VAR_STRING => {
+            // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html
+            // This is used to store both strings and enumeration values. The first byte is a enumeration value storing the real type, which may be either MYSQL_TYPE_VAR_STRING or MYSQL_TYPE_ENUM. The second byte is a 1 byte unsigned integer representing the field size, i.e., the number of bytes needed to store the length of the string.
             todo!()
           }
           ColumnType::MYSQL_TYPE_STRING => {
-            let bytes = column_meta.to_le_bytes();
-            // Most likely a better way to do this.
-            let upper = ((0xFE - bytes[0]) * 4) as u16;
-            let lower = bytes[1] as u16;
-            let length = upper + lower;
-            let pack_length = if length > 255 { 2 } else { 1 };
-            ColumnTypeDefinition::String { pack_length }
+            // https://dev.mysql.com/doc/dev/mysql-server/latest/classbinary__log_1_1Table__map__event.html
+            // The first byte is always MYSQL_TYPE_VAR_STRING (i.e., 253). The second byte is the field size, i.e., the number of bytes in the representation of size of the string: 3 or 4.
+            // https://github.com/mysql/mysql-server/blob/9c3a49ec84b521cb0b35383f119099b2eb25d4ff/sql/log_event.cc#L1988-L2006
+
+            if column_meta > 255 {
+              let bytes = column_meta.to_le_bytes();
+
+              if bytes[0] & 0x30 != 0x30 {
+                let pack_length = if bytes[1] as u16 | (((bytes[0] as u16 & 0x30) ^ 0x30) << 4) > 255 {
+                  2
+                } else {
+                  1
+                };
+                ColumnTypeDefinition::String { pack_length }
+              } else {
+                match bytes[0] {
+                  0xF7 => todo!("enum"),
+                  0xF8 => todo!("set"),
+                  _ => ColumnTypeDefinition::String { pack_length: 1 },
+                }
+              }
+            } else {
+              ColumnTypeDefinition::String { pack_length: 1 }
+            }
           }
           ColumnType::MYSQL_TYPE_GEOMETRY => todo!(),
         };
-
-        if let ColumnType::MYSQL_TYPE_TINY
-        | ColumnType::MYSQL_TYPE_SHORT
-        | ColumnType::MYSQL_TYPE_INT24
-        | ColumnType::MYSQL_TYPE_LONG
-        | ColumnType::MYSQL_TYPE_LONGLONG = column_type
-        {
-          *j += 1;
-        }
 
         Some(Column {
           column_name,
