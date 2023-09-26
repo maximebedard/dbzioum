@@ -95,6 +95,8 @@ impl EventProcessor {
             binlog::ColumnTypeDefinition::Year => ColumnType::U64,
             binlog::ColumnTypeDefinition::Time(_) => ColumnType::Time,
             binlog::ColumnTypeDefinition::Timestamp => ColumnType::Timestamp,
+            binlog::ColumnTypeDefinition::Enum => todo!(),
+            binlog::ColumnTypeDefinition::Set => todo!(),
           };
           let value = match v {
             binlog::Value::Null => ColumnValue::Null,
@@ -107,6 +109,8 @@ impl EventProcessor {
             binlog::Value::Json(_) => todo!(),
             binlog::Value::Date { .. } => todo!(),
             binlog::Value::Time { .. } => todo!(),
+            binlog::Value::Enum => todo!(),
+            binlog::Value::Set => todo!(),
           };
           Column {
             name,

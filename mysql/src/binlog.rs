@@ -53,8 +53,10 @@ impl BinlogEventHeader {
       BinlogEventType::DELETE_ROWS_EVENTV0 => DeleteRowEvent::parse(payload, false).map(BinlogEvent::Delete),
       BinlogEventType::DELETE_ROWS_EVENTV1 => DeleteRowEvent::parse(payload, false).map(BinlogEvent::Delete),
       BinlogEventType::DELETE_ROWS_EVENTV2 => DeleteRowEvent::parse(payload, true).map(BinlogEvent::Delete),
+      BinlogEventType::XID_EVENT => XidEvent::parse(payload).map(BinlogEvent::Xid),
       BinlogEventType::GTID_EVENT => GtidEvent::parse(payload).map(BinlogEvent::Gtid),
       BinlogEventType::PREVIOUS_GTIDS_EVENT => PreviousGtidEvent::parse(payload).map(BinlogEvent::PreviousGtid),
+      BinlogEventType::ANONYMOUS_GTID_EVENT => AnonymousGtidEvent::parse(payload).map(BinlogEvent::AnonymousGtid),
       not_supported => Ok(BinlogEvent::NotSupported(not_supported)),
     }?;
 
@@ -70,8 +72,10 @@ pub enum BinlogEvent {
   Insert(InsertRowEvent),
   Update(UpdateRowEvent),
   Delete(DeleteRowEvent),
+  Xid(XidEvent),
   Gtid(GtidEvent),
   PreviousGtid(PreviousGtidEvent),
+  AnonymousGtid(AnonymousGtidEvent),
   NotSupported(BinlogEventType),
 }
 
@@ -117,6 +121,131 @@ pub struct TableMapEventMetadata {
   pub column_names: Option<Vec<String>>,
   pub set_str_values: Option<Vec<String>>,
   pub enum_str_values: Option<Vec<String>>,
+  pub geometry_types: Option<Vec<u64>>,
+  pub simple_primary_keys: Option<Vec<u64>>,
+  pub primary_keys_with_prefixes: Option<Vec<(u64, u64)>>,
+}
+
+impl TableMapEventMetadata {
+  fn parse(mut b: Bytes) -> io::Result<Self> {
+    fn parse_default_charset(mut b: Bytes) -> io::Result<(CharacterSet, Vec<(usize, CharacterSet)>)> {
+      let default_charset = b.mysql_get_lenc_uint();
+      let default_charset = (default_charset as u8).try_into().unwrap();
+
+      let mut pairs = Vec::new();
+      while b.remaining() > 0 {
+        let index = b.mysql_get_lenc_uint().try_into().unwrap();
+
+        let charset = b.mysql_get_lenc_uint();
+        let charset = (charset as u8).try_into().unwrap();
+
+        pairs.push((index, charset))
+      }
+      Ok((default_charset, pairs))
+    }
+
+    fn parse_column_charsets(mut b: Bytes) -> io::Result<Vec<CharacterSet>> {
+      let mut column_charsets = Vec::new();
+      while b.remaining() > 0 {
+        let column_charset = b.mysql_get_lenc_uint();
+        let column_charset = (column_charset as u8).try_into().unwrap();
+        column_charsets.push(column_charset);
+      }
+      Ok(column_charsets)
+    }
+
+    fn parse_strings(mut b: Bytes) -> io::Result<Vec<String>> {
+      let length = b.mysql_get_lenc_uint().try_into().unwrap();
+      let mut strings = Vec::with_capacity(length);
+      for _i in 0..length {
+        strings.push(b.mysql_get_lenc_string());
+      }
+      assert_eq!(0, b.remaining());
+      Ok(strings)
+    }
+
+    fn parse_ints(mut b: Bytes) -> io::Result<Vec<u64>> {
+      let mut ints = Vec::new();
+      while b.remaining() > 0 {
+        ints.push(b.mysql_get_lenc_uint());
+      }
+      Ok(ints)
+    }
+
+    fn parse_column_names(mut b: Bytes) -> io::Result<Vec<String>> {
+      let mut column_names = Vec::new();
+      while b.remaining() > 0 {
+        column_names.push(b.mysql_get_lenc_string());
+      }
+      Ok(column_names)
+    }
+
+    fn parse_keys_with_prefixes(mut b: Bytes) -> io::Result<Vec<(u64, u64)>> {
+      let mut primary_keys_with_prefixes = Vec::new();
+      while b.remaining() > 0 {
+        let index = b.mysql_get_lenc_uint();
+        let prefix = b.mysql_get_lenc_uint();
+        primary_keys_with_prefixes.push((index, prefix));
+      }
+      Ok(primary_keys_with_prefixes)
+    }
+
+    let mut metadata = Self::default();
+
+    while b.remaining() > 0 {
+      let metadata_type: ColumnMetadataType = b.get_u8().try_into().unwrap();
+      let metadata_len = b.mysql_get_lenc_uint().try_into().unwrap();
+      let metadata_value = b.split_to(metadata_len);
+
+      // https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp#L141
+      match metadata_type {
+        ColumnMetadataType::SIGNEDNESS => metadata.is_unsigned_integer_bitmap = Some(metadata_value),
+        ColumnMetadataType::DEFAULT_CHARSET => {
+          let default_charset = parse_default_charset(metadata_value)?;
+          metadata.default_charset = Some(default_charset)
+        }
+        ColumnMetadataType::COLUMN_CHARSET => {
+          let column_charset = parse_column_charsets(metadata_value)?;
+          metadata.column_charsets = Some(column_charset)
+        }
+        ColumnMetadataType::COLUMN_NAME => {
+          let column_names = parse_column_names(metadata_value)?;
+          metadata.column_names = Some(column_names);
+        }
+        ColumnMetadataType::SET_STR_VALUE => {
+          let set_str_values = parse_strings(metadata_value)?;
+          metadata.set_str_values = Some(set_str_values);
+        }
+        ColumnMetadataType::ENUM_STR_VALUE => {
+          let enum_str_values = parse_strings(metadata_value)?;
+          metadata.enum_str_values = Some(enum_str_values);
+        }
+        ColumnMetadataType::GEOMETRY_TYPE => {
+          let geometry_types = parse_ints(metadata_value)?;
+          metadata.geometry_types = Some(geometry_types);
+        }
+        ColumnMetadataType::SIMPLE_PRIMARY_KEY => {
+          let simple_primary_keys = parse_ints(metadata_value)?;
+          metadata.simple_primary_keys = Some(simple_primary_keys);
+        }
+        ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX => {
+          let primary_keys_with_prefixes = parse_keys_with_prefixes(metadata_value)?;
+          metadata.primary_keys_with_prefixes = Some(primary_keys_with_prefixes);
+        }
+        ColumnMetadataType::ENUM_AND_SET_DEFAULT_CHARSET => {
+          let enum_and_set_default_charsets = parse_default_charset(metadata_value)?;
+          metadata.enum_and_set_default_charsets = Some(enum_and_set_default_charsets);
+        }
+        ColumnMetadataType::ENUM_AND_SET_COLUMN_CHARSET => {
+          let enum_and_set_column_charsets = parse_column_charsets(metadata_value)?;
+          metadata.enum_and_set_column_charsets = Some(enum_and_set_column_charsets);
+        }
+        ColumnMetadataType::COLUMN_VISIBILITY => {}
+      }
+    }
+
+    Ok(metadata)
+  }
 }
 
 impl TableMapEvent {
@@ -199,91 +328,7 @@ impl TableMapEvent {
     let bitmap_len = (column_count + 7) / 8;
     let null_bitmap = b.split_to(bitmap_len);
 
-    let mut metadata = TableMapEventMetadata::default();
-
-    fn parse_default_charset(mut b: Bytes) -> io::Result<(CharacterSet, Vec<(usize, CharacterSet)>)> {
-      let default_charset = b.mysql_get_lenc_uint();
-      let default_charset = (default_charset as u8).try_into().unwrap();
-
-      let mut pairs = Vec::new();
-      while b.remaining() > 0 {
-        let index = b.mysql_get_lenc_uint().try_into().unwrap();
-
-        let charset = b.mysql_get_lenc_uint();
-        let charset = (charset as u8).try_into().unwrap();
-
-        pairs.push((index, charset))
-      }
-      Ok((default_charset, pairs))
-    }
-
-    fn parse_column_charsets(mut b: Bytes) -> io::Result<Vec<CharacterSet>> {
-      let mut column_charsets = Vec::new();
-      while b.remaining() > 0 {
-        let column_charset = b.mysql_get_lenc_uint();
-        let column_charset = (column_charset as u8).try_into().unwrap();
-        column_charsets.push(column_charset);
-      }
-      Ok(column_charsets)
-    }
-
-    fn parse_str_value(_b: Bytes) -> io::Result<Vec<String>> {
-      todo!()
-    }
-
-    pub fn parse_column_names(mut b: Bytes) -> io::Result<Vec<String>> {
-      let mut column_names = Vec::new();
-      while b.remaining() > 0 {
-        let len = b.mysql_get_lenc_uint().try_into().unwrap();
-        let column_name = b.split_to(len);
-        let column_name = std::str::from_utf8(column_name.chunk()).unwrap();
-        column_names.push(column_name.into());
-      }
-      Ok(column_names)
-    }
-
-    while b.remaining() > 0 {
-      let metadata_type: ColumnMetadataType = b.get_u8().try_into().unwrap();
-      let metadata_len = b.mysql_get_lenc_uint().try_into().unwrap();
-      let metadata_value = b.split_to(metadata_len);
-
-      // https://github.com/mysql/mysql-server/blob/8.0/libbinlogevents/src/rows_event.cpp#L141
-      match metadata_type {
-        ColumnMetadataType::SIGNEDNESS => metadata.is_unsigned_integer_bitmap = Some(metadata_value),
-        ColumnMetadataType::DEFAULT_CHARSET => {
-          let default_charset = parse_default_charset(metadata_value)?;
-          metadata.default_charset = Some(default_charset)
-        }
-        ColumnMetadataType::COLUMN_CHARSET => {
-          let column_charset = parse_column_charsets(metadata_value)?;
-          metadata.column_charsets = Some(column_charset)
-        }
-        ColumnMetadataType::COLUMN_NAME => {
-          let column_names = parse_column_names(metadata_value)?;
-          metadata.column_names = Some(column_names);
-        }
-        ColumnMetadataType::SET_STR_VALUE => {
-          let set_str_values = parse_str_value(metadata_value)?;
-          metadata.set_str_values = Some(set_str_values);
-        }
-        ColumnMetadataType::ENUM_STR_VALUE => {
-          let enum_str_values = parse_str_value(metadata_value)?;
-          metadata.enum_str_values = Some(enum_str_values);
-        }
-        ColumnMetadataType::GEOMETRY_TYPE => {}
-        ColumnMetadataType::SIMPLE_PRIMARY_KEY => {}
-        ColumnMetadataType::PRIMARY_KEY_WITH_PREFIX => {}
-        ColumnMetadataType::ENUM_AND_SET_DEFAULT_CHARSET => {
-          let enum_and_set_default_charsets = parse_default_charset(metadata_value)?;
-          metadata.enum_and_set_default_charsets = Some(enum_and_set_default_charsets)
-        }
-        ColumnMetadataType::ENUM_AND_SET_COLUMN_CHARSET => {
-          let enum_and_set_column_charsets = parse_column_charsets(metadata_value)?;
-          metadata.enum_and_set_column_charsets = Some(enum_and_set_column_charsets);
-        }
-        ColumnMetadataType::COLUMN_VISIBILITY => {}
-      }
-    }
+    let metadata = TableMapEventMetadata::parse(b)?;
 
     Ok(Self {
       table_id,
@@ -422,8 +467,8 @@ impl TableMapEvent {
                 ColumnTypeDefinition::String { pack_length }
               } else {
                 match bytes[0] {
-                  0xF7 => todo!("enum"),
-                  0xF8 => todo!("set"),
+                  0xF7 => ColumnTypeDefinition::Enum,
+                  0xF8 => ColumnTypeDefinition::Set,
                   _ => ColumnTypeDefinition::String { pack_length: 1 },
                 }
               }
@@ -646,6 +691,8 @@ fn parse_row(b: &mut Bytes, columns: &[Column], _column_present: &Bytes) -> Vec<
           }
         }
         ColumnTypeDefinition::Time(ColumnTypeDefinitionTime::Arbitrary(_)) => todo!(),
+        ColumnTypeDefinition::Set => todo!(),
+        ColumnTypeDefinition::Enum => todo!(),
       }
     })
     .collect()
@@ -756,6 +803,29 @@ impl PreviousGtidEvent {
 }
 
 #[derive(Debug)]
+pub struct XidEvent {
+  pub xid: u64,
+}
+
+impl XidEvent {
+  pub fn parse(mut b: Bytes) -> io::Result<Self> {
+    let xid = b.get_u64_le();
+    Ok(Self { xid })
+  }
+}
+
+#[derive(Debug)]
+pub struct AnonymousGtidEvent {
+  b: Bytes,
+}
+
+impl AnonymousGtidEvent {
+  pub fn parse(b: Bytes) -> io::Result<Self> {
+    Ok(Self { b })
+  }
+}
+
+#[derive(Debug)]
 pub enum Value {
   Null,
   U64(u64),
@@ -782,6 +852,8 @@ pub enum Value {
     seconds: u8,
     micro_seconds: u32,
   },
+  Enum,
+  Set,
 }
 
 #[derive(Debug)]
@@ -817,6 +889,8 @@ pub enum ColumnTypeDefinition {
   Year,
   Time(ColumnTypeDefinitionTime),
   Timestamp,
+  Set,
+  Enum,
 }
 
 #[cfg(test)]

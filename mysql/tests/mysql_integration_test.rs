@@ -183,8 +183,7 @@ async fn test_binlog_inserts() {
 
   let cursor = conn.binlog_cursor().await.unwrap();
 
-  let mut table_map_evt = None;
-  let mut events = vec![];
+  let mut table_map_event = None;
   loop {
     // Wait for the stream to have caught up with the master
     if commited >= cursor {
@@ -196,25 +195,15 @@ async fn test_binlog_inserts() {
     // Insert/Update/Delete are always preceded by a TableMap event.
     match event {
       BinlogEvent::TableMap(v) => {
-        table_map_evt.replace(v);
+        table_map_event.replace(v);
       }
       BinlogEvent::Rotate(v) => {
         commited.log_file = v.next_log_file.clone();
         commited.log_position = v.next_log_position;
       }
-      v @ (BinlogEvent::Insert(_) | BinlogEvent::Update(_) | BinlogEvent::Delete(_)) => {
-        events.push((table_map_evt.take().unwrap(), v));
-      }
-      _ => {}
-    }
-
-    commited.log_position = header.log_position;
-  }
-
-  for (table_map_event, binlog_event) in events {
-    let columns = table_map_event.columns();
-    match binlog_event {
       BinlogEvent::Insert(v) => {
+        let table_map_event = table_map_event.take().unwrap();
+        let columns = table_map_event.columns();
         println!(
           "insert {}.{} => {:?}",
           table_map_event.schema,
@@ -223,6 +212,8 @@ async fn test_binlog_inserts() {
         );
       }
       BinlogEvent::Update(v) => {
+        let table_map_event = table_map_event.take().unwrap();
+        let columns = table_map_event.columns();
         println!(
           "update {}.{} => {:?}",
           table_map_event.schema,
@@ -231,6 +222,8 @@ async fn test_binlog_inserts() {
         );
       }
       BinlogEvent::Delete(v) => {
+        let table_map_event = table_map_event.take().unwrap();
+        let columns = table_map_event.columns();
         println!(
           "delete {}.{} => {:?}",
           table_map_event.schema,
@@ -238,8 +231,12 @@ async fn test_binlog_inserts() {
           v.rows(&columns)
         );
       }
-      _ => {}
+      evt => {
+        println!("{:?}", evt);
+      }
     }
+
+    commited.log_position = header.log_position;
   }
 
   tokio::try_join!(stream.close(), conn.close()).unwrap();

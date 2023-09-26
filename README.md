@@ -36,7 +36,9 @@ Event log streamer for postgresql@11 and mysql@8, heavily inspired from [debeziu
         - [ ] SET
         - [x] _partial_ Date and Time
         - [ ] _partial_ JSON (needs custom parser)
-    - [x] commit cursor position
+    - [ ] commit cursor position
+          [x] log file + position
+          [ ] GTID
 - [ ] mysql2kafka
   - [ ] bridge mysql events to row events
 - [ ] sink:
